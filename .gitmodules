@@ -1,21 +1,18 @@
-[submodule "esp_wireguard"]
-	path = external/esp_wireguard
-	url = https://github.com/trombik/esp_wireguard.git
-[submodule "esp-idf"]
+[submodule "external/esp-idf"]
 	path = external/esp-idf
 	url = https://github.com/espressif/esp-idf.git
-[submodule "esp-tamp"]
+[submodule "external/esp-tamp"]
 	path = external/esp-tamp
 	url = https://github.com/BitsForPeople/esp-tamp.git
-[submodule "esphome"]
+[submodule "external/esphome"]
 	path = external/esphome
 	url = https://github.com/esphome/esphome.git
-[submodule "headscale"]
+[submodule "external/headscale"]
 	path = external/headscale
 	url = https://github.com/juanfont/headscale.git
-[submodule "libtailscale"]
+[submodule "external/libtailscale"]
 	path = external/libtailscale
 	url = https://github.com/tailscale/libtailscale.git
-[submodule "noise-c"]
+[submodule "external/noise-c"]
 	path = external/noise-c
 	url = https://github.com/esphome/noise-c.git
