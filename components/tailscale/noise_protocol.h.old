@@ -31,7 +31,7 @@ namespace tailscale {
  * References:
  * - tailscale/control/controlhttp/client.go
  * - headscale/hscontrol/noise.go
- * - noise-c library (external/noise-c)
+ * - noise-c library (external/required/noise-c)
  */
 class NoiseProtocol {
  public:

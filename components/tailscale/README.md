@@ -25,11 +25,15 @@ A Tailscale/Headscale client implementation for ESP32-C3 microcontrollers using 
 - Git for cloning repositories
 
 ### External Dependencies
-The following repositories are included as submodules in `external/`:
-- `noise-c`: Noise Protocol implementation with ESP32 fixes
-- `esphome`: ESPHome fork with WireGuard component
-- `headscale`: Headscale server (for testing/reference)
-- `libtailscale`: Tailscale mobile library (reference)
+The `external/` folder is split so you can clone only what you need:
+- **Required (`external/required/`)**
+  - `noise-c`: Noise Protocol implementation with ESP32 fixes
+  - `esphome`: ESPHome fork with WireGuard component
+- **Optional (`external/optional/`)**
+  - `headscale`: Headscale server (for testing/reference)
+  - `libtailscale`: Tailscale mobile library (reference)
+  - `esp-tamp`: TAMP compression experiments
+  - `esp-idf`: Reference checkout of the ESP-IDF sources
 
 ## 🚀 Quick Start
 
@@ -38,7 +42,10 @@ The following repositories are included as submodules in `external/`:
 ```bash
 git clone https://github.com/yourusername/tailscale-iot.git
 cd tailscale-iot
-git submodule update --init --recursive
+# Pull only the submodules needed for builds
+git submodule update --init external/required/noise-c external/required/esphome
+# Optional: grab every reference repo for protocol work
+git submodule update --init --recursive external/optional
 ```
 
 ### 2. Set Up Secrets

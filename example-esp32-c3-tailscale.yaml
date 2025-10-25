@@ -6,7 +6,7 @@ esphome:
   friendly_name: ESP32 Tailscale Node
   platformio_options:
     lib_extra_dirs:
-      - ../external/noise-c
+      - ../external/required/noise-c
     build_flags:
       - "-DNATIVE_LITTLE_ENDIAN"
       - "-DSODIUM_STATIC"
@@ -34,7 +34,7 @@ external_components:
   
   - source:
       type: local
-      path: external/esphome/esphome/components
+      path: external/required/esphome/esphome/components
     components: [ wireguard ]
 
 # WiFi configuration

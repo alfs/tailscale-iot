@@ -79,7 +79,7 @@ async def to_code(config):
     # Add noise-c library from local directory
     repo_root = Path(__file__).resolve().parents[2]  # Up to tailscale-iot root (components/tailscale/__init__.py -> components -> tailscale-iot)
     ensure_noise_c_patched(repo_root)
-    noise_dir = repo_root / "external" / "noise-c"
+    noise_dir = repo_root / "external" / "required" / "noise-c"
     logging.warning(f"Noise-c path: {noise_dir}, exists: {noise_dir.exists()}")
     if noise_dir.exists():
         # Add noise-c directory to library search paths

@@ -1,7 +1,7 @@
 # CMake configuration for noise-c library integration
 # This file is included from the main component CMakeLists.txt
 
-set(NOISE_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/noise-c")
+set(NOISE_C_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../external/required/noise-c")
 
 # Noise-C protocol sources
 set(NOISE_PROTOCOL_SRCS

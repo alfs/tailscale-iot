@@ -32,10 +32,15 @@ machine to a flashed ESP32-C3 binary.
    ```bash
    git clone https://github.com/<your-org>/tailscale-iot.git
    cd tailscale-iot
-   git submodule update --init --recursive
+   # Required for builds
+   git submodule update --init external/required/noise-c external/required/esphome
+   # Optional protocol-analysis helpers
+   git submodule update --init --recursive external/optional
    ```
-   The submodules provide the vendored `noise-c` library plus the forked
-   ESPHome components that the build expects.
+   The required submodules (under `external/required/`) provide the vendored
+   `noise-c` library plus the forked ESPHome components that the build expects.
+   The optional set (under `external/optional/`) contains reference repositories
+   useful when hacking on the protocol but they are not needed for `esphome compile`.
 
 3. **Create your configuration YAML**
    - Copy the example as a starting point:

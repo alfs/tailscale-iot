@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noise-dir",
         type=Path,
-        default=repo_root / "external" / "noise-c",
+        default=repo_root / "external" / "required" / "noise-c",
         help="Path to the noise-c git checkout",
     )
     parser.add_argument(
