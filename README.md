@@ -22,29 +22,46 @@ The project builds like any other ESPHome node once the extra components and
 submodules are available locally. The steps below take you from an empty
 machine to a flashed ESP32-C3 binary.
 
+### Quick Start (Using Makefile)
+
+```bash
+git clone https://github.com/alfs/tailscale-iot.git
+cd tailscale-iot
+make setup        # Install dependencies and initialize submodules
+make config       # Copy example configuration files
+# Edit secrets.yaml with your credentials
+make build        # Build the firmware
+```
+
+### Manual Installation
+
 1. **Install prerequisites**
    - ESPHome CLI (`brew install esphome`, `pipx install esphome` or `pip install --user esphome`)
+   - Python packages required by ESP-IDF framework:
+     ```bash
+     python -m pip install idf-component-manager esp-idf-kconfig cryptography
+     ```
    - A working Headscale/Tailscale control server with a reusable auth key
 
-2. **Clone the repository and pull submodules**
+2. **Clone the repository and pull required submodules**
    ```bash
    git clone https://github.com/alfs/tailscale-iot.git
    cd tailscale-iot
+   git submodule update --init external/required/noise-c
    ```
-   The required submodules (under `external/required/`) provide the vendored
-   `noise-c` library plus the forked ESPHome components that the build expects.
-   The optional set (under `external/optional/`) contains reference repositories
-   useful when hacking on the protocol but they are not needed for `esphome compile`.
 
-   There are some submodules, like headscale, esp-idf, tailscale, libtailscale only used for
-   protocol analysis but not necessary for the build. Use
-   ```
+   The required submodules (under `external/required/`) provide the vendored
+   `noise-c` library that the build expects. The optional set (under
+   `external/optional/`) contains reference repositories useful when debugging
+   the protocol but they are not needed for building.
+
+   To get all submodules including optional ones for protocol debugging:
+   ```bash
    git submodule update --init --recursive
    ```
-   to get them all.
 
 
-4. **Create your configuration YAML**
+3. **Create your configuration YAML**
    - Copy the example as a starting point:
      ```bash
      cp example-esp32-c3-tailscale.yaml esp32-ts.yaml
@@ -53,7 +70,7 @@ machine to a flashed ESP32-C3 binary.
      hardware. The example already wires up the `tailscale:` component and the
      supporting WireGuard stub so it is a good baseline.
 
-5. **Provide secrets**
+4. **Provide secrets**
    - Copy the template and fill in the required values (Wi-Fi credentials,
      OTA password, Tailscale auth key, Headscale URL, WireGuard private key, etc.):
      ```bash
@@ -63,7 +80,7 @@ machine to a flashed ESP32-C3 binary.
    - The YAML references secrets like `wifi_ssid`, `tailscale_auth_key`, and
      `headscale_url`; make sure each key listed in the template has a value.
 
-6. **Compile (optional) and flash**
+5. **Compile (optional) and flash**
    - To only compile and inspect the binary:
      ```bash
      esphome compile esp32-ts.yaml
@@ -75,7 +92,7 @@ machine to a flashed ESP32-C3 binary.
    - If you prefer separate steps, use `esphome upload esp32-ts.yaml --device <port>`
      followed by `esphome logs esp32-ts.yaml`.
 
-7. **Verify runtime**
+6. **Verify runtime**
    - On first boot the component patches the local `noise-c` sources and
      reports progress over the ESPHome logger.
    - Watch for the `tailscale.ctrl` log lines confirming registration, DERP map
