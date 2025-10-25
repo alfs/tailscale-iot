@@ -23,21 +23,29 @@ submodules are available locally. The steps below take you from an empty
 machine to a flashed ESP32-C3 binary.
 
 1. **Install prerequisites**
-   - Python 3.11+
-   - `pipx` (preferred) or `pip`
-   - ESPHome CLI (`pipx install esphome` or `pip install --user esphome`)
+   - ESPHome CLI (`brew install esphome`, `pipx install esphome` or `pip install --user esphome`)
    - A working Headscale/Tailscale control server with a reusable auth key
 
 2. **Clone the repository and pull submodules**
    ```bash
-   git clone https://github.com/<your-org>/tailscale-iot.git
+   git clone https://github.com/alfs/tailscale-iot.git
    cd tailscale-iot
-   git submodule update --init --recursive
+
+   git submodule update --init external/esphome
+   git submodule update --init external/noise-c
    ```
    The submodules provide the vendored `noise-c` library plus the forked
    ESPHome components that the build expects.
 
-3. **Create your configuration YAML**
+   There are some submodules, like headscale, esp-idf, tailscale, libtailscale only used for
+   protocol analysis but not necessary for the build. Use
+   ```
+   git submodule update --init --recursive
+   ```
+   to get them all.
+
+
+4. **Create your configuration YAML**
    - Copy the example as a starting point:
      ```bash
      cp example-esp32-c3-tailscale.yaml esp32-ts.yaml
@@ -46,7 +54,7 @@ machine to a flashed ESP32-C3 binary.
      hardware. The example already wires up the `tailscale:` component and the
      supporting WireGuard stub so it is a good baseline.
 
-4. **Provide secrets**
+5. **Provide secrets**
    - Copy the template and fill in the required values (Wi-Fi credentials,
      OTA password, Tailscale auth key, Headscale URL, WireGuard private key, etc.):
      ```bash
@@ -56,7 +64,7 @@ machine to a flashed ESP32-C3 binary.
    - The YAML references secrets like `wifi_ssid`, `tailscale_auth_key`, and
      `headscale_url`; make sure each key listed in the template has a value.
 
-5. **Compile (optional) and flash**
+6. **Compile (optional) and flash**
    - To only compile and inspect the binary:
      ```bash
      esphome compile esp32-ts.yaml
@@ -68,7 +76,7 @@ machine to a flashed ESP32-C3 binary.
    - If you prefer separate steps, use `esphome upload esp32-ts.yaml --device <port>`
      followed by `esphome logs esp32-ts.yaml`.
 
-6. **Verify runtime**
+7. **Verify runtime**
    - On first boot the component patches the local `noise-c` sources and
      reports progress over the ESPHome logger.
    - Watch for the `tailscale.ctrl` log lines confirming registration, DERP map
