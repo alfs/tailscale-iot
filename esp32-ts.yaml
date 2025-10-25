@@ -1,0 +1,57 @@
+# Minimal test configuration for Tailscale component
+esphome:
+  name: tailscale-test
+  friendly_name: Tailscale Test
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      # Increase task watchdog timeout from default 5s to 30s
+      # This allows longer network operations during TS2021 handshake
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Time source (required)
+time:
+  - platform: sntp
+    id: sntp_time
+
+# Test just the component loading first
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ tailscale ]
+
+# Minimal tailscale config for syntax testing
+tailscale:
+  id: tailscale_client
+  auth_key: !secret tailscale_auth_key
+  control_url: !secret headscale_url
+  device_name: "esp"
+  time_id: sntp_time
+  wireguard_id: wg_iface
+  update_interval: 5s
+
+wireguard:
+  id: wg_iface
+  time_id: sntp_time
+  address: 100.64.0.254
+  private_key: !secret wg_template_private_key
+  peer_public_key: !secret wg_template_peer_public_key
+  peer_endpoint: "0.0.0.0"
+  peer_allowed_ips:
+    - "100.64.0.0/10"
+
+

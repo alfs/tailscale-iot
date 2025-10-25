@@ -1,0 +1,148 @@
+# ESPHome Tailscale Client for ESP32-C3
+# Connects to Headscale server and establishes WireGuard tunnels with peers
+
+esphome:
+  name: esp32-tailscale
+  friendly_name: ESP32 Tailscale Node
+  platformio_options:
+    lib_extra_dirs:
+      - ../external/noise-c
+    build_flags:
+      - "-DNATIVE_LITTLE_ENDIAN"
+      - "-DSODIUM_STATIC"
+      - "-DCONFIGURED"
+      - "-Wl,--wrap=sodium_init"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0: "n"
+      CONFIG_LWIP_PPP_SUPPORT: "y"
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: "y"
+      CONFIG_MBEDTLS_DEFAULT_CERTIFICATE_BUNDLE: "y"
+
+# External components
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ tailscale ]
+  
+  - source:
+      type: local
+      path: external/esphome/esphome/components
+    components: [ wireguard ]
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Hack for ESP32-C3 devices with wifi-problems. You may not need it, or need more wifi power, adjust accordingly.
+  output_power: 10dB
+  
+  # Enable AP fallback for configuration
+  ap:
+    ssid: "ESP32-Tailscale-Fallback"
+    password: !secret ap_password
+
+# Enable captive portal for initial setup
+captive_portal:
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    tailscale: DEBUG
+    tailscale.noise: DEBUG
+    tailscale.http2: DEBUG
+    tailscale.parser: DEBUG
+    wireguard: DEBUG
+
+# Enable OTA updates
+ota:
+  password: !secret ota_password
+
+# Enable web server for status
+web_server:
+  port: 80
+
+# Time source (required for Tailscale)
+time:
+  - platform: sntp
+    id: sntp_time
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+
+# WireGuard component
+wireguard:
+  id: wg_tunnel
+  time_id: sntp_time
+  address: 100.64.0.0  # Will be updated by Tailscale
+  netmask: 255.255.255.0
+  private_key: !secret wg_private_key
+  peer_public_key: ""  # Will be set by Tailscale
+  peer_endpoint: "0.0.0.0"  # Will be set by Tailscale
+  peer_port: 0  # Will be set by Tailscale
+  peer_allowed_ips:
+    - "100.64.0.0/10"  # Tailscale IP range
+  keepalive: 25
+  update_interval: 10s
+  require_connection_to_proceed: false
+
+# Tailscale client
+tailscale:
+  id: tailscale_client
+  auth_key: !secret tailscale_auth_key
+  control_url: !secret headscale_url  # e.g., "https://headscale.example.com:443"
+  device_name: "esp32-c3-test"
+  time_id: sntp_time
+  wireguard_id: wg_tunnel
+  update_interval: 60s
+
+# Binary sensors
+binary_sensor:
+  # WireGuard status
+  - platform: wireguard
+    wireguard_id: wg_tunnel
+    status:
+      name: "WireGuard Status"
+    enabled:
+      name: "WireGuard Enabled"
+
+# Text sensors
+text_sensor:
+  # WireGuard address
+  - platform: wireguard
+    wireguard_id: wg_tunnel
+    address:
+      name: "WireGuard Address"
+
+# Sensors
+sensor:
+  # WireGuard handshake time
+  - platform: wireguard
+    wireguard_id: wg_tunnel
+    latest_handshake:
+      name: "WireGuard Latest Handshake"
+
+  # WiFi Signal
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # Uptime
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+# Switches
+switch:
+  # Restart button
+  - platform: restart
+    name: "Restart"

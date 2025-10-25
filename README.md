@@ -9,21 +9,71 @@ So here it is. The Frankenstein proof-of-concept. Slashed and stitched by many h
 
 You probably don't want to touch this code by hand. But it works, with some quirks. I hope it will give inspiration to a clean, optimized, smaller, implementation.
 
-Status so far: Connects to self-hosted headscale servers (probably also tailscale servers - haven't tested), registers successfully, gets IP address. Not yet wireguard connectivity.
-In about 1.3 MByte, 71% of the flash memory of ESP32-C3.
+Current status: Connects to self-hosted headscale servers (probably also tailscale servers - haven't tested), registers successfully, gets IP address, gets peer names and addresses.
 
-```
-[17:00:09][I][tailscale.lite_parser:129]: Parsing JSON response with lite parser (61733 bytes)
-[17:00:09][D][tailscale.lite_parser:142]: Extracted Node ID: 30
-[17:00:09][I][tailscale.lite_parser:180]: Extracted IPv4: 100.64.0.30
-[17:00:09][W][tailscale.lite_parser:262]: Lite parser: No peers extracted from map response
-[17:00:09][I][tailscale.lite_parser:330]: Lite parser: Extracted 4 DERP node(s)
-[17:00:09][I][tailscale.lite_parser:335]: Lite parser: Extracted essential fields (Node ID: 30, IPv4: 100.64.0.30)
-[17:00:09][I][tailscale.ctrl:1427]: 📍 ESP32 assigned Tailscale IPv4: 100.64.0.30 (Node ID: 30)
-[17:00:09][I][tailscale.ctrl:1471]: 🌐 Parsed 4 DERP relay server(s)
-[17:00:09][D][tailscale.ctrl:1473]:   Primary DERP: derp1f.tailscale.com:443 (region: nyc)
-[17:00:09][D][tailscale.ctrl:1487]: Error tracking reset after successful map fetch
-[17:00:09][I][tailscale.ctrl:1492]: ✅ Tailscale control plane ACTIVE
-[17:00:09][I][tailscale.ctrl:1494]:    IP Address: 100.64.0.30
-[17:00:09][I][tailscale.ctrl:1496]:    Peers: 0, DERP Servers: 4
-```
+TODO: go from peers to wireguard connectivity to testing of echo server.
+
+Current problem: Lack of Claude tokens ;)
+
+
+## Build & Flash Instructions
+
+The project builds like any other ESPHome node once the extra components and
+submodules are available locally. The steps below take you from an empty
+machine to a flashed ESP32-C3 binary.
+
+1. **Install prerequisites**
+   - Python 3.11+
+   - `pipx` (preferred) or `pip`
+   - ESPHome CLI (`pipx install esphome` or `pip install --user esphome`)
+   - A working Headscale/Tailscale control server with a reusable auth key
+
+2. **Clone the repository and pull submodules**
+   ```bash
+   git clone https://github.com/<your-org>/tailscale-iot.git
+   cd tailscale-iot
+   git submodule update --init --recursive
+   ```
+   The submodules provide the vendored `noise-c` library plus the forked
+   ESPHome components that the build expects.
+
+3. **Create your configuration YAML**
+   - Copy the example as a starting point:
+     ```bash
+     cp example-esp32-c3-tailscale.yaml esp32-ts.yaml
+     ```
+   - Adjust Wi-Fi settings, board type, and anything else specific to your
+     hardware. The example already wires up the `tailscale:` component and the
+     supporting WireGuard stub so it is a good baseline.
+
+4. **Provide secrets**
+   - Copy the template and fill in the required values (Wi-Fi credentials,
+     OTA password, Tailscale auth key, Headscale URL, WireGuard private key, etc.):
+     ```bash
+     cp secrets.yaml.template secrets.yaml
+     $EDITOR secrets.yaml
+     ```
+   - The YAML references secrets like `wifi_ssid`, `tailscale_auth_key`, and
+     `headscale_url`; make sure each key listed in the template has a value.
+
+5. **Compile (optional) and flash**
+   - To only compile and inspect the binary:
+     ```bash
+     esphome compile esp32-ts.yaml
+     ```
+   - To build, flash over USB (or OTA), and watch logs in one step:
+     ```bash
+     esphome run esp32-ts.yaml --device /dev/ttyACM0
+     ```
+   - If you prefer separate steps, use `esphome upload esp32-ts.yaml --device <port>`
+     followed by `esphome logs esp32-ts.yaml`.
+
+6. **Verify runtime**
+   - On first boot the component patches the local `noise-c` sources and
+     reports progress over the ESPHome logger.
+   - Watch for the `tailscale.ctrl` log lines confirming registration, DERP map
+     parsing, and the assigned 100.x.x.x address.
+
+Once the node comes online you can continue iterating on `esp32-ts.yaml` or
+switch to your own configuration files. Subsequent `esphome run` invocations
+will reuse the `.esphome/` build cache for faster rebuilds.
