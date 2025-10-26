@@ -45,6 +45,7 @@ class Http2Session {
   ReceiveCallback recv_cb_;
   std::vector<uint8_t> recv_buffer_;
   bool settings_ack_sent_{false};
+  bool settings_exchanged_{false};
   
   // Pointer to static buffer for response body to avoid heap fragmentation on ESP32-C3
   // The actual buffer is allocated as a static global to avoid stack overflow

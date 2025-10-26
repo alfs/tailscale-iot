@@ -62,10 +62,7 @@ make build        # Build the firmware
 
 
 3. **Create your configuration YAML**
-   - Copy the example as a starting point:
-     ```bash
-     cp example-esp32-c3-tailscale.yaml esp32-ts.yaml
-     ```
+   - Edit the esp32-ts.yaml as a starting point
    - Adjust Wi-Fi settings, board type, and anything else specific to your
      hardware. The example already wires up the `tailscale:` component and the
      supporting WireGuard stub so it is a good baseline.
@@ -87,7 +84,7 @@ make build        # Build the firmware
      ```
    - To build, flash over USB (or OTA), and watch logs in one step:
      ```bash
-     esphome run esp32-ts.yaml --device /dev/ttyACM0
+     esphome run esp32-ts.yaml
      ```
    - If you prefer separate steps, use `esphome upload esp32-ts.yaml --device <port>`
      followed by `esphome logs esp32-ts.yaml`.

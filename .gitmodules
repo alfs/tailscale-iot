@@ -21,3 +21,7 @@
 [submodule "external/optional/libtailscale"]
 	path = external/optional/libtailscale
 	url = https://github.com/tailscale/libtailscale.git
+
+[submodule "external/optional/tailscale"]
+	path = external/optional/tailscale
+	url = https://github.com/tailscale/tailscale

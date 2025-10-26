@@ -1,0 +1,183 @@
+From 209d89e35982cdf94ca88866bd2236a5691b14b0 Mon Sep 17 00:00:00 2001
+From: Stefan Alfredsson <stefan@alfredsson.se>
+Date: Sun, 26 Oct 2025 15:33:09 +0100
+Subject: [PATCH] Add srcFilter to exclude conflicting sources
+
+- Exclude protocol/rand_sodium.c (custom implementation in tailscale.cpp)
+- Exclude crypto/donna (conflicts with esp_wireguard poly1305)
+- Prevents multiple definition linker errors
+---
+ library.json                           |  7 +++-
+ src/backend/ref/cipher-chachapoly.c    | 25 ++++++++---
+ src/backend/sodium/cipher-chachapoly.c | 58 +++++++++++++++++++++++++-
+ 3 files changed, 82 insertions(+), 8 deletions(-)
+
+diff --git a/library.json b/library.json
+index a0e80a3..432f7a4 100644
+--- a/library.json
++++ b/library.json
+@@ -14,7 +14,12 @@
+     ],
+     "build": {
+         "includeDir": "include",
+-        "srcDir": "src"
++        "srcDir": "src",
++        "srcFilter": [
++            "+<*>",
++            "-<protocol/rand_sodium.c>",
++            "-<crypto/donna>"
++        ]
+     },
+     "dependencies": [
+         {
+diff --git a/src/backend/ref/cipher-chachapoly.c b/src/backend/ref/cipher-chachapoly.c
+index cb517ce..58a5837 100644
+--- a/src/backend/ref/cipher-chachapoly.c
++++ b/src/backend/ref/cipher-chachapoly.c
+@@ -44,7 +44,21 @@ static void noise_chachapoly_init_key
+     chacha_keysetup(&(st->chacha), key, 256);
+ }
+ 
+-#define PUT_UINT64(buf, value) \
++// Big-endian for ChaCha20 nonce (RFC 7539 - Go crypto/chacha20poly1305 compatibility)
++#define PUT_UINT64_BE(buf, value) \
++    do { \
++        (buf)[0] = (uint8_t)((value) >> 56); \
++        (buf)[1] = (uint8_t)((value) >> 48); \
++        (buf)[2] = (uint8_t)((value) >> 40); \
++        (buf)[3] = (uint8_t)((value) >> 32); \
++        (buf)[4] = (uint8_t)((value) >> 24); \
++        (buf)[5] = (uint8_t)((value) >> 16); \
++        (buf)[6] = (uint8_t)((value) >> 8); \
++        (buf)[7] = (uint8_t)(value); \
++    } while (0)
++
++// Little-endian for Poly1305 MAC lengths (RFC 7539 Section 2.8.1)
++#define PUT_UINT64_LE(buf, value) \
+     do { \
+         (buf)[0] = (uint8_t)(value); \
+         (buf)[1] = (uint8_t)((value) >> 8); \
+@@ -64,8 +78,8 @@ static void noise_chachapoly_init_key
+  */
+ static void noise_chachapoly_setup(NoiseChaChaPolyState *st, uint64_t n)
+ {
+-    /* Set the initialization vector to the supplied nonce */
+-    PUT_UINT64(st->block, n);
++    /* Set the initialization vector to the supplied nonce (BIG-ENDIAN for Go compatibility) */
++    PUT_UINT64_BE(st->block, n);
+     chacha_ivsetup(&(st->chacha), st->block, 0);
+ 
+     /* Encrypt an initial block to create the Poly1305 key */
+@@ -102,8 +116,9 @@ static void noise_chachapoly_pad_auth(NoiseChaChaPolyState *st, size_t len)
+ static void noise_chachapoly_auth_lengths
+     (NoiseChaChaPolyState *st, uint64_t ad_len, uint64_t data_len)
+ {
+-    PUT_UINT64(st->block, ad_len);
+-    PUT_UINT64(st->block + 8, data_len);
++    /* Poly1305 length fields are little-endian per RFC 7539 Section 2.8 */
++    PUT_UINT64_LE(st->block, ad_len);
++    PUT_UINT64_LE(st->block + 8, data_len);
+     poly1305_update(&(st->poly1305), st->block, 16);
+ }
+ 
+diff --git a/src/backend/sodium/cipher-chachapoly.c b/src/backend/sodium/cipher-chachapoly.c
+index 8c4a6e5..8965985 100644
+--- a/src/backend/sodium/cipher-chachapoly.c
++++ b/src/backend/sodium/cipher-chachapoly.c
+@@ -38,13 +38,59 @@ typedef struct
+ 
+ } NoiseChaChaPolyState;
+ 
++#ifdef ESP_PLATFORM
++#include "esp_log.h"
++static const char *const TAG = "noise.chachapoly";
++
++static void noise_log_sodium_key(const char *label, const NoiseChaChaPolyState *st)
++{
++    ESP_LOGI(TAG, "%s key (32 bytes):", label);
++    ESP_LOG_BUFFER_HEX_LEVEL("noise_key", st->chacha_k, crypto_stream_chacha20_KEYBYTES, ESP_LOG_INFO);
++}
++
++static void noise_log_sodium_decrypt(const NoiseChaChaPolyState *st,
++                                     uint64_t nonce,
++                                     const uint8_t *data,
++                                     size_t len,
++                                     size_t mac_len)
++{
++    ESP_LOGI(TAG, "decrypt state=%p nonce=%llu len=%zu", (const void *)st,
++             (unsigned long long)nonce, len);
++    if (len > 0U) {
++        size_t log_len = (len < 64U) ? len : 64U;
++        ESP_LOG_BUFFER_HEX_LEVEL("decrypt_ct", data, log_len, ESP_LOG_INFO);
++    }
++    if (mac_len > 0U) {
++        size_t log_len = (mac_len < 32U) ? mac_len : 32U;
++        ESP_LOG_BUFFER_HEX_LEVEL("decrypt_mac", data + len, log_len, ESP_LOG_INFO);
++    }
++}
++#endif  // ESP_PLATFORM
++
+ static void noise_chachapoly_init_key
+     (NoiseCipherState *state, const uint8_t *key)
+ {
+     NoiseChaChaPolyState *st = (NoiseChaChaPolyState *)state;
+     memcpy(st->chacha_k, key, crypto_stream_chacha20_KEYBYTES);
++#ifdef ESP_PLATFORM
++    noise_log_sodium_key("init_key", st);
++#endif
+ }
+ 
++// Big-endian for ChaCha20 nonce (RFC 7539 - Go crypto/chacha20poly1305 compatibility)
++#define PUT_UINT64_BE(buf, value) \
++    do { \
++        (buf)[0] = (uint8_t)((value) >> 56); \
++        (buf)[1] = (uint8_t)((value) >> 48); \
++        (buf)[2] = (uint8_t)((value) >> 40); \
++        (buf)[3] = (uint8_t)((value) >> 32); \
++        (buf)[4] = (uint8_t)((value) >> 24); \
++        (buf)[5] = (uint8_t)((value) >> 16); \
++        (buf)[6] = (uint8_t)((value) >> 8); \
++        (buf)[7] = (uint8_t)(value); \
++    } while (0)
++
++// Little-endian for Poly1305 MAC lengths (RFC 7539 Section 2.8.1)
+ #define PUT_UINT64_LE(buf, value) \
+     do { \
+         (buf)[0] = (uint8_t)(value); \
+@@ -65,9 +111,10 @@ static void noise_chachapoly_init_key
+  */
+ static void noise_chachapoly_setup(NoiseChaChaPolyState *st, uint64_t n)
+ {
+-    /* The 96-bit nonce is formed by encoding 32 bits of zeros followed by little-endian encoding of n */
++    /* The 96-bit nonce is formed by encoding 32 bits of zeros followed by big-endian encoding of n */
++    /* BIG-ENDIAN is required for compatibility with Go's crypto/chacha20poly1305 */
+     memset(st->chacha_n, 0, 4);
+-    PUT_UINT64_LE(st->chacha_n + 4, n);
++    PUT_UINT64_BE(st->chacha_n + 4, n);
+ 
+     /* Encrypt an initial block to create the Poly1305 key */
+     memset(st->block, 0, 64);
+@@ -113,6 +160,10 @@ static int noise_chachapoly_encrypt
+      uint8_t *data, size_t len)
+ {
+     NoiseChaChaPolyState *st = (NoiseChaChaPolyState *)state;
++#ifdef ESP_PLATFORM
++    ESP_LOGI(TAG, "encrypt state=%p nonce=%llu len=%zu", (void *)st,
++             (unsigned long long)state->n, len);
++#endif
+     noise_chachapoly_setup(st, state->n);
+     if (ad_len) {
+         crypto_onetimeauth_poly1305_update(&(st->poly1305), ad, ad_len);
+@@ -131,6 +182,9 @@ static int noise_chachapoly_decrypt
+      uint8_t *data, size_t len)
+ {
+     NoiseChaChaPolyState *st = (NoiseChaChaPolyState *)state;
++#ifdef ESP_PLATFORM
++    noise_log_sodium_decrypt(st, state->n, data, len, state->mac_len);
++#endif
+     noise_chachapoly_setup(st, state->n);
+     if (ad_len) {
+         crypto_onetimeauth_poly1305_update(&(st->poly1305), ad, ad_len);
+-- 
+2.50.1 (Apple Git-155)
+

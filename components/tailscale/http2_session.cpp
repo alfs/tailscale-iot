@@ -50,6 +50,7 @@ bool Http2Session::init(SendCallback send_cb, ReceiveCallback recv_cb) {
   this->recv_buffer_.clear();
   this->recv_buffer_.reserve(MAX_FRAME_SIZE + 32);  // reduce reallocations while pulling data
   this->settings_ack_sent_ = false;
+  this->settings_exchanged_ = false;
   this->response_buffer_ = g_response_buffer;  // Assign pointer to static buffer
   this->response_buffer_used_ = 0;
   return this->send_initial_settings();
@@ -85,6 +86,12 @@ bool Http2Session::send_initial_settings() {
 }
 
 bool Http2Session::process_control_frames(uint32_t timeout_ms) {
+  // Skip if SETTINGS exchange already completed
+  if (this->settings_exchanged_) {
+    ESP_LOGD(TAG, "SETTINGS already exchanged, skipping control frames");
+    return true;
+  }
+
   Frame frame;
   ESP_LOGD(TAG, "Processing HTTP/2 control frames");
 
@@ -92,7 +99,7 @@ bool Http2Session::process_control_frames(uint32_t timeout_ms) {
   // 1. Receive server SETTINGS
   // 2. Send our SETTINGS ACK
   // That's it! Don't try to drain additional frames - they'll arrive async and be handled later.
-  
+
   bool received_server_settings = false;
 
   // Read just the initial SETTINGS frame from the server
@@ -130,6 +137,9 @@ bool Http2Session::process_control_frames(uint32_t timeout_ms) {
   if (!this->send_settings_ack_()) {
     return false;
   }
+
+  // Mark SETTINGS exchange as complete
+  this->settings_exchanged_ = true;
 
   ESP_LOGI(TAG, "");
   ESP_LOGI(TAG, "✓ HTTP/2 connection established - ready for requests");
@@ -236,8 +246,10 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
 
     // Ignore frames not for our stream (unless they're connection-level control frames)
     if (frame.stream_id != stream_id && frame.stream_id != 0) {
-      ESP_LOGW(TAG, "Ignoring frame for unexpected stream %u", frame.stream_id);
-      continue;
+      ESP_LOGE(TAG, "Received frame for unexpected stream %u (expected %u) - stream desync detected",
+               frame.stream_id, stream_id);
+      ESP_LOGE(TAG, "This usually means a previous request failed. Aborting to prevent buffer overflow.");
+      return false;
     }
     switch (frame.type) {
       case kFrameTypeHeaders: {

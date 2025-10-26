@@ -32,6 +32,8 @@ enum class TailscaleState {
 struct PeerInfo {
   uint64_t node_id;
   std::string public_key;
+  std::string disco_key;
+  std::string hostname;
   std::string endpoint;
   uint16_t port;
   std::vector<std::string> allowed_ips;
@@ -116,10 +118,18 @@ class TailscaleComponent : public PollingComponent {
   std::string machine_key_;
   std::string node_key_public_;
   std::string node_key_private_;
+  std::string disco_key_public_;
+  std::string disco_key_private_;
   std::vector<uint8_t> machine_key_raw_;      // Raw bytes for Noise session
   std::vector<uint8_t> machine_pub_raw_;      // Raw public key bytes
   StaticMapResponse static_map_;              // STATIC buffer for map response (NO heap)
   bool keys_loaded_from_nvs_{false};          // Track if keys were loaded from NVS
+
+  // Disco protocol
+  int disco_socket_{-1};                      // UDP socket for Disco protocol
+  void setup_disco_socket_();
+  void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
+  void check_disco_responses_();              // Check for incoming Disco messages
   
   // Protocol handlers
   std::unique_ptr<NoiseSession> noise_session_;

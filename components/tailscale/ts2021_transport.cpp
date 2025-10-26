@@ -422,6 +422,10 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
   if (!this->http2_session_->post_json(stream_id, scheme, authority, path, payload, response_ptr, response_size,
                                        status_code, timeout_ms)) {
     ESP_LOGE(TAG, "HTTP/2 POST failed for %s", path.c_str());
+    // Reset HTTP/2 session on failure to avoid stream ID desync
+    ESP_LOGW(TAG, "Resetting HTTP/2 session after failure");
+    this->http2_session_.reset();
+    this->next_stream_id_ = 1;
     return false;
   }
   return true;

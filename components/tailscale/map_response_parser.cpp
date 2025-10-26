@@ -506,6 +506,16 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
         continue;  // Skip peers without keys
       }
 
+      // Extract DiscoKey for NAT traversal
+      const char* disco_field = find_str(peer_obj_start, peer_obj_end, "\"DiscoKey\":");
+      if (disco_field) {
+        size_t disco_len;
+        const char* disco_val = extract_quoted_value(disco_field + 11, peer_obj_end, &disco_len);
+        if (disco_val) {
+          safe_strncpy(peer->disco_key, disco_val, sizeof(peer->disco_key), disco_len);
+        }
+      }
+
       // Extract Name (preferred) or HostName for easier identification
       size_t hostname_len = 0;
       const char* hostname_val = nullptr;

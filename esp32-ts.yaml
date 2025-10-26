@@ -1,7 +1,6 @@
-# Minimal test configuration for Tailscale component
 esphome:
-  name: tailscale-test
-  friendly_name: Tailscale Test
+  name: esp32-ts
+  friendly_name: ESP32 Tailscale
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -20,6 +19,7 @@ wifi:
 
 # Enable logging
 logger:
+  #level: INFO
   level: DEBUG
 
 # Time source (required)
@@ -27,14 +27,12 @@ time:
   - platform: sntp
     id: sntp_time
 
-# Test just the component loading first
 external_components:
   - source:
       type: local
       path: components
     components: [ tailscale ]
 
-# Minimal tailscale config for syntax testing
 tailscale:
   id: tailscale_client
   auth_key: !secret tailscale_auth_key
