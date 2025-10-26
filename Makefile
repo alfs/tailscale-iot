@@ -126,7 +126,27 @@ install-espidf-deps: ## Install ESP-IDF Python packages in PlatformIO venv
 		exit 1; \
 	fi; \
 	echo "  Using Python: $$ESPIDF_PYTHON"; \
-	$$ESPIDF_PYTHON -m pip install -q idf-component-manager esp-idf-kconfig cryptography || exit 1; \
+	if ! $$ESPIDF_PYTHON -m pip --version >/dev/null 2>&1; then \
+		echo "  $(YELLOW)pip not found in ESP-IDF venv, installing...$(NC)"; \
+		if command -v pip3 >/dev/null 2>&1; then \
+			echo "  Using system pip3 to install packages..."; \
+			VENV_SITE=$$($$ESPIDF_PYTHON -c "import site; print(site.getsitepackages()[0])" 2>/dev/null); \
+			if [ -n "$$VENV_SITE" ]; then \
+				pip3 install --target="$$VENV_SITE" idf-component-manager esp-idf-kconfig cryptography || exit 1; \
+			else \
+				echo "  $(RED)✗ Could not determine venv site-packages location$(NC)"; \
+				echo "  Try installing pip manually: curl -sS https://bootstrap.pypa.io/get-pip.py | $$ESPIDF_PYTHON"; \
+				exit 1; \
+			fi; \
+		else \
+			echo "  $(RED)✗ pip not available$(NC)"; \
+			echo "  Install pip in ESP-IDF venv manually:"; \
+			echo "    curl -sS https://bootstrap.pypa.io/get-pip.py | $$ESPIDF_PYTHON"; \
+			exit 1; \
+		fi; \
+	else \
+		$$ESPIDF_PYTHON -m pip install -q idf-component-manager esp-idf-kconfig cryptography || exit 1; \
+	fi; \
 	echo "$(GREEN)✓ ESP-IDF packages installed:$(NC)"; \
 	echo "  • idf-component-manager (for ESP-IDF components)"; \
 	echo "  • esp-idf-kconfig (for menuconfig)"; \
