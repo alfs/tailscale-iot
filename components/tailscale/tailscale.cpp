@@ -363,23 +363,24 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
       }
     }
 
-    // Close control plane connection to free memory before DERP connections
-    // The control plane will be reconnected on-demand for keepalives and endpoint updates
-    ESP_LOGI(TAG, "→ Closing control plane connection to free memory...");
-    if (this->ts2021_transport_) {
-      this->ts2021_transport_->reset();
-    }
-    if (this->upgrade_channel_) {
-      this->upgrade_channel_->close();
-      this->upgrade_channel_.reset();
-    }
-    // Reset Noise session so it can be reinitialized for reconnection
-    this->noise_session_.reset();
-    this->noise_session_ = esphome::make_unique<NoiseSession>();
-    if (!this->noise_session_->initialize_ik()) {
-      ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
-    }
-    ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP connections)");
+    // KEEP control plane connection alive to avoid out-of-memory crashes during reconnection
+    // Previously: closed control plane to free ~70KB RAM for DERP connections
+    // Problem: Reconnecting requires re-allocating 16KB HTTP/2 recv_buffer, which fails with OOM
+    // Solution: Keep control plane alive (~70KB cost) to ensure stability
+    ESP_LOGI(TAG, "→ Keeping control plane connection alive for keepalives and endpoint updates");
+    // if (this->ts2021_transport_) {
+    //   this->ts2021_transport_->reset();
+    // }
+    // if (this->upgrade_channel_) {
+    //   this->upgrade_channel_->close();
+    //   this->upgrade_channel_.reset();
+    // }
+    // this->noise_session_.reset();
+    // this->noise_session_ = esphome::make_unique<NoiseSession>();
+    // if (!this->noise_session_->initialize_ik()) {
+    //   ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
+    // }
+    ESP_LOGI(TAG, "   ✓ Control plane remains connected");
 
 
     this->transition_to(TailscaleState::CONNECTED);
@@ -2599,25 +2600,26 @@ bool TailscaleComponent::send_map_keepalive_() {
   // Note: We don't need to parse the keepalive response - the server acknowledges with HTTP 200
   // and may send an empty or minimal response since OmitPeers=true
 
-  // Close control plane after keepalive if we had to reconnect it
-  // This maintains memory efficiency for DERP connections
-  if (!transport_ready) {
-    ESP_LOGI(TAG, "→ Closing control plane to free memory...");
-    if (this->ts2021_transport_) {
-      this->ts2021_transport_->reset();
-    }
-    if (this->upgrade_channel_) {
-      this->upgrade_channel_->close();
-      this->upgrade_channel_.reset();
-    }
-    // Reset Noise session so it can be reinitialized for next reconnection
-    this->noise_session_.reset();
-    this->noise_session_ = esphome::make_unique<NoiseSession>();
-    if (!this->noise_session_->initialize_ik()) {
-      ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
-    }
-    ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP)");
-  }
+  // KEEP control plane alive after keepalive to avoid OOM crashes
+  // Previously: closed control plane to free ~70KB for DERP connections
+  // Problem: Causes out-of-memory crashes when reconnecting due to 16KB buffer allocation
+  // Solution: Keep control plane alive permanently
+  // if (!transport_ready) {
+  //   ESP_LOGI(TAG, "→ Closing control plane to free memory...");
+  //   if (this->ts2021_transport_) {
+  //     this->ts2021_transport_->reset();
+  //   }
+  //   if (this->upgrade_channel_) {
+  //     this->upgrade_channel_->close();
+  //     this->upgrade_channel_.reset();
+  //   }
+  //   this->noise_session_.reset();
+  //   this->noise_session_ = esphome::make_unique<NoiseSession>();
+  //   if (!this->noise_session_->initialize_ik()) {
+  //     ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
+  //   }
+  //   ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP)");
+  // }
 
   return true;
 }
