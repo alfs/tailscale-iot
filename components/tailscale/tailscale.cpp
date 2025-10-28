@@ -401,6 +401,19 @@ void TailscaleComponent::handle_connected_state_() {
   // Connect to DERP if not already connected
   if (this->derp_client_ && !this->derp_client_->is_ready()) {
     if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
+      // Temporarily close control plane to free ~70KB for DERP TLS session (mbedtls allocation)
+      // DERP TLS requires significant memory that fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00)
+      // when control plane is active
+      ESP_LOGI(TAG, "→ Closing control plane temporarily for DERP connection...");
+      if (this->ts2021_transport_) {
+        this->ts2021_transport_->reset();
+      }
+      if (this->upgrade_channel_) {
+        this->upgrade_channel_->close();
+        this->upgrade_channel_.reset();
+      }
+      ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP TLS)");
+
       ESP_LOGI(TAG, "Connecting to DERP relay...");
       if (this->derp_client_->connect()) {
         ESP_LOGI(TAG, "✓ DERP relay connected");
