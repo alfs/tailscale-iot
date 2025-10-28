@@ -329,8 +329,7 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
     }
 
     // Close control plane connection to free memory before DERP connections
-    // The official Tailscale client closes the control plane after initial setup
-    // and reopens it only when needed (for MAP updates, keepalives, etc.)
+    // The control plane will be reconnected on-demand for keepalives and endpoint updates
     ESP_LOGI(TAG, "→ Closing control plane connection to free memory...");
     if (this->ts2021_transport_) {
       this->ts2021_transport_->reset();
@@ -360,6 +359,7 @@ void TailscaleComponent::handle_connected_state_() {
         ESP_LOGI(TAG, "✓ DERP relay connected");
 
         // Send initial endpoint update after DERP connection
+        // Control plane will be reconnected, used, then closed automatically
         if (!this->initial_endpoint_sent_ && !this->discovered_endpoint_.empty()) {
           ESP_LOGI(TAG, "→ Sending initial endpoint update to server...");
           if (this->send_map_keepalive_()) {
@@ -2422,10 +2422,21 @@ bool TailscaleComponent::perform_stun_query_() {
 bool TailscaleComponent::send_map_keepalive_() {
   ESP_LOGD(TAG, "→ Sending keepalive map request...");
 
-  // Ensure transport is ready
-  if (!this->ts2021_transport_ || !this->ts2021_transport_->handshake_complete()) {
-    ESP_LOGE(TAG, "TS2021 transport not ready for keepalive");
-    return false;
+  // Check if control plane needs to be reconnected
+  // After initial MAP fetch, we close the control plane to free ~70KB for DERP connections
+  // For keepalives and endpoint updates, we need to temporarily reconnect
+  bool transport_ready = this->ts2021_transport_ && this->ts2021_transport_->handshake_complete();
+
+  if (!transport_ready) {
+    ESP_LOGI(TAG, "→ Control plane closed - reconnecting for keepalive...");
+
+    // Ensure TS2021 transport is ready (will reconnect if needed)
+    if (!this->ensure_ts2021_ready_()) {
+      ESP_LOGE(TAG, "Failed to reconnect control plane for keepalive");
+      return false;
+    }
+
+    ESP_LOGI(TAG, "   ✓ Control plane reconnected");
   }
 
   if (!this->upgrade_channel_) {
@@ -2524,6 +2535,14 @@ bool TailscaleComponent::send_map_keepalive_() {
 
   // Note: We don't need to parse the keepalive response - the server acknowledges with HTTP 200
   // and may send an empty or minimal response since OmitPeers=true
+
+  // Close control plane after keepalive if we had to reconnect it
+  // This maintains memory efficiency for DERP connections
+  if (!transport_ready && this->ts2021_transport_) {
+    ESP_LOGI(TAG, "→ Closing control plane to free memory...");
+    this->ts2021_transport_->reset();
+    ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP)");
+  }
 
   return true;
 }
