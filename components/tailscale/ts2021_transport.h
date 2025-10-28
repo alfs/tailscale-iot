@@ -42,7 +42,8 @@ class Ts2021Transport {
   bool start_http2_session();
   bool http2_post_json(const std::string &scheme, const std::string &authority, const std::string &path,
                        const std::string &payload, const char *&response_ptr, size_t &response_size,
-                       uint16_t &status_code, uint32_t timeout_ms = 5000);
+                       uint16_t &status_code, uint32_t timeout_ms = 5000, bool close_stream = true,
+                       bool filter_node_only = false);
 
   bool handshake_complete() const { return this->stage_ == Stage::kTransportReady; }
   bool failed() const { return this->stage_ == Stage::kFailed; }

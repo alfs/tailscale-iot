@@ -1,4 +1,6 @@
 #include "tailscale.h"
+#include "derp_client.h"
+#include "local_server_cert.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include "esphome/components/network/util.h"
@@ -13,6 +15,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <netdb.h>
 
 extern "C" {
 #include <noise/protocol/dhstate.h>
@@ -135,11 +138,29 @@ void TailscaleComponent::loop() {
 }
 
 void TailscaleComponent::update() {
-  // Once connected, stay connected - the map request is a long-lived streaming connection
-  // The server will push updates as they happen
-  // We don't need to periodically re-fetch the map
+  // IMPORTANT: The map connection is bidirectional streaming:
+  // - Server->Client: Map updates when network changes
+  // - Client->Server: Keepalive map requests to update endpoints and maintain session
+  //
+  // We MUST send periodic keepalive map requests to:
+  // 1. Update our endpoint information on the server
+  // 2. Keep the control plane session alive
+  // 3. Signal to the server that we're still active
+
   if (this->state_ == TailscaleState::CONNECTED) {
-    ESP_LOGV(TAG, "Connected - map stream active");
+    uint32_t now = millis();
+
+    // Send keepalive map request every 60 seconds
+    if (now - this->last_keepalive_time_ >= KEEPALIVE_INTERVAL_MS) {
+      ESP_LOGD(TAG, "Sending periodic keepalive map request");
+      if (this->send_map_keepalive_()) {
+        this->last_keepalive_time_ = now;
+        ESP_LOGD(TAG, "✓ Keepalive sent successfully");
+      } else {
+        ESP_LOGW(TAG, "Failed to send keepalive - will retry in %u seconds", KEEPALIVE_INTERVAL_MS / 1000);
+        this->last_keepalive_time_ = now;  // Update anyway to avoid flooding with retries
+      }
+    }
   }
 }
 
@@ -216,6 +237,17 @@ void TailscaleComponent::handle_registering_state_() {
 void TailscaleComponent::handle_fetching_map_state_() {
   ESP_LOGI(TAG, "→ Step 3/3: Fetching network map...");
 
+  // QUICK FIX: Perform STUN discovery BEFORE fetching map so we can include endpoint in initial request
+  // This avoids the need for separate keepalive requests which conflict with the streaming map connection
+  ESP_LOGI(TAG, "→ Discovering our public endpoint via STUN (before map request)...");
+  if (this->perform_stun_query_()) {
+    ESP_LOGI(TAG, "✓ Discovered endpoint: %s", this->discovered_endpoint_.c_str());
+    ESP_LOGI(TAG, "  Endpoint will be included in initial map request");
+  } else {
+    ESP_LOGW(TAG, "STUN query failed - endpoint will not be available");
+  }
+
+  // Now fetch map WITH endpoint included in the request
   if (!this->fetch_map_response_()) {
     ESP_LOGE(TAG, "Failed to fetch map");
     delay(2000);  // 2 second delay after failure
@@ -224,6 +256,7 @@ void TailscaleComponent::handle_fetching_map_state_() {
   }
 
   ESP_LOGI(TAG, "✓ Network map received - %d peers discovered", this->node_config_.peers.size());
+
   ESP_LOGI(TAG, "Network configuration:");
   ESP_LOGI(TAG, "  Node ID: %" PRIu64, this->node_config_.node_id);
   ESP_LOGI(TAG, "  IPv4: %s", this->node_config_.ipv4_address.c_str());
@@ -237,6 +270,39 @@ void TailscaleComponent::handle_fetching_map_state_() {
              name,
              peer.endpoint.c_str(),
              peer.online ? "online" : "offline");
+  }
+
+  // Initialize DERP client for relay connectivity
+  ESP_LOGI(TAG, "→ Initializing DERP relay client...");
+  this->derp_client_ = std::make_unique<DerpClient>();
+
+  // Use DERP server from DERPMap if available, otherwise fall back to control URL
+  std::string derp_url;
+  if (this->static_map_.derp_host[0] != '\0') {
+    // Use DERP server from map response
+    if (this->static_map_.derp_port != 443) {
+      derp_url = "https://" + std::string(this->static_map_.derp_host) +
+                 ":" + std::to_string(this->static_map_.derp_port) + "/derp";
+    } else {
+      derp_url = "https://" + std::string(this->static_map_.derp_host) + "/derp";
+    }
+    ESP_LOGI(TAG, "Using DERP server from map: %s", derp_url.c_str());
+  } else {
+    // Fallback to constructing from control URL (for compatibility)
+    derp_url = "https://" + this->control_url_.substr(8) + "/derp";
+    ESP_LOGW(TAG, "No DERP server in map, using fallback: %s", derp_url.c_str());
+  }
+
+  if (this->derp_client_->init(derp_url,
+                               this->machine_pub_raw_.data(),
+                               this->machine_key_raw_.data())) {
+    ESP_LOGI(TAG, "✓ DERP client initialized");
+    this->derp_client_->set_packet_callback([this](
+        const uint8_t* peer_key, const uint8_t* packet, size_t len) {
+      this->handle_derp_packet_(peer_key, packet, len);
+    });
+  } else {
+    ESP_LOGW(TAG, "Failed to initialize DERP client - relay will be unavailable");
   }
 
   this->transition_to(TailscaleState::CONFIGURING_WIREGUARD);
@@ -262,6 +328,15 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
       }
     }
 
+    // Close control plane connection to free memory before DERP connections
+    // The official Tailscale client closes the control plane after initial setup
+    // and reopens it only when needed (for MAP updates, keepalives, etc.)
+    ESP_LOGI(TAG, "→ Closing control plane connection to free memory...");
+    if (this->ts2021_transport_) {
+      this->ts2021_transport_->reset();
+      ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP connections)");
+    }
+
     this->transition_to(TailscaleState::CONNECTED);
     this->retry_count_ = 0;
   } else {
@@ -275,6 +350,34 @@ void TailscaleComponent::handle_connected_state_() {
   // Start echo server on first entry to CONNECTED state
   if (this->echo_server_socket_ == -1) {
     this->setup_echo_server_();
+  }
+
+  // Connect to DERP if not already connected
+  if (this->derp_client_ && !this->derp_client_->is_ready()) {
+    if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
+      ESP_LOGI(TAG, "Connecting to DERP relay...");
+      if (this->derp_client_->connect()) {
+        ESP_LOGI(TAG, "✓ DERP relay connected");
+
+        // Send initial endpoint update after DERP connection
+        if (!this->initial_endpoint_sent_ && !this->discovered_endpoint_.empty()) {
+          ESP_LOGI(TAG, "→ Sending initial endpoint update to server...");
+          if (this->send_map_keepalive_()) {
+            ESP_LOGI(TAG, "✓ Initial endpoint update sent successfully");
+            this->initial_endpoint_sent_ = true;
+          } else {
+            ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
+          }
+        }
+      } else {
+        ESP_LOGW(TAG, "Failed to connect to DERP relay");
+      }
+    }
+  }
+
+  // Process DERP client if initialized
+  if (this->derp_client_ && this->derp_client_->is_ready()) {
+    this->derp_client_->process();
   }
 
   // Check for incoming Disco responses
@@ -637,11 +740,25 @@ bool TailscaleComponent::fetch_control_key_() {
   std::string url = this->control_url_ + "/key?v=130";
   ESP_LOGI(TAG, "→ Step 1/3: Fetching control server public key...");
   ESP_LOGD(TAG, "Control key URL: %s", url.c_str());
-  
+
   esp_http_client_config_t config = {};
   config.url = url.c_str();
   config.timeout_ms = 5000;
-  config.crt_bundle_attach = esp_crt_bundle_attach;
+
+  // Use local dev certificate for self-signed local servers (192.168.x.x or localhost)
+  if (this->control_url_.find("192.168.") != std::string::npos ||
+      this->control_url_.find("localhost") != std::string::npos ||
+      this->control_url_.find("127.0.0.1") != std::string::npos) {
+    // For local testing, skip all cert verification
+    // Don't set cert_pem or crt_bundle_attach - leave them NULL
+    config.skip_cert_common_name_check = true;
+    ESP_LOGW(TAG, "⚠️  INSECURE: Skipping certificate verification for local server (TEST ONLY)");
+  } else {
+    // Use system certificate bundle for HTTPS verification of public servers
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    ESP_LOGD(TAG, "Using system certificate bundle for TLS verification (control key fetch)");
+  }
+
   config.method = HTTP_METHOD_GET;
   
   esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -1021,8 +1138,8 @@ bool TailscaleComponent::perform_registration_() {
   reg_payload.hostinfo_json = build_hostinfo_json(hostinfo);
 
   std::string payload_json = render_register_request(reg_payload);
-  ESP_LOGD(TAG, "Registration payload (%d bytes)", payload_json.length());
-  ESP_LOGV(TAG, "%s", payload_json.c_str());
+  ESP_LOGI(TAG, "Registration request JSON (%d bytes):", payload_json.length());
+  ESP_LOGI(TAG, "%s", payload_json.c_str());
 
   // Send registration via HTTP/2 - use pointer to avoid heap allocation
   const char *response_ptr = nullptr;
@@ -1075,14 +1192,16 @@ bool TailscaleComponent::perform_registration_() {
     return false;
   }
 
-  ESP_LOGD(TAG, "Registration successful (status %u)", status_code);
-  
+  ESP_LOGI(TAG, "✓ Registration successful (status %u)", status_code);
+  ESP_LOGI(TAG, "Registration response JSON (%zu bytes):", response_size);
+  if (response_size > 0 && response_ptr) {
+    ESP_LOGI(TAG, "%.*s", (int)response_size, response_ptr);
+  }
+
   // If we used NVS keys and they were accepted, log success
   if (this->keys_loaded_from_nvs_) {
     ESP_LOGI(TAG, "✓ NVS keys validated - server accepted existing identity");
   }
-  
-  ESP_LOGD(TAG, "Response length: %zu bytes", response_size);
   
   // TODO: Parse registration response and extract node credentials
   
@@ -1128,13 +1247,18 @@ bool TailscaleComponent::fetch_map_response_() {
   map_payload.hostinfo_json = build_hostinfo_json(hostinfo);
   map_payload.stream = true;        // Must be true to receive initial map response and updates
   map_payload.read_only = false;    // Must be false to get full map response (not just lite update)
-  map_payload.omit_peers = false;   // Get peers - we'll stream parse to handle large responses
+  map_payload.omit_peers = false;   // Must be false with stream=true (headscale protocol requirement)
+
+  // Include our discovered endpoint if available
+  if (!this->discovered_endpoint_.empty()) {
+    map_payload.endpoints.push_back(this->discovered_endpoint_);
+    ESP_LOGI(TAG, "Including endpoint in map request: %s", this->discovered_endpoint_.c_str());
+  }
 
   std::string payload_json = render_map_request(map_payload);
   ESP_LOGD(TAG, "Sending map request: OmitPeers=%s (streaming parser enabled)",
            map_payload.omit_peers ? "true" : "false");
-  ESP_LOGD(TAG, "Map request payload (%zu bytes)", payload_json.length());
-  ESP_LOGV(TAG, "%s", payload_json.c_str());
+  ESP_LOGI(TAG, "Map request payload (%zu bytes): %s", payload_json.length(), payload_json.c_str());
 
   // Send map request via HTTP/2 - use pointer to avoid heap allocation
   const char *response_ptr = nullptr;
@@ -1143,14 +1267,57 @@ bool TailscaleComponent::fetch_map_response_() {
   std::string scheme = this->control_url_.rfind("http://", 0) == 0 ? "http" : "https";
 
   ESP_LOGD(TAG, "Sending map request to %s/machine/map", this->control_url_.c_str());
+  // Map response can be large (50KB+) and may take time to receive over the encrypted/framed connection
+  // Use a longer timeout of 120 seconds to allow for full response transmission over slow connections
+  // Note: Each MapRequest uses a separate HTTP/2 stream (not bidirectional on same stream)
+  // Keepalives are sent as new requests on different stream IDs
+  // Map request with Stream=true - don't wait for stream closure, return buffered data
+  // Disable JSON filtering to receive full MapResponse including Peers array
+  // close_stream=true: Client sends END_STREAM to signal request complete
+  // filter_node_only=false: Response handler buffers full response (Node + Peers + DERPMap + etc)
   if (!this->ts2021_transport_->http2_post_json(scheme, this->upgrade_channel_->authority(),
                                                  "/machine/map", payload_json,
-                                                 response_ptr, response_size, status, 8000)) {
+                                                 response_ptr, response_size, status, 120000, true, false)) {
     ESP_LOGE(TAG, "Map request HTTP/2 POST failed");
     return false;
   }
 
-  ESP_LOGD(TAG, "Map request completed with status %u, body length %zu", status, response_size);
+  ESP_LOGI(TAG, "Map request completed with status %u, body length %zu", status, response_size);
+
+  // Check for error responses (without Tailscale wire format)
+  if (response_size > 0 && response_ptr != nullptr) {
+    // Check for common error messages that indicate user configuration issues
+    if (strstr(response_ptr, "node not found") != nullptr) {
+      ESP_LOGW(TAG, "⚠️  SERVER ERROR: Node not found - this usually means:");
+      ESP_LOGW(TAG, "   1. The preauth key has expired");
+      ESP_LOGW(TAG, "   2. The preauth key was already used");
+      ESP_LOGW(TAG, "   3. Registration succeeded but node wasn't created in database");
+      ESP_LOGW(TAG, "   → Please create a new preauth key on your Headscale server");
+      ESP_LOGW(TAG, "   → Update the auth_key in your ESPHome configuration");
+      ESP_LOGW(TAG, "   → Flash the updated configuration to this device");
+      ESP_LOGW(TAG, "");
+      ESP_LOGW(TAG, "⏰ Waiting 30 seconds before retry to avoid flooding the server...");
+
+      // Mark as warning in ESPHome status
+      this->status_set_warning("Node not found - check preauth key");
+
+      // Wait 30 seconds before retrying to avoid flooding the server
+      delay(30000);
+
+      return false;
+    } else if (strstr(response_ptr, "unauthorized") != nullptr || strstr(response_ptr, "forbidden") != nullptr) {
+      ESP_LOGW(TAG, "⚠️  SERVER ERROR: Authorization failed");
+      ESP_LOGW(TAG, "   → Check your Headscale server configuration");
+      ESP_LOGW(TAG, "   → Verify the auth_key is correct and not expired");
+      ESP_LOGW(TAG, "");
+      ESP_LOGW(TAG, "⏰ Waiting 30 seconds before retry...");
+
+      this->status_set_warning("Authorization failed");
+      delay(30000);
+
+      return false;
+    }
+  }
 
   if (status < 200 || status >= 300) {
     ESP_LOGE(TAG, "Map request returned error status %u", status);
@@ -1162,9 +1329,9 @@ bool TailscaleComponent::fetch_map_response_() {
     return false;
   }
 
-  // Show first 200 chars for debugging (safe with buffer pointer)
-  size_t preview_len = (response_size < 200) ? response_size : 200;
-  ESP_LOGD(TAG, "Map response body (first %zu chars): %.*s", preview_len, (int)preview_len, response_ptr);
+  // Show first 500 chars for debugging (safe with buffer pointer)
+  size_t preview_len = (response_size < 500) ? response_size : 500;
+  ESP_LOGI(TAG, "Map response body (first %zu chars): %.*s", preview_len, (int)preview_len, response_ptr);
 
   // Headscale returns TS2021 map responses using the "Tailscale wire format":
   // a 4-byte little-endian length prefix followed by the JSON payload. Strip
@@ -1212,7 +1379,11 @@ bool TailscaleComponent::fetch_map_response_() {
   ESP_LOGD(TAG, "Using STATIC parser (NO heap) for %zu byte JSON", json_len);
   ESP_LOGD(TAG, "Free heap before parse: %u bytes", esp_get_free_heap_size());
 
-  if (!parse_map_static(json_ptr, json_len, this->static_map_)) {
+  // Pass allowed_peers filter to parser (or nullptr if empty)
+  const std::vector<std::string> *filter = 
+      this->disco_ping_targets_.empty() ? nullptr : &this->disco_ping_targets_;
+
+  if (!parse_map_static(json_ptr, json_len, this->static_map_, filter)) {
     ESP_LOGE(TAG, "Static parser failed to extract map data");
     return false;
   }
@@ -1240,6 +1411,7 @@ bool TailscaleComponent::fetch_map_response_() {
     const StaticPeerInfo *static_peer = &this->static_map_.peers[i];
     if (!static_peer->valid) continue;
 
+    // Filtering is now done during parsing, so all peers here are already approved
     PeerInfo peer;
     peer.public_key = static_peer->public_key;
     peer.disco_key = static_peer->disco_key;
@@ -1268,7 +1440,7 @@ bool TailscaleComponent::fetch_map_response_() {
     this->node_config_.peers.push_back(std::move(peer));
   }
 
-  ESP_LOGD(TAG, "Converted %d static peers to NodeConfig", this->static_map_.peer_count);
+  ESP_LOGD(TAG, "Converted %d static peers to NodeConfig", this->node_config_.peers.size());
 
   return true;
 }
@@ -1696,6 +1868,120 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   }
 }
 
+void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
+                                          const uint8_t* tx_id, const std::string& peer_disco_key) {
+  if (this->disco_socket_ == -1) {
+    ESP_LOGW(TAG, "Disco socket not initialized");
+    return;
+  }
+
+  ESP_LOGI(TAG, "→ Sending Disco PONG to %s:%u", sender_ip.c_str(), sender_port);
+
+  // Disco protocol constants
+  const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0x9b};  // "TS💬"
+  const uint8_t DISCO_VERSION = 0;
+  const uint8_t DISCO_MSG_PONG = 2;
+
+  // Decode our disco private key
+  std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
+  if (our_priv_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco private key size: %d (expected 32)", our_priv_raw.size());
+    return;
+  }
+
+  // Decode peer's disco public key
+  std::string peer_pub_raw;
+  std::string peer_key_str = peer_disco_key;
+
+  // Strip "discokey:" prefix if present and convert from hex
+  if (peer_key_str.substr(0, 9) == "discokey:") {
+    peer_key_str = peer_key_str.substr(9);
+    if (peer_key_str.size() == 64) {  // 32 bytes = 64 hex chars
+      peer_pub_raw.resize(32);
+      for (size_t i = 0; i < 32; i++) {
+        char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
+        peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
+      }
+    } else {
+      ESP_LOGE(TAG, "Invalid hex disco key length: %d (expected 64)", peer_key_str.size());
+      return;
+    }
+  } else {
+    peer_pub_raw = this->base64_decode(peer_key_str);
+  }
+
+  if (peer_pub_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid peer disco key size: %d (expected 32)", peer_pub_raw.size());
+    return;
+  }
+
+  // Generate nonce (24 bytes for NaCl box)
+  uint8_t nonce[24];
+  esp_fill_random(nonce, 24);
+
+  // Prepare plaintext payload (PONG marker)
+  uint8_t plaintext[32] = {0x02};  // Pong marker + padding
+
+  // Compute shared secret using ECDH (Curve25519)
+  uint8_t shared_secret[32];
+  if (crypto_scalarmult_curve25519(shared_secret,
+                                   (const uint8_t*)our_priv_raw.data(),
+                                   (const uint8_t*)peer_pub_raw.data()) != 0) {
+    ESP_LOGE(TAG, "Failed to compute shared secret");
+    return;
+  }
+
+  // Encrypt using XSalsa20-Poly1305
+  uint8_t ciphertext[sizeof(plaintext) + 16];  // 16 bytes for Poly1305 MAC
+
+  crypto_stream_salsa20_xor(ciphertext + 16, plaintext, sizeof(plaintext),
+                            nonce, shared_secret);
+
+  crypto_onetimeauth_poly1305(ciphertext,  // First 16 bytes = MAC
+                              ciphertext + 16,  // Ciphertext
+                              sizeof(plaintext),
+                              shared_secret);
+
+  // Clear sensitive data
+  sodium_memzero(shared_secret, sizeof(shared_secret));
+
+  // Build final PONG message
+  std::vector<uint8_t> message;
+  message.reserve(6 + 1 + 1 + 12 + 24 + sizeof(ciphertext));
+
+  // Magic
+  message.insert(message.end(), DISCO_MAGIC, DISCO_MAGIC + 6);
+  // Version
+  message.push_back(DISCO_VERSION);
+  // Message type (PONG)
+  message.push_back(DISCO_MSG_PONG);
+  // TX ID (echo back the PING's TX ID)
+  message.insert(message.end(), tx_id, tx_id + 12);
+  // Nonce
+  message.insert(message.end(), nonce, nonce + 24);
+  // Encrypted payload
+  message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
+
+  // Send UDP packet back to sender
+  struct sockaddr_in dest_addr{};
+  dest_addr.sin_family = AF_INET;
+  dest_addr.sin_port = htons(sender_port);
+
+  if (inet_pton(AF_INET, sender_ip.c_str(), &dest_addr.sin_addr) <= 0) {
+    ESP_LOGE(TAG, "Invalid sender address: %s", sender_ip.c_str());
+    return;
+  }
+
+  ssize_t sent = sendto(this->disco_socket_, message.data(), message.size(), 0,
+                        (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+  if (sent < 0) {
+    ESP_LOGE(TAG, "Failed to send disco PONG: errno %d", errno);
+  } else {
+    ESP_LOGI(TAG, "✓ Sent Disco PONG (%d bytes) to %s:%u", sent, sender_ip.c_str(), sender_port);
+  }
+}
+
 void TailscaleComponent::check_disco_responses_() {
   if (this->disco_socket_ < 0) {
     return;
@@ -1752,13 +2038,152 @@ void TailscaleComponent::check_disco_responses_() {
   // 2 = PONG
   // 3 = CALL_ME_MAYBE
   switch (msg_type) {
-    case 1:
+    case 1: {
       ESP_LOGI(TAG, "  Message type: PING");
-      // TODO: Respond with PONG
+
+      // Find the peer by matching sender IP
+      std::string peer_disco_key;
+      for (const auto& peer : this->node_config_.peers) {
+        if (peer.endpoint == sender_ip) {
+          peer_disco_key = peer.disco_key;
+          ESP_LOGD(TAG, "  Found peer with matching endpoint: %s", peer.hostname.c_str());
+          break;
+        }
+      }
+
+      if (peer_disco_key.empty()) {
+        ESP_LOGW(TAG, "  Cannot respond to PING - peer disco key not found for %s", sender_ip);
+      } else {
+        // Extract TX ID (12 bytes at offset 8)
+        const uint8_t* tx_id = &buffer[8];
+
+        // Send PONG response
+        this->send_disco_pong_(sender_ip, sender_port, tx_id, peer_disco_key);
+      }
       break;
-    case 2:
+    }
+    case 2: {
       ESP_LOGI(TAG, "  ✓ Message type: PONG (peer received our PING!)");
+
+      // Find the peer by matching sender IP to decrypt the PONG
+      std::string peer_disco_key;
+      std::string peer_hostname;
+      for (const auto& peer : this->node_config_.peers) {
+        if (peer.endpoint == sender_ip) {
+          peer_disco_key = peer.disco_key;
+          peer_hostname = peer.hostname;
+          ESP_LOGD(TAG, "  Found peer: %s", peer_hostname.c_str());
+          break;
+        }
+      }
+
+      if (peer_disco_key.empty()) {
+        ESP_LOGW(TAG, "  Cannot decrypt PONG - peer disco key not found for %s", sender_ip);
+        break;
+      }
+
+      // Decrypt and validate the PONG message
+      if (received < 8 + 12 + 24 + 16 + 32) {  // header + tx_id + nonce + mac + ciphertext minimum
+        ESP_LOGW(TAG, "  PONG packet too short for encrypted payload");
+        break;
+      }
+
+      // Extract nonce (24 bytes at offset 20)
+      const uint8_t* nonce = &buffer[20];
+
+      // Extract encrypted payload (MAC + ciphertext)
+      const uint8_t* encrypted_payload = &buffer[44];  // After magic(6) + version(1) + type(1) + tx_id(12) + nonce(24)
+      size_t encrypted_len = received - 44;
+
+      if (encrypted_len < 16 + 32) {  // Need at least MAC(16) + payload(32)
+        ESP_LOGW(TAG, "  Encrypted payload too short");
+        break;
+      }
+
+      // Decode our disco private key
+      std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
+      if (our_priv_raw.size() != 32) {
+        ESP_LOGE(TAG, "Invalid our disco private key size: %d", our_priv_raw.size());
+        break;
+      }
+
+      // Decode peer's disco public key
+      std::string peer_pub_raw;
+      std::string peer_key_str = peer_disco_key;
+
+      // Strip "discokey:" prefix if present and convert from hex
+      if (peer_key_str.substr(0, 9) == "discokey:") {
+        peer_key_str = peer_key_str.substr(9);
+
+        if (peer_key_str.size() == 64) {  // 32 bytes = 64 hex chars
+          peer_pub_raw.resize(32);
+          for (size_t i = 0; i < 32; i++) {
+            char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
+            peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
+          }
+        } else {
+          ESP_LOGE(TAG, "Invalid hex disco key length: %d", peer_key_str.size());
+          break;
+        }
+      } else {
+        peer_pub_raw = this->base64_decode(peer_key_str);
+      }
+
+      if (peer_pub_raw.size() != 32) {
+        ESP_LOGE(TAG, "Invalid peer disco key size: %d", peer_pub_raw.size());
+        break;
+      }
+
+      // Compute shared secret using ECDH (Curve25519)
+      uint8_t shared_secret[32];
+      if (crypto_scalarmult_curve25519(shared_secret,
+                                       (const uint8_t*)our_priv_raw.data(),
+                                       (const uint8_t*)peer_pub_raw.data()) != 0) {
+        ESP_LOGE(TAG, "Failed to compute shared secret for PONG decryption");
+        break;
+      }
+
+      // Verify Poly1305 MAC (first 16 bytes of encrypted payload)
+      uint8_t computed_mac[16];
+      const uint8_t* received_mac = encrypted_payload;
+      const uint8_t* ciphertext = encrypted_payload + 16;
+      size_t ciphertext_len = encrypted_len - 16;
+
+      crypto_onetimeauth_poly1305(computed_mac, ciphertext, ciphertext_len, shared_secret);
+
+      if (sodium_memcmp(computed_mac, received_mac, 16) != 0) {
+        ESP_LOGW(TAG, "  PONG MAC verification failed - message may be corrupted or forged");
+        sodium_memzero(shared_secret, sizeof(shared_secret));
+        break;
+      }
+
+      ESP_LOGD(TAG, "  ✓ PONG MAC verified");
+
+      // Decrypt with Salsa20
+      uint8_t plaintext[64];  // Large enough for any PONG payload
+      if (ciphertext_len > sizeof(plaintext)) {
+        ESP_LOGW(TAG, "  PONG payload too large: %d bytes", ciphertext_len);
+        sodium_memzero(shared_secret, sizeof(shared_secret));
+        break;
+      }
+
+      crypto_stream_salsa20_xor(plaintext, ciphertext, ciphertext_len, nonce, shared_secret);
+
+      // Clear sensitive data
+      sodium_memzero(shared_secret, sizeof(shared_secret));
+
+      // Validate PONG marker (should be 0x02)
+      if (plaintext[0] != 0x02) {
+        ESP_LOGW(TAG, "  Invalid PONG marker: 0x%02x (expected 0x02)", plaintext[0]);
+        break;
+      }
+
+      ESP_LOGI(TAG, "  ✓ PONG decrypted and validated successfully!");
+      ESP_LOGI(TAG, "  ✓ Direct UDP connectivity confirmed with %s at %s:%u",
+               peer_hostname.empty() ? "peer" : peer_hostname.c_str(), sender_ip, sender_port);
+
       break;
+    }
     case 3:
       ESP_LOGI(TAG, "  Message type: CALL_ME_MAYBE");
       break;
@@ -1766,26 +2191,414 @@ void TailscaleComponent::check_disco_responses_() {
       ESP_LOGW(TAG, "  Unknown message type: %u", msg_type);
       break;
   }
+}
 
-  // Try to decrypt the message
-  if (received < 8 + 12 + 24 + 16) {  // header + tx_id + nonce + mac minimum
-    ESP_LOGW(TAG, "  Disco packet too short for encrypted payload");
-    return;
+}  // namespace tailscale
+}  // namespace esphome
+// Endpoint discovery implementation for Tailscale ESP32 client
+#include "tailscale.h"
+#include "esphome/core/log.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+namespace esphome {
+namespace tailscale {
+
+// STUN magic cookie (RFC 5389)
+static const uint32_t STUN_MAGIC_COOKIE = 0x2112A442;
+
+// STUN message types
+static const uint16_t STUN_BINDING_REQUEST = 0x0001;
+static const uint16_t STUN_BINDING_RESPONSE = 0x0101;
+
+// STUN attributes
+static const uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
+static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
+
+// Simple STUN query to discover our public endpoint
+bool TailscaleComponent::perform_stun_query_() {
+  ESP_LOGD(TAG, "→ Performing STUN query to discover endpoint...");
+
+  // Create UDP socket for STUN
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
+    ESP_LOGE(TAG, "Failed to create STUN socket: %d", errno);
+    return false;
   }
 
-  // Extract transaction ID (12 bytes after header)
-  ESP_LOGD(TAG, "  TX ID: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-           buffer[8], buffer[9], buffer[10], buffer[11], 
-           buffer[12], buffer[13], buffer[14], buffer[15],
-           buffer[16], buffer[17], buffer[18], buffer[19]);
+  // Set socket to non-blocking
+  int flags = fcntl(sock, F_GETFL, 0);
+  fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-  // Extract nonce (24 bytes starting at offset 20)
-  ESP_LOGD(TAG, "  Nonce: %02x%02x%02x%02x... (24 bytes)", 
-           buffer[20], buffer[21], buffer[22], buffer[23]);
+  // TODO: The DERP server's STUN has issues, using Google's public STUN for now
+  // In the future, we should use the DERP server from DERPMap (this->static_map_.derp_host)
+  // with the STUNPort from the map (this->static_map_.stun_port, defaults to 3478)
 
-  // TODO: Decrypt payload using our disco private key
-  // For now, just log that we received it
-  ESP_LOGI(TAG, "  ✓ Disco response received - peer is reachable!");
+  struct sockaddr_in stun_addr{};
+  stun_addr.sin_family = AF_INET;
+
+  // Using Google's public STUN server temporarily
+  const char* stun_server = "stun.l.google.com";
+  uint16_t stun_port = 19302;  // Google's STUN port
+  stun_addr.sin_port = htons(stun_port);
+
+  ESP_LOGD(TAG, "Using Google STUN server (temporary): %s:%d", stun_server, stun_port);
+
+  struct hostent *server = gethostbyname(stun_server);
+  if (server == nullptr) {
+    ESP_LOGE(TAG, "Failed to resolve STUN server %s", stun_server);
+    close(sock);
+    return false;
+  }
+
+  memcpy(&stun_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+  // Build STUN Binding Request
+  uint8_t stun_request[20];  // Minimal STUN header
+  memset(stun_request, 0, sizeof(stun_request));
+
+  // Message type: Binding Request (0x0001)
+  stun_request[0] = 0x00;
+  stun_request[1] = 0x01;
+
+  // Message length: 0 (no attributes)
+  stun_request[2] = 0x00;
+  stun_request[3] = 0x00;
+
+  // Magic cookie
+  stun_request[4] = (STUN_MAGIC_COOKIE >> 24) & 0xFF;
+  stun_request[5] = (STUN_MAGIC_COOKIE >> 16) & 0xFF;
+  stun_request[6] = (STUN_MAGIC_COOKIE >> 8) & 0xFF;
+  stun_request[7] = STUN_MAGIC_COOKIE & 0xFF;
+
+  // Transaction ID (12 random bytes)
+  for (int i = 0; i < 12; i++) {
+    stun_request[8 + i] = esp_random() % 256;
+  }
+
+  ESP_LOGI(TAG, "STUN request to %s:%d (%d bytes):", stun_server, stun_port, (int)sizeof(stun_request));
+  ESP_LOGI(TAG, "  Hex: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+           stun_request[0], stun_request[1], stun_request[2], stun_request[3],
+           stun_request[4], stun_request[5], stun_request[6], stun_request[7],
+           stun_request[8], stun_request[9], stun_request[10], stun_request[11],
+           stun_request[12], stun_request[13], stun_request[14], stun_request[15],
+           stun_request[16], stun_request[17], stun_request[18], stun_request[19]);
+
+  // Send STUN request
+  ssize_t sent = sendto(sock, stun_request, sizeof(stun_request), 0,
+                        (struct sockaddr *)&stun_addr, sizeof(stun_addr));
+  if (sent < 0) {
+    ESP_LOGE(TAG, "Failed to send STUN request: %d", errno);
+    close(sock);
+    return false;
+  }
+
+  // Wait for response with timeout
+  fd_set readfds;
+  FD_ZERO(&readfds);
+  FD_SET(sock, &readfds);
+
+  struct timeval timeout = {2, 0};  // 2 second timeout
+  int ret = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+
+  if (ret <= 0) {
+    ESP_LOGW(TAG, "STUN query timeout - no response from server");
+    close(sock);
+    // Not a fatal error - we can still use DERP
+    return false;
+  }
+
+  // Read STUN response
+  uint8_t response[512];
+  struct sockaddr_in response_addr{};
+  socklen_t addr_len = sizeof(response_addr);
+
+  ssize_t received = recvfrom(sock, response, sizeof(response), 0,
+                              (struct sockaddr *)&response_addr, &addr_len);
+  if (received < 20) {
+    ESP_LOGE(TAG, "Invalid STUN response (too short)");
+    close(sock);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "✓ STUN response received (%d bytes from %s:%d):",
+           (int)received,
+           inet_ntoa(response_addr.sin_addr),
+           ntohs(response_addr.sin_port));
+  // Print first 20 bytes (header)
+  if (received >= 20) {
+    ESP_LOGI(TAG, "  Header: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+             response[0], response[1], response[2], response[3],
+             response[4], response[5], response[6], response[7],
+             response[8], response[9], response[10], response[11],
+             response[12], response[13], response[14], response[15],
+             response[16], response[17], response[18], response[19]);
+  }
+  // Print attribute bytes (20-31 for 32-byte response)
+  if (received >= 32) {
+    ESP_LOGI(TAG, "  Attrs:  %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+             response[20], response[21], response[22], response[23],
+             response[24], response[25], response[26], response[27],
+             response[28], response[29], response[30], response[31]);
+  }
+
+  // Parse STUN response header
+  uint16_t msg_type = (response[0] << 8) | response[1];
+  uint16_t msg_len = (response[2] << 8) | response[3];
+
+  ESP_LOGI(TAG, "  Type: 0x%04x, Length: %d bytes", msg_type, msg_len);
+
+  if (msg_type != STUN_BINDING_RESPONSE) {
+    ESP_LOGE(TAG, "Unexpected STUN message type: 0x%04x (expected 0x%04x)",
+             msg_type, STUN_BINDING_RESPONSE);
+    close(sock);
+    return false;
+  }
+
+  // Parse attributes to find XOR-MAPPED-ADDRESS
+  size_t offset = 20;  // Skip header
+  bool found_endpoint = false;
+
+  while (offset + 4 <= received) {
+    uint16_t attr_type = (response[offset] << 8) | response[offset + 1];
+    uint16_t attr_len = (response[offset + 2] << 8) | response[offset + 3];
+
+    ESP_LOGI(TAG, "STUN attribute: type=0x%04x, len=%d", attr_type, attr_len);
+
+    if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && attr_len >= 8) {
+      // Parse XOR-MAPPED-ADDRESS
+      uint8_t family = response[offset + 5];
+      uint16_t xor_port = (response[offset + 6] << 8) | response[offset + 7];
+
+      if (family == 0x01) {  // IPv4
+        uint32_t xor_addr = (response[offset + 8] << 24) |
+                           (response[offset + 9] << 16) |
+                           (response[offset + 10] << 8) |
+                           response[offset + 11];
+
+        // XOR with magic cookie to get real values
+        uint16_t real_port = xor_port ^ (STUN_MAGIC_COOKIE >> 16);
+        uint32_t real_addr = xor_addr ^ STUN_MAGIC_COOKIE;
+
+        // Convert to string
+        char ip_str[INET_ADDRSTRLEN];
+        struct in_addr addr;
+        addr.s_addr = htonl(real_addr);
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+
+        this->discovered_endpoint_ = std::string(ip_str) + ":" + std::to_string(real_port);
+        ESP_LOGI(TAG, "✓ STUN discovered our endpoint: %s", this->discovered_endpoint_.c_str());
+        found_endpoint = true;
+        break;
+      }
+    } else if (attr_type == STUN_ATTR_MAPPED_ADDRESS && attr_len >= 8) {
+      // Fallback to non-XOR MAPPED-ADDRESS (older STUN)
+      uint8_t family = response[offset + 5];
+      uint16_t port = (response[offset + 6] << 8) | response[offset + 7];
+
+      if (family == 0x01) {  // IPv4
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &response[offset + 8], ip_str, sizeof(ip_str));
+
+        this->discovered_endpoint_ = std::string(ip_str) + ":" + std::to_string(port);
+        ESP_LOGI(TAG, "✓ STUN discovered our endpoint (legacy): %s", this->discovered_endpoint_.c_str());
+        found_endpoint = true;
+        break;
+      }
+    }
+
+    // Move to next attribute (with padding to 4-byte boundary)
+    offset += 4 + ((attr_len + 3) & ~3);
+  }
+
+  close(sock);
+  return found_endpoint;
+}
+
+// Send periodic keepalive map request with updated endpoints
+bool TailscaleComponent::send_map_keepalive_() {
+  ESP_LOGD(TAG, "→ Sending keepalive map request...");
+
+  // Ensure transport is ready
+  if (!this->ts2021_transport_ || !this->ts2021_transport_->handshake_complete()) {
+    ESP_LOGE(TAG, "TS2021 transport not ready for keepalive");
+    return false;
+  }
+
+  if (!this->upgrade_channel_) {
+    ESP_LOGE(TAG, "No upgrade channel available for keepalive");
+    return false;
+  }
+
+  // Ensure HTTP/2 session is ready - restart it if necessary
+  if (!this->ts2021_transport_->start_http2_session()) {
+    ESP_LOGW(TAG, "Failed to start HTTP/2 session for keepalive");
+    return false;
+  }
+
+  // Re-discover endpoint via STUN in case NAT mapping changed
+  // This is important because NAT mappings can change over time
+  if (this->perform_stun_query_()) {
+    ESP_LOGD(TAG, "Updated endpoint: %s", this->discovered_endpoint_.c_str());
+  } else {
+    ESP_LOGD(TAG, "STUN query failed - using previous endpoint");
+  }
+
+  // Build keepalive map request
+  MapPayload map_payload;
+  map_payload.capability_version = 90;
+
+  // Convert keys to hex format
+  std::string node_key_hex = base64_to_hex(this->node_key_public_);
+  if (node_key_hex.empty()) {
+    ESP_LOGE(TAG, "Failed to convert node key to hex");
+    return false;
+  }
+  map_payload.node_key = "nodekey:" + node_key_hex;
+
+  std::string disco_key_hex = base64_to_hex(this->disco_key_public_);
+  if (disco_key_hex.empty()) {
+    ESP_LOGE(TAG, "Failed to convert disco key to hex");
+    return false;
+  }
+  map_payload.disco_key = "discokey:" + disco_key_hex;
+
+  // Build minimal hostinfo for keepalive
+  HostinfoConfig hostinfo;
+  hostinfo.hostname = this->device_name_;
+  hostinfo.os = "esphome";
+  hostinfo.os_version = "2025.6.1";
+  hostinfo.go_arch = "riscv32";
+  map_payload.hostinfo_json = build_hostinfo_json(hostinfo);
+
+  // CRITICAL: Set KeepAlive to true for keepalive requests
+  map_payload.keep_alive = true;
+  map_payload.stream = true;
+  map_payload.read_only = false;
+  map_payload.omit_peers = false;  // Must be false to receive peer list and updates
+
+  // Include current endpoint
+  if (!this->discovered_endpoint_.empty()) {
+    map_payload.endpoints.push_back(this->discovered_endpoint_);
+    ESP_LOGI(TAG, "Including endpoint in keepalive: %s", this->discovered_endpoint_.c_str());
+  } else {
+    ESP_LOGW(TAG, "No endpoint to include in keepalive");
+  }
+
+  std::string payload_json = render_map_request(map_payload);
+  ESP_LOGI(TAG, "DEBUG: Keepalive payload (%zu bytes): %s", payload_json.length(), payload_json.c_str());
+
+  // Send keepalive map request via HTTP/2
+  const char *response_ptr = nullptr;
+  size_t response_size = 0;
+  uint16_t status = 0;
+  std::string scheme = this->control_url_.rfind("http://", 0) == 0 ? "http" : "https";
+
+  ESP_LOGI(TAG, "DEBUG: Sending keepalive to /machine/map with %zu endpoints", map_payload.endpoints.size());
+
+  // Keepalive map requests with JSON filtering enabled
+  if (!this->ts2021_transport_->http2_post_json(scheme, this->upgrade_channel_->authority(),
+                                                 "/machine/map", payload_json,
+                                                 response_ptr, response_size, status, 5000, true, true)) {
+    ESP_LOGE(TAG, "Failed to send keepalive map request");
+    return false;
+  }
+
+  ESP_LOGI(TAG, "DEBUG: Keepalive response - HTTP %u, size: %zu bytes", status, response_size);
+
+  if (status < 200 || status >= 300) {
+    ESP_LOGW(TAG, "Keepalive returned HTTP %u", status);
+    return false;
+  }
+
+  // Log response content for debugging endpoint acknowledgment
+  if (response_ptr && response_size > 0) {
+    std::string response_snippet(response_ptr, std::min(response_size, (size_t)500));
+    ESP_LOGI(TAG, "DEBUG: Keepalive response snippet: %s", response_snippet.c_str());
+  }
+
+  ESP_LOGI(TAG, "✓ Keepalive sent successfully (HTTP %u, response %zu bytes)", status, response_size);
+
+  // Note: We don't need to parse the keepalive response - the server acknowledges with HTTP 200
+  // and may send an empty or minimal response since OmitPeers=true
+
+  return true;
+}
+
+// DEPRECATED: This function sends a minimal endpoint update which doesn't work properly
+// Use send_map_keepalive_() instead for proper keepalive with endpoint updates
+bool TailscaleComponent::send_endpoint_update_() {
+  if (this->discovered_endpoint_.empty()) {
+    ESP_LOGW(TAG, "No endpoint to send - discovery failed");
+    return false;
+  }
+
+  if (!this->upgrade_channel_) {
+    ESP_LOGE(TAG, "No upgrade channel available for endpoint update");
+    return false;
+  }
+
+  ESP_LOGD(TAG, "→ Sending endpoint update to control server...");
+
+  // Ensure transport is ready
+  if (!this->ts2021_transport_ || !this->ts2021_transport_->handshake_complete()) {
+    ESP_LOGE(TAG, "TS2021 transport not ready for endpoint update");
+    return false;
+  }
+
+  // Build endpoint update message
+  // Tailscale control protocol expects endpoints in the map request
+  // Format: {"Endpoints": ["1.2.3.4:5678"]}
+  std::string update = "{\"Endpoints\":[\"" + this->discovered_endpoint_ + "\"]}";
+
+  // Send as HTTP/2 POST to the map endpoint
+  // The control server will update our node's endpoint list
+  std::string path = "/machine/map";
+
+  // Prepare for response
+  const char* response_ptr = nullptr;
+  size_t response_size = 0;
+  uint16_t status_code = 0;
+  std::string scheme = this->control_url_.rfind("http://", 0) == 0 ? "http" : "https";
+
+  ESP_LOGI(TAG, "Sending endpoint update: %s to %s", this->discovered_endpoint_.c_str(), path.c_str());
+
+  // Send the endpoint update via HTTP/2 POST (no filtering needed for endpoint updates)
+  if (!this->ts2021_transport_->http2_post_json(scheme, this->upgrade_channel_->authority(),
+                                                 path, update,
+                                                 response_ptr, response_size, status_code, 5000, true, false)) {
+    ESP_LOGE(TAG, "Failed to send endpoint update");
+    return false;
+  }
+
+  if (status_code != 200) {
+    ESP_LOGW(TAG, "Endpoint update returned HTTP %d", status_code);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "✓ Endpoint update sent successfully (HTTP %d)", status_code);
+  return true;
+}
+
+// Handle packets received from DERP relay
+void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len) {
+  ESP_LOGI(TAG, "← Received packet from DERP relay (%d bytes)", len);
+
+  // TODO: Route to WireGuard interface
+  // This packet is already encrypted WireGuard traffic
+  // Need to inject it into the WireGuard receive path
+
+  // For now, just log
+  ESP_LOGD(TAG, "  From peer: %02x%02x%02x%02x...",
+           peer_key[0], peer_key[1], peer_key[2], peer_key[3]);
+  ESP_LOGD(TAG, "  Packet: %02x%02x%02x%02x... (%d bytes)",
+           packet[0], packet[1], packet[2], packet[3], len);
+
+  // TODO: Call WireGuard receive function
+  // wireguard_receive_packet(packet, len);
 }
 
 }  // namespace tailscale

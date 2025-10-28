@@ -23,6 +23,9 @@ class Ts2021Upgrade {
   bool write_raw(const uint8_t *data, size_t len);
   bool read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t timeout_ms);
 
+  // Clear receive buffer - use when resetting HTTP/2 session to avoid stale data
+  void clear_receive_buffer();
+
   bool is_connected() const { return this->tls_ != nullptr; }
   bool http2_negotiated() const { return this->http2_negotiated_; }
   const std::string &authority() const { return this->authority_; }

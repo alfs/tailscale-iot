@@ -11,6 +11,9 @@ esp32:
       # Increase task watchdog timeout from default 5s to 30s
       # This allows longer network operations during TS2021 handshake
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      # Enable certificate bundle for TLS verification
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: y
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL: y
 
 # WiFi configuration
 wifi:
@@ -41,6 +44,7 @@ tailscale:
   time_id: sntp_time
   wireguard_id: wg_iface
   update_interval: 5s
+  allowed_peers: !secret allowed_peers
 
 wireguard:
   id: wg_iface

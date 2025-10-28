@@ -11,8 +11,10 @@
 #include "register_payload.h"
 #include "map_payload.h"
 #include "hostinfo_builder.h"
+#include "derp_client.h"
 #include <string>
 #include <vector>
+#include <memory>
 #include <cstring>  // for memset
 
 namespace esphome {
@@ -66,6 +68,7 @@ class TailscaleComponent : public PollingComponent {
   void set_device_name(const std::string &name) { this->device_name_ = name; }
   void set_time_source(time::RealTimeClock *time) { this->time_source_ = time; }
   void set_wireguard_component(Component *wg) { this->wireguard_component_ = wg; }
+  void add_disco_ping_target(const std::string &hostname) { this->disco_ping_targets_.push_back(hostname); }
 
   // State getters
   TailscaleState get_state() const { return this->state_; }
@@ -127,20 +130,40 @@ class TailscaleComponent : public PollingComponent {
 
   // Disco protocol
   int disco_socket_{-1};                      // UDP socket for Disco protocol
+  std::vector<std::string> disco_ping_targets_;  // Hostnames to send Disco pings to (configured by user)
   void setup_disco_socket_();
   void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
+  void send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
+                        const uint8_t* tx_id, const std::string& peer_disco_key);
   void check_disco_responses_();              // Check for incoming Disco messages
-  
+  bool decrypt_disco_payload_(const uint8_t* encrypted, size_t enc_len,
+                               const uint8_t* nonce, const std::string& peer_disco_key,
+                               uint8_t* plaintext, size_t* plain_len);
+  void handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port);
+
   // Protocol handlers
   std::unique_ptr<NoiseSession> noise_session_;
   std::unique_ptr<Ts2021Transport> ts2021_transport_;
   std::unique_ptr<Ts2021Upgrade> upgrade_channel_;
+  std::unique_ptr<DerpClient> derp_client_;
+
+  // Endpoint discovery and advertisement
+  std::string discovered_endpoint_;  // Our public IP:port
+  bool initial_endpoint_sent_{false};  // Track if initial endpoint update was sent
+  bool send_endpoint_update_();      // Send endpoint to control server
+  bool perform_stun_query_();         // Query DERP server for our public IP
+  void handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len);
 
   // Timing
   uint32_t last_update_time_{0};
+  uint32_t last_keepalive_time_{0};
   uint32_t retry_count_{0};
   static const uint32_t MAX_RETRIES = 5;
   static const uint32_t RETRY_DELAY_MS = 5000;
+  static const uint32_t KEEPALIVE_INTERVAL_MS = 60000;  // Send keepalive every 60 seconds
+
+  // Keepalive
+  bool send_map_keepalive_();  // Send periodic keepalive map request with endpoints
 };
 
 }  // namespace tailscale

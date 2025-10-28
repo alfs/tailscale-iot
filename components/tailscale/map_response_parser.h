@@ -41,9 +41,15 @@ struct StaticMapResponse {
   StaticPeerInfo peers[MAX_PEERS];
   uint8_t peer_count;
 
-  StaticMapResponse() : peer_count(0) {
+  // DERP relay server (first node from DERPMap)
+  char derp_host[128];  // DERP server hostname
+  uint16_t derp_port;   // DERP server port (usually 443)
+  uint16_t stun_port;   // STUN server port (usually 3478, 0 means use default)
+
+  StaticMapResponse() : peer_count(0), derp_port(0), stun_port(0) {
     memset(node_id, 0, sizeof(node_id));
     memset(node_ipv4, 0, sizeof(node_ipv4));
+    memset(derp_host, 0, sizeof(derp_host));
   }
 };
 
@@ -78,7 +84,9 @@ bool parse_map_response(const std::string &json, MapResponseData &out);
 bool parse_map_response_streaming(const char *json, size_t len, MapResponseData &out);
 
 // STATIC BUFFER PARSER - NO HEAP ALLOCATIONS AT ALL
-bool parse_map_static(const char *json, size_t len, StaticMapResponse &out);
+// Optional filter: if provided, only peers matching hostnames in the vector are extracted
+bool parse_map_static(const char *json, size_t len, StaticMapResponse &out, 
+                      const std::vector<std::string> *allowed_peers = nullptr);
 
 // Print peer table for debugging
 void print_peer_table(const StaticMapResponse &map);

@@ -26,6 +26,7 @@ CONF_HOSTNAME = "hostname"
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_CONTROL_PUBLIC_KEY = "control_public_key"
 CONF_CONTROL_PSK = "control_psk"
+CONF_DISCO_PING_TARGETS = "allowed_peers"
 
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
 TailscaleComponent = tailscale_ns.class_("TailscaleComponent", cg.PollingComponent)
@@ -42,6 +43,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CONTROL_PUBLIC_KEY): cv.string,
         cv.Optional(CONF_CONTROL_PSK): cv.string,
         cv.Optional(CONF_UPDATE_INTERVAL, default="60s"): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_DISCO_PING_TARGETS): cv.ensure_list(cv.string),
     }
 ).extend(cv.polling_component_schema("60s"))
 
@@ -157,3 +159,8 @@ async def to_code(config):
         wg_component = await cg.get_variable(config[CONF_WIREGUARD_ID])
         cg.add_define("USE_WIREGUARD")
         cg.add(var.set_wireguard_component(wg_component))
+    
+    # Set disco ping targets if provided
+    if CONF_DISCO_PING_TARGETS in config:
+        for target in config[CONF_DISCO_PING_TARGETS]:
+            cg.add(var.add_disco_ping_target(target))

@@ -328,10 +328,11 @@ bool Ts2021Transport::receive_plaintext(std::vector<uint8_t> &out, uint32_t time
   }
 
   // Read the framed message from WebSocket
-  // Buffer size needs to accommodate 16KB HTTP/2 DATA frames + WebSocket/Noise overhead
-  // 20KB should be sufficient for most cases (matching legacy implementation)
+  // ESP32-C3 has limited RAM and suffers from fragmentation with large allocations
+  // Use 8KB buffer - WebSocket layer buffers partial frames automatically
+  // This is enough for most control messages while preventing OOM crashes
   std::vector<uint8_t> framed;
-  if (!this->upgrade_->read_raw(framed, 20480, timeout_ms)) {
+  if (!this->upgrade_->read_raw(framed, 8192, timeout_ms)) {
     ESP_LOGD(TAG, "WebSocket read timeout or closed");
     return false;
   }
@@ -409,7 +410,8 @@ bool Ts2021Transport::start_http2_session() {
 bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::string &authority,
                                       const std::string &path, const std::string &payload,
                                       const char *&response_ptr, size_t &response_size,
-                                      uint16_t &status_code, uint32_t timeout_ms) {
+                                      uint16_t &status_code, uint32_t timeout_ms, bool close_stream,
+                                      bool filter_node_only) {
   if (!this->http2_session_) {
     ESP_LOGW(TAG, "HTTP/2 session not ready");
     return false;
@@ -420,12 +422,18 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
     ESP_LOGD(TAG, "No pending control frames processed before request");
   }
   if (!this->http2_session_->post_json(stream_id, scheme, authority, path, payload, response_ptr, response_size,
-                                       status_code, timeout_ms)) {
+                                       status_code, timeout_ms, close_stream, filter_node_only)) {
     ESP_LOGE(TAG, "HTTP/2 POST failed for %s", path.c_str());
-    // Reset HTTP/2 session on failure to avoid stream ID desync
-    ESP_LOGW(TAG, "Resetting HTTP/2 session after failure");
-    this->http2_session_.reset();
-    this->next_stream_id_ = 1;
+
+    // DO NOT reset HTTP/2 session for stream desync errors
+    // Stream desync happens when multiple streams are active (e.g., streaming map + keepalive)
+    // Resetting would cause the new session to start at stream 1, conflicting with old streams
+    // Instead, keep incrementing stream IDs to avoid conflicts with streams that have data in flight
+    ESP_LOGW(TAG, "HTTP/2 request failed - continuing with next stream ID");
+
+    // Note: We do NOT reset next_stream_id_ or http2_session_
+    // This allows subsequent requests to use new stream IDs that don't conflict
+
     return false;
   }
   return true;

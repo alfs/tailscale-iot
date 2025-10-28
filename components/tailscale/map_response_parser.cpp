@@ -276,6 +276,34 @@ bool parse_map_response_streaming(const char *json, size_t len, MapResponseData 
         if (addr_p >= node_end || *addr_p == ']') break;
       }
     }
+
+    // DEBUG: Extract and log Node Endpoints to verify server acknowledgment
+    const char* node_endpoints_key = find_str(node_start, node_end, "\"Endpoints\":[");
+    if (node_endpoints_key) {
+      ESP_LOGI(TAG, "DEBUG: Node Endpoints field found in map response!");
+      const char* ep_p = node_endpoints_key + 13;  // Skip to array content
+      int ep_count = 0;
+
+      // Extract each endpoint (they're quoted strings)
+      while (ep_p < node_end && ep_count < 5) {  // Limit to first 5 for logging
+        size_t ep_len;
+        const char* ep_val = extract_quoted_value(ep_p, node_end, &ep_len);
+        if (!ep_val) break;
+
+        std::string endpoint(ep_val, ep_len);
+        ESP_LOGI(TAG, "DEBUG:   Node Endpoint[%d]: %s", ep_count, endpoint.c_str());
+        ep_count++;
+
+        ep_p = ep_val + ep_len + 1;  // Move past this endpoint
+        if (ep_p >= node_end || *ep_p == ']') break;
+      }
+
+      if (ep_count == 0) {
+        ESP_LOGW(TAG, "DEBUG: Node Endpoints array is empty!");
+      }
+    } else {
+      ESP_LOGW(TAG, "DEBUG: Node Endpoints field NOT found in map response!");
+    }
   }
 
   // ========== Extract Peers Array ==========
@@ -380,11 +408,16 @@ static void safe_strncpy(char *dest, const char *src, size_t dest_size, size_t s
 }
 
 // STATIC BUFFER PARSER - Absolutely NO heap allocations
-bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
+bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
+                      const std::vector<std::string> *allowed_peers) {
   if (!json || len == 0) return false;
 
   const char* end = json + len;
   ESP_LOGI(TAG, "🔍 STATIC parse (NO heap): %zu bytes", len);
+  
+  if (allowed_peers && !allowed_peers->empty()) {
+    ESP_LOGI(TAG, "Filtering enabled: only extracting %zu allowed peer(s)", allowed_peers->size());
+  }
 
   // Clear output (stack memory only)
   out.peer_count = 0;
@@ -457,10 +490,16 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
     }
   }
 
-  // ========== Extract First 5 Peers ==========
+  // ========== Extract Peers (with optional filtering) ==========
   const char* peers_start = find_str(json, end, "\"Peers\":[");
   if (peers_start) {
-    ESP_LOGI(TAG, "Found Peers section (extracting first %d)", MAX_PEERS);
+    // Storage limit is always MAX_PEERS (static buffer size)
+    // But when filtering, we scan ALL peers in the response
+    if (allowed_peers && !allowed_peers->empty()) {
+      ESP_LOGI(TAG, "Found Peers section (scanning all peers, storing up to %d matches)", MAX_PEERS);
+    } else {
+      ESP_LOGI(TAG, "Found Peers section (extracting first %d peers, no filtering)", MAX_PEERS);
+    }
 
     const char* peers_end = peers_start + 9;
     int depth = 1;
@@ -471,6 +510,8 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
     }
 
     const char* p = peers_start + 9;
+    int peers_processed = 0;  // Count all peers seen
+    int peers_skipped = 0;    // Count peers skipped due to filtering
 
     while (p < peers_end && out.peer_count < MAX_PEERS) {
       // Find next peer object
@@ -536,6 +577,28 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
         safe_strncpy(peer->hostname, hostname_val, sizeof(peer->hostname), hostname_len);
       }
 
+      // Apply filtering if enabled
+      peers_processed++;
+      if (allowed_peers && !allowed_peers->empty()) {
+        bool is_allowed = false;
+        std::string hostname_str(peer->hostname);
+        
+        for (const auto& target : *allowed_peers) {
+          if (hostname_str == target || hostname_str.find(target) == 0) {
+            is_allowed = true;
+            break;
+          }
+        }
+        
+        if (!is_allowed) {
+          peers_skipped++;
+          ESP_LOGD(TAG, "  Skipping peer %d: %s (not in allowed list)", 
+                   peers_processed, peer->hostname[0] ? peer->hostname : "(no hostname)");
+          p = peer_obj_end;
+          continue;  // Skip this peer
+        }
+      }
+
       // Extract first Endpoint only
       const char* endpoints_field = find_str(peer_obj_start, peer_obj_end, "\"Endpoints\":[");
       if (endpoints_field) {
@@ -566,7 +629,7 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
       }
 
       out.peer_count++;
-      ESP_LOGD(TAG, "  Peer %d: %s [%.16s...] (endpoint: %s, %d allowed IPs)",
+      ESP_LOGD(TAG, "  ✓ Peer %d: %s [%.16s...] (endpoint: %s, %d allowed IPs)",
                out.peer_count,
                peer->hostname[0] ? peer->hostname : "(no hostname)",
                peer->public_key,
@@ -576,7 +639,90 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out) {
       p = peer_obj_end;
     }
 
-    ESP_LOGI(TAG, "✓ Extracted first %d peers (static buffer, NO heap used)", out.peer_count);
+    if (allowed_peers && !allowed_peers->empty()) {
+      ESP_LOGI(TAG, "✓ Extracted %d peers (filtered from %d total, skipped %d)",
+               out.peer_count, peers_processed, peers_skipped);
+    } else {
+      ESP_LOGI(TAG, "✓ Extracted %d peers (static buffer, NO heap used)", out.peer_count);
+    }
+  }
+
+  // ========== Extract DERPMap (first DERP server) ==========
+  const char* derp_map_start = find_str(json, end, "\"DERPMap\":{");
+  if (derp_map_start) {
+    ESP_LOGD(TAG, "Found DERPMap section");
+
+    // Find DERPMap section end
+    const char* derp_map_end = derp_map_start + 11;
+    int depth = 1;
+    while (derp_map_end < end && depth > 0) {
+      if (*derp_map_end == '{') depth++;
+      else if (*derp_map_end == '}') depth--;
+      derp_map_end++;
+    }
+
+    // Find Regions object
+    const char* regions_start = find_str(derp_map_start, derp_map_end, "\"Regions\":{");
+    if (regions_start) {
+      // Find first region's Nodes array
+      const char* nodes_start = find_str(regions_start, derp_map_end, "\"Nodes\":[");
+      if (nodes_start) {
+        // Find first node object
+        const char* node_obj_start = (const char*)memchr(nodes_start + 9, '{', derp_map_end - (nodes_start + 9));
+        if (node_obj_start) {
+          // Find node object end
+          const char* node_obj_end = node_obj_start + 1;
+          int obj_depth = 1;
+          while (node_obj_end < derp_map_end && obj_depth > 0) {
+            if (*node_obj_end == '{') obj_depth++;
+            else if (*node_obj_end == '}') obj_depth--;
+            node_obj_end++;
+          }
+
+          // Extract HostName
+          const char* host_key = find_str(node_obj_start, node_obj_end, "\"HostName\":");
+          if (host_key) {
+            size_t host_len;
+            const char* host_val = extract_quoted_value(host_key + 11, node_obj_end, &host_len);
+            if (host_val && host_len > 0) {
+              safe_strncpy(out.derp_host, host_val, sizeof(out.derp_host), host_len);
+            }
+          }
+
+          // Extract DERPPort (optional, defaults to 443)
+          const char* port_key = find_str(node_obj_start, node_obj_end, "\"DERPPort\":");
+          if (port_key) {
+            uint64_t port_num;
+            if (extract_number(port_key + 11, node_obj_end, &port_num)) {
+              out.derp_port = static_cast<uint16_t>(port_num);
+            }
+          }
+
+          // Default to 443 if no port specified
+          if (out.derp_port == 0 && out.derp_host[0] != '\0') {
+            out.derp_port = 443;
+          }
+
+          // Extract STUNPort (optional, defaults to 3478)
+          const char* stun_port_key = find_str(node_obj_start, node_obj_end, "\"STUNPort\":");
+          if (stun_port_key) {
+            uint64_t stun_port_num;
+            if (extract_number(stun_port_key + 11, node_obj_end, &stun_port_num)) {
+              out.stun_port = static_cast<uint16_t>(stun_port_num);
+            }
+          }
+
+          // Default to 3478 if no STUN port specified
+          if (out.stun_port == 0 && out.derp_host[0] != '\0') {
+            out.stun_port = 3478;
+          }
+
+          if (out.derp_host[0] != '\0') {
+            ESP_LOGI(TAG, "✓ DERP server: %s:%d (STUN port: %d)", out.derp_host, out.derp_port, out.stun_port);
+          }
+        }
+      }
+    }
   }
 
   return out.node_ipv4[0] != '\0' || out.peer_count > 0;
@@ -588,6 +734,9 @@ void print_peer_table(const StaticMapResponse &map) {
   ESP_LOGI(TAG, "========== PEER TABLE (first %d peers) ==========", map.peer_count);
   ESP_LOGI(TAG, "Node ID: %s", map.node_id);
   ESP_LOGI(TAG, "IPv4:    %s", map.node_ipv4);
+  if (map.derp_host[0] != '\0') {
+    ESP_LOGI(TAG, "DERP:    %s:%d", map.derp_host, map.derp_port);
+  }
   ESP_LOGI(TAG, "");
 
   for (uint8_t i = 0; i < map.peer_count; i++) {
