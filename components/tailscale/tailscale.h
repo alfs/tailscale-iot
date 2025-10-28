@@ -69,6 +69,7 @@ class TailscaleComponent : public PollingComponent {
   void set_time_source(time::RealTimeClock *time) { this->time_source_ = time; }
   void set_wireguard_component(Component *wg) { this->wireguard_component_ = wg; }
   void add_disco_ping_target(const std::string &hostname) { this->disco_ping_targets_.push_back(hostname); }
+  void set_preferred_derp(uint32_t region) { this->preferred_derp_ = region; }
 
   // State getters
   TailscaleState get_state() const { return this->state_; }
@@ -106,6 +107,7 @@ class TailscaleComponent : public PollingComponent {
   std::string control_url_;
   std::string control_public_key_;  // Optional server public key
   std::string device_name_;
+  uint32_t preferred_derp_{28};  // Preferred DERP region (default 28)
   time::RealTimeClock *time_source_{nullptr};
   Component *wireguard_component_{nullptr};
 

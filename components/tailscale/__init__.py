@@ -27,6 +27,7 @@ CONF_UPDATE_INTERVAL = "update_interval"
 CONF_CONTROL_PUBLIC_KEY = "control_public_key"
 CONF_CONTROL_PSK = "control_psk"
 CONF_DISCO_PING_TARGETS = "allowed_peers"
+CONF_PREFERRED_DERP = "preferred_derp"
 
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
 TailscaleComponent = tailscale_ns.class_("TailscaleComponent", cg.PollingComponent)
@@ -44,6 +45,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_CONTROL_PSK): cv.string,
         cv.Optional(CONF_UPDATE_INTERVAL, default="60s"): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_DISCO_PING_TARGETS): cv.ensure_list(cv.string),
+        cv.Optional(CONF_PREFERRED_DERP, default=28): cv.int_range(min=0, max=999),
     }
 ).extend(cv.polling_component_schema("60s"))
 
@@ -164,3 +166,6 @@ async def to_code(config):
     if CONF_DISCO_PING_TARGETS in config:
         for target in config[CONF_DISCO_PING_TARGETS]:
             cg.add(var.add_disco_ping_target(target))
+
+    # Set preferred DERP region
+    cg.add(var.set_preferred_derp(config[CONF_PREFERRED_DERP]))

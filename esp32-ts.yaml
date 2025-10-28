@@ -45,6 +45,7 @@ tailscale:
   wireguard_id: wg_iface
   update_interval: 5s
   allowed_peers: !secret allowed_peers
+  preferred_derp: 28  # DERP region 28 (Helsinki)
 
 wireguard:
   id: wg_iface

@@ -29,7 +29,9 @@ std::string render_map_request(const MapPayload &payload) {
     oss << "\"HairPinning\":false,";
     oss << "\"WorkingIPv4\":true,";
     oss << "\"WorkingIPv6\":false,";
-    oss << "\"PreferredDERP\":0,";
+    // Report configured DERP region as our preferred relay
+    // This tells Headscale which DERP server we're connected to
+    oss << "\"PreferredDERP\":" << payload.preferred_derp << ",";
     oss << "\"LinkType\":\"wired\"";
     oss << "},";
   }

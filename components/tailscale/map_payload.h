@@ -12,6 +12,7 @@ struct MapPayload {
   std::string disco_key;
   std::string hostinfo_json;
   std::vector<std::string> endpoints;  // Our public endpoints from STUN/disco
+  uint32_t preferred_derp{28};  // Preferred DERP region (default 28)
   bool stream{true};
   bool keep_alive{false};  // Set to true for keepalive/endpoint update requests
   bool read_only{false};  // Must be false for streaming sessions to get full map

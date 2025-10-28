@@ -69,6 +69,35 @@ static std::string base64_to_hex(const std::string &base64_input) {
   return hex_output;
 }
 
+// Helper function to print long strings in chunks to handle ESP32 serial line length limits
+static void print_chunked(const char *tag, const char *label, const char *data, size_t length) {
+  const size_t chunk_size = 200;  // Safe chunk size for ESP32 serial output
+
+  if (length == 0 || data == nullptr) {
+    ESP_LOGI(tag, "%s: (empty)", label);
+    return;
+  }
+
+  ESP_LOGI(tag, "%s (%zu bytes):", label, length);
+
+  size_t offset = 0;
+  size_t chunk_num = 1;
+  while (offset < length) {
+    size_t remaining = length - offset;
+    size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+
+    // Create a temporary null-terminated string for this chunk
+    char chunk_buffer[chunk_size + 1];
+    memcpy(chunk_buffer, data + offset, current_chunk);
+    chunk_buffer[current_chunk] = '\0';
+
+    ESP_LOGI(tag, "  [%zu/%zu] %s", chunk_num, (length + chunk_size - 1) / chunk_size, chunk_buffer);
+
+    offset += current_chunk;
+    chunk_num++;
+  }
+}
+
 void TailscaleComponent::setup() {
   ESP_LOGI(TAG, "Setting up Tailscale component for ESP32-C3");
   ESP_LOGI(TAG, "Device name: %s", this->device_name_.c_str());
@@ -319,12 +348,18 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
 
     // Send Disco pings to all peers to trigger WireGuard handshake
     ESP_LOGI(TAG, "→ Sending Disco pings to establish NAT mappings...");
+    ESP_LOGI(TAG, "   Peer count: %zu", this->node_config_.peers.size());
     for (const auto& peer : this->node_config_.peers) {
+      ESP_LOGI(TAG, "   Peer: %s | endpoint=%s:%u | disco_key=%s",
+               peer.hostname.c_str(), peer.endpoint.c_str(), peer.port,
+               peer.disco_key.empty() ? "(none)" : peer.disco_key.substr(0, 20).c_str());
+
       if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0" && !peer.disco_key.empty()) {
+        ESP_LOGI(TAG, "   📡 Sending disco PING to %s", peer.hostname.c_str());
         this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
       } else {
-        ESP_LOGD(TAG, "Skipping Disco ping for peer %s (no endpoint or disco key)",
-                 peer.hostname.c_str());
+        ESP_LOGW(TAG, "   ⚠️  Skipping disco ping for peer %s (endpoint='%s', has_disco_key=%d)",
+                 peer.hostname.c_str(), peer.endpoint.c_str(), !peer.disco_key.empty());
       }
     }
 
@@ -333,8 +368,19 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
     ESP_LOGI(TAG, "→ Closing control plane connection to free memory...");
     if (this->ts2021_transport_) {
       this->ts2021_transport_->reset();
-      ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP connections)");
     }
+    if (this->upgrade_channel_) {
+      this->upgrade_channel_->close();
+      this->upgrade_channel_.reset();
+    }
+    // Reset Noise session so it can be reinitialized for reconnection
+    this->noise_session_.reset();
+    this->noise_session_ = esphome::make_unique<NoiseSession>();
+    if (!this->noise_session_->initialize_ik()) {
+      ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
+    }
+    ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP connections)");
+
 
     this->transition_to(TailscaleState::CONNECTED);
     this->retry_count_ = 0;
@@ -612,6 +658,16 @@ bool TailscaleComponent::configure_wireguard_() {
   }
 
   ESP_LOGD(TAG, "WireGuard configuration complete");
+
+  // Restart WireGuard to apply new configuration
+  // The WireGuard component may have failed to start during setup() with endpoint 0.0.0.0
+  // We need to disable and re-enable it with the correct peer endpoints
+  ESP_LOGI(TAG, "→ Restarting WireGuard with new peer configuration...");
+  wg->disable();  // Stop current (possibly failed) connection
+  delay(100);      // Brief delay to ensure clean shutdown
+  wg->enable();    // Start with newly configured endpoints
+  ESP_LOGI(TAG, "✓ WireGuard restarted");
+
   return true;
 #else
   ESP_LOGW(TAG, "WireGuard support not compiled in (USE_WIREGUARD not defined)");
@@ -1138,8 +1194,7 @@ bool TailscaleComponent::perform_registration_() {
   reg_payload.hostinfo_json = build_hostinfo_json(hostinfo);
 
   std::string payload_json = render_register_request(reg_payload);
-  ESP_LOGI(TAG, "Registration request JSON (%d bytes):", payload_json.length());
-  ESP_LOGI(TAG, "%s", payload_json.c_str());
+  print_chunked(TAG, "Registration request JSON", payload_json.c_str(), payload_json.length());
 
   // Send registration via HTTP/2 - use pointer to avoid heap allocation
   const char *response_ptr = nullptr;
@@ -1220,6 +1275,7 @@ bool TailscaleComponent::fetch_map_response_() {
   // Create map request payload
   MapPayload map_payload;
   map_payload.capability_version = 90;  // MinSupportedCapabilityVersion in Headscale
+  map_payload.preferred_derp = this->preferred_derp_;  // Use configured DERP region
 
   // Convert node key to hex format with type prefix (same as registration)
   std::string node_key_hex = base64_to_hex(this->node_key_public_);
@@ -2430,6 +2486,12 @@ bool TailscaleComponent::send_map_keepalive_() {
   if (!transport_ready) {
     ESP_LOGI(TAG, "→ Control plane closed - reconnecting for keepalive...");
 
+    // Recreate upgrade channel if it was closed
+    if (!this->upgrade_channel_) {
+      this->upgrade_channel_ = std::make_unique<Ts2021Upgrade>();
+      ESP_LOGD(TAG, "Created new upgrade channel");
+    }
+
     // Ensure TS2021 transport is ready (will reconnect if needed)
     if (!this->ensure_ts2021_ready_()) {
       ESP_LOGE(TAG, "Failed to reconnect control plane for keepalive");
@@ -2461,6 +2523,7 @@ bool TailscaleComponent::send_map_keepalive_() {
   // Build keepalive map request
   MapPayload map_payload;
   map_payload.capability_version = 90;
+  map_payload.preferred_derp = this->preferred_derp_;  // Use configured DERP region
 
   // Convert keys to hex format
   std::string node_key_hex = base64_to_hex(this->node_key_public_);
@@ -2538,9 +2601,21 @@ bool TailscaleComponent::send_map_keepalive_() {
 
   // Close control plane after keepalive if we had to reconnect it
   // This maintains memory efficiency for DERP connections
-  if (!transport_ready && this->ts2021_transport_) {
+  if (!transport_ready) {
     ESP_LOGI(TAG, "→ Closing control plane to free memory...");
-    this->ts2021_transport_->reset();
+    if (this->ts2021_transport_) {
+      this->ts2021_transport_->reset();
+    }
+    if (this->upgrade_channel_) {
+      this->upgrade_channel_->close();
+      this->upgrade_channel_.reset();
+    }
+    // Reset Noise session so it can be reinitialized for next reconnection
+    this->noise_session_.reset();
+    this->noise_session_ = esphome::make_unique<NoiseSession>();
+    if (!this->noise_session_->initialize_ik()) {
+      ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
+    }
     ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP)");
   }
 
