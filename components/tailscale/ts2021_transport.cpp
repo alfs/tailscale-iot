@@ -426,6 +426,11 @@ bool Ts2021Transport::start_http2_session() {
     return this->receive_plaintext(out, timeout_ms);
   };
   this->http2_session_ = std::make_unique<Http2Session>();
+
+  // Feed watchdog before HTTP/2 init which waits for server SETTINGS frame
+  ESP_LOGD(TAG, "Feeding watchdog before HTTP/2 session init...");
+  App.feed_wdt();
+
   if (!this->http2_session_->init(send_cb, recv_cb)) {
     ESP_LOGE(TAG, "Failed to initialise HTTP/2 session");
     this->http2_session_.reset();

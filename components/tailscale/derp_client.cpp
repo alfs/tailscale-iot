@@ -1,6 +1,8 @@
 #include "derp_client.h"
+#include "crypto_box_simple.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/application.h"
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -200,9 +202,17 @@ bool DerpClient::do_http_upgrade_() {
     return false;
   }
 
+  // Feed watchdog before blocking HTTP response read to prevent crashes
+  ESP_LOGD(TAG, "Feeding watchdog before HTTP Upgrade response read...");
+  App.feed_wdt();
+
   // Read HTTP response
   char response[512];
+  ESP_LOGD(TAG, "Reading HTTP Upgrade response (blocking)...");
+  uint32_t start_ms = esphome::millis();
   ssize_t received = this->sock_read_(response, sizeof(response) - 1);
+  uint32_t elapsed_ms = esphome::millis() - start_ms;
+  ESP_LOGD(TAG, "HTTP response read completed in %d ms", elapsed_ms);
 
   if (received <= 0) {
     ESP_LOGE(TAG, "Failed to receive HTTP response");
@@ -252,10 +262,19 @@ bool DerpClient::do_tls_handshake_() {
     return false;
   }
 
+  // Feed watchdog before blocking TLS handshake to prevent crashes
+  // TLS handshake can take up to 30 seconds according to timeout config
+  ESP_LOGD(TAG, "Feeding watchdog before TLS handshake (30s timeout)...");
+  App.feed_wdt();
+
   // Connect with TLS (includes TCP + TLS handshake)
   // esp_tls_conn_new_sync will automatically use server_host for SNI
+  ESP_LOGD(TAG, "Starting TLS connection (blocking, up to 30s)...");
+  uint32_t start_ms = esphome::millis();
   int ret = esp_tls_conn_new_sync(this->server_host_.c_str(), this->server_host_.length(),
                                    this->server_port_, &cfg, tls);
+  uint32_t elapsed_ms = esphome::millis() - start_ms;
+  ESP_LOGD(TAG, "TLS connection attempt completed in %d ms (result: %d)", elapsed_ms, ret);
 
   if (ret != 1) {
     ESP_LOGE(TAG, "❌ TLS connection failed:");
@@ -582,8 +601,12 @@ bool DerpClient::handle_server_info_() {
 
 bool DerpClient::send_client_info_() {
   // FrameClientInfo format: 32B our public key + 24B nonce + NaCl box(JSON)
-  // For simplicity, send minimal info without encryption initially
 
+  // Minimal client info JSON (protocol expects at least empty JSON object)
+  const char* client_info_json = "{}";
+  size_t json_len = strlen(client_info_json);
+
+  // Buffer: 32B public key + 24B nonce + encrypted payload (json + 16B MAC)
   uint8_t buffer[KEY_LEN + NONCE_LEN + 256];
   size_t offset = 0;
 
@@ -591,17 +614,44 @@ bool DerpClient::send_client_info_() {
   memcpy(buffer + offset, this->our_node_key_, KEY_LEN);
   offset += KEY_LEN;
 
-  // TODO: Generate nonce and encrypt client info JSON
-  // For now, send zeros (server might accept it for testing)
-  memset(buffer + offset, 0, NONCE_LEN + 2); // nonce + minimal encrypted payload
-  offset += NONCE_LEN + 2;
+  // Generate random nonce for NaCl crypto_box
+  uint8_t nonce[NONCE_LEN];
+  randombytes_buf(nonce, NONCE_LEN);
+  memcpy(buffer + offset, nonce, NONCE_LEN);
+  offset += NONCE_LEN;
+
+  // Encrypt client info JSON using NaCl crypto_box
+  // crypto_box_easy_simple adds 16-byte MAC to the ciphertext
+  uint8_t ciphertext[256 + CRYPTO_BOX_MACBYTES];
+
+  int ret = crypto_box_easy_simple(
+    ciphertext,                           // Output: encrypted message with MAC
+    (const unsigned char*)client_info_json, // Input: plaintext JSON
+    json_len,                             // Plaintext length
+    nonce,                                // 24-byte nonce
+    this->server_public_key_,             // Recipient public key (DERP server)
+    this->our_node_key_priv_              // Our private key
+  );
+
+  if (ret != 0) {
+    ESP_LOGE(TAG, "Failed to encrypt client info with NaCl crypto_box");
+    return false;
+  }
+
+  // Append encrypted payload to buffer
+  size_t encrypted_len = json_len + CRYPTO_BOX_MACBYTES;
+  memcpy(buffer + offset, ciphertext, encrypted_len);
+  offset += encrypted_len;
+
+  ESP_LOGI(TAG, "→ Sending encrypted FrameClientInfo (%d bytes total, %d bytes encrypted)",
+           offset, encrypted_len);
 
   if (!this->send_frame_(DerpFrameType::CLIENT_INFO, buffer, offset)) {
     ESP_LOGE(TAG, "Failed to send FrameClientInfo");
     return false;
   }
 
-  ESP_LOGI(TAG, "✓ Sent client info");
+  ESP_LOGI(TAG, "✓ Sent encrypted client info (nonce + NaCl box)");
   return true;
 }
 
