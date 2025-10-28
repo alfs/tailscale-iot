@@ -104,9 +104,21 @@ bool Ts2021Transport::build_handshake_message(std::vector<uint8_t> &out_cipherte
   out_ciphertext[4] = noise_payload.size() & 0xFF;
   std::copy(noise_payload.begin(), noise_payload.end(), out_ciphertext.begin() + 5);
   
-  ESP_LOGI(TAG, "Wrapped in controlbase framing: %zu bytes total (5 byte header + %zu byte payload)", 
+  ESP_LOGI(TAG, "Wrapped in controlbase framing: %zu bytes total (5 byte header + %zu byte payload)",
            out_ciphertext.size(), noise_payload.size());
-  
+
+  // Print hex dump of handshake message for debugging
+  std::string hex_dump;
+  for (size_t i = 0; i < std::min<size_t>(out_ciphertext.size(), 128); i++) {
+    char hex[4];
+    snprintf(hex, sizeof(hex), "%02x ", out_ciphertext[i]);
+    hex_dump += hex;
+  }
+  if (out_ciphertext.size() > 128) {
+    hex_dump += "... (truncated)";
+  }
+  ESP_LOGI(TAG, "→ SENT handshake message (%zu bytes): %s", out_ciphertext.size(), hex_dump.c_str());
+
   action = noise_handshakestate_get_action(hs);
   if (action == NOISE_ACTION_SPLIT) {
     if (!this->session_->split_transport()) {
@@ -139,9 +151,21 @@ bool Ts2021Transport::accept_handshake_message(const uint8_t *data, size_t len) 
   uint8_t msg_type = data[0];
   uint16_t payload_len = (data[1] << 8) | data[2];
   
-  ESP_LOGI(TAG, "Received controlbase message: type=%d, payload_len=%d, total_len=%zu", 
+  ESP_LOGI(TAG, "Received controlbase message: type=%d, payload_len=%d, total_len=%zu",
            msg_type, payload_len, len);
-  
+
+  // Print hex dump of handshake message for debugging
+  std::string hex_dump;
+  for (size_t i = 0; i < std::min<size_t>(len, (size_t)128); i++) {
+    char hex[4];
+    snprintf(hex, sizeof(hex), "%02x ", data[i]);
+    hex_dump += hex;
+  }
+  if (len > 128) {
+    hex_dump += "... (truncated)";
+  }
+  ESP_LOGI(TAG, "← RECV handshake message (%zu bytes): %s", len, hex_dump.c_str());
+
   if (msg_type == 0x03) {
     // Error message
     std::string error_msg(reinterpret_cast<const char*>(data + 3), std::min<size_t>(payload_len, len - 3));
@@ -326,6 +350,9 @@ bool Ts2021Transport::receive_plaintext(std::vector<uint8_t> &out, uint32_t time
     ESP_LOGE(TAG, "upgrade channel is null");
     return false;
   }
+
+  // Feed watchdog before blocking WebSocket read to prevent crashes
+  App.feed_wdt();
 
   // Read the framed message from WebSocket
   // ESP32-C3 has limited RAM and suffers from fragmentation with large allocations

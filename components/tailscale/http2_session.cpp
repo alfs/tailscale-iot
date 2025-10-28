@@ -45,6 +45,35 @@ void append_uint32(std::vector<uint8_t> &out, uint32_t value) {
 
 }  // namespace
 
+// Helper function to print long strings in chunks to handle ESP32 serial line length limits
+static void print_chunked(const char *tag, const char *label, const char *data, size_t length) {
+  const size_t chunk_size = 200;  // Safe chunk size for ESP32 serial output
+
+  if (length == 0 || data == nullptr) {
+    ESP_LOGD(tag, "%s: (empty)", label);
+    return;
+  }
+
+  ESP_LOGD(tag, "%s (%zu bytes):", label, length);
+
+  size_t offset = 0;
+  size_t chunk_num = 1;
+  while (offset < length) {
+    size_t remaining = length - offset;
+    size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
+
+    // Create a temporary null-terminated string for this chunk
+    char chunk_buffer[chunk_size + 1];
+    memcpy(chunk_buffer, data + offset, current_chunk);
+    chunk_buffer[current_chunk] = '\0';
+
+    ESP_LOGD(tag, "  [%zu/%zu] %s", chunk_num, (length + chunk_size - 1) / chunk_size, chunk_buffer);
+
+    offset += current_chunk;
+    chunk_num++;
+  }
+}
+
 bool Http2Session::init(SendCallback send_cb, ReceiveCallback recv_cb) {
   this->send_cb_ = std::move(send_cb);
   this->recv_cb_ = std::move(recv_cb);
@@ -668,13 +697,16 @@ bool Http2Session::pull_bytes_(uint32_t timeout_ms) {
     return false;
   }
 
+  // Feed watchdog before blocking network operation to prevent crashes
+  App.feed_wdt();
+
   std::vector<uint8_t> chunk;
   ESP_LOGD(TAG, "pull_bytes_: calling recv_cb to decrypt next message...");
   if (!this->recv_cb_(chunk, timeout_ms)) {
     ESP_LOGW(TAG, "pull_bytes_: recv_cb failed");
     return false;
   }
-  ESP_LOGD(TAG, "pull_bytes_: received %zu bytes, adding to buffer (current size: %zu)", 
+  ESP_LOGD(TAG, "pull_bytes_: received %zu bytes, adding to buffer (current size: %zu)",
            chunk.size(), this->recv_buffer_.size());
   this->recv_buffer_.insert(this->recv_buffer_.end(), chunk.begin(), chunk.end());
   return !chunk.empty();
@@ -692,8 +724,7 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
   uint32_t expected_json_length = 0;
 
   auto log_full_json = [&](const char *label, size_t closing_index) {
-    // Disabled: Creating a 48KB string copy for logging causes OOM on ESP32
-    // Just log the size instead
+    // Print JSON in chunks without copying to avoid OOM on ESP32
     if (buffer_size <= start_offset) {
       return;
     }
@@ -707,8 +738,8 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
     } else if (json_len == 0 || json_len > available) {
       json_len = available;
     }
-    // Don't copy 48KB for logging - just log the size
-    ESP_LOGD(TAG, "%s JSON payload (%zu bytes) - not printing full content to save memory", label, json_len);
+    // Use pointer to existing buffer - no copy needed
+    print_chunked(TAG, label, buffer + start_offset, json_len);
   };
 
   if (buffer_size >= 5) {
