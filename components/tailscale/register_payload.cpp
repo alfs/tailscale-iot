@@ -21,6 +21,31 @@ std::string render_register_request(const RegisterPayload &payload) {
     oss << "\"DiscoKey\":\"" << payload.disco_key << "\",";
   }
   oss << "\"Hostinfo\":" << (payload.hostinfo_json.empty() ? "{}" : payload.hostinfo_json) << ',';
+
+  // Include NetInfo with endpoints and PreferredDERP for DERP-only mode
+  // This tells Headscale which DERP region we're connected to
+  if (!payload.endpoints.empty() || payload.preferred_derp > 0) {
+    oss << "\"Endpoints\":[";
+    for (size_t i = 0; i < payload.endpoints.size(); ++i) {
+      oss << '\"' << payload.endpoints[i] << '\"';
+      if (i < payload.endpoints.size() - 1) {
+        oss << ',';
+      }
+    }
+    oss << "],";
+
+    oss << "\"NetInfo\":{";
+    oss << "\"MappingVariesByDestIP\":false,";
+    oss << "\"HairPinning\":false,";
+    oss << "\"WorkingIPv4\":true,";
+    oss << "\"WorkingIPv6\":false,";
+    if (payload.preferred_derp > 0) {
+      oss << "\"PreferredDERP\":" << payload.preferred_derp << ",";
+    }
+    oss << "\"LinkType\":\"wired\"";
+    oss << "},";
+  }
+
   // Note: MachineAuthorized is a RESPONSE field, not a request field - removed
   oss << "\"Capabilities\":[";
   for (size_t i = 0; i < payload.capabilities.size(); ++i) {

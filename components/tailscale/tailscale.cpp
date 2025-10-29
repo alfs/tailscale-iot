@@ -71,7 +71,7 @@ static std::string base64_to_hex(const std::string &base64_input) {
 
 // Helper function to print long strings in chunks to handle ESP32 serial line length limits
 static void print_chunked(const char *tag, const char *label, const char *data, size_t length) {
-  const size_t chunk_size = 200;  // Safe chunk size for ESP32 serial output
+  const size_t chunk_size = 120;  // Reduced chunk size to prevent serial truncation
 
   if (length == 0 || data == nullptr) {
     ESP_LOGI(tag, "%s: (empty)", label);
@@ -179,17 +179,28 @@ void TailscaleComponent::update() {
   if (this->state_ == TailscaleState::CONNECTED) {
     uint32_t now = millis();
 
-    // Send keepalive map request every 60 seconds
-    if (now - this->last_keepalive_time_ >= KEEPALIVE_INTERVAL_MS) {
-      ESP_LOGD(TAG, "Sending periodic keepalive map request");
-      if (this->send_map_keepalive_()) {
-        this->last_keepalive_time_ = now;
-        ESP_LOGD(TAG, "✓ Keepalive sent successfully");
-      } else {
-        ESP_LOGW(TAG, "Failed to send keepalive - will retry in %u seconds", KEEPALIVE_INTERVAL_MS / 1000);
-        this->last_keepalive_time_ = now;  // Update anyway to avoid flooding with retries
-      }
-    }
+    // NOTE: Periodic keepalives completely disabled for DERP-only mode
+    //
+    // Keepalives are NOT needed because:
+    // 1. DERP connection itself signals server that device is online
+    // 2. No direct peer connections (invalid 0.0.0.0 endpoint)
+    // 3. Reconnecting control plane causes OOM (needs ~70KB for TLS + HTTP/2)
+    // 4. DERP connection already occupies memory freed from control plane
+    //
+    // If future versions support direct connections, keepalives can be re-enabled
+    // with proper memory management (close DERP before reconnecting control plane)
+
+    // Keepalives disabled - do nothing
+    // if (now - this->last_keepalive_time_ >= KEEPALIVE_INTERVAL_MS) {
+    //   ESP_LOGD(TAG, "Sending periodic keepalive map request");
+    //   if (this->send_map_keepalive_()) {
+    //     this->last_keepalive_time_ = now;
+    //     ESP_LOGD(TAG, "✓ Keepalive sent successfully");
+    //   } else {
+    //     ESP_LOGW(TAG, "Failed to send keepalive - will retry in %u seconds", KEEPALIVE_INTERVAL_MS / 1000);
+    //     this->last_keepalive_time_ = now;
+    //   }
+    // }
   }
 }
 
@@ -418,17 +429,27 @@ void TailscaleComponent::handle_connected_state_() {
       if (this->derp_client_->connect()) {
         ESP_LOGI(TAG, "✓ DERP relay connected");
 
-        // Send initial endpoint update after DERP connection
-        // Control plane will be reconnected, used, then closed automatically
-        if (!this->initial_endpoint_sent_ && !this->discovered_endpoint_.empty()) {
-          ESP_LOGI(TAG, "→ Sending initial endpoint update to server...");
-          if (this->send_map_keepalive_()) {
-            ESP_LOGI(TAG, "✓ Initial endpoint update sent successfully");
-            this->initial_endpoint_sent_ = true;
-          } else {
-            ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
-          }
-        }
+        // Start UDP relay for WireGuard → DERP packet forwarding
+        this->start_udp_relay_();
+
+        // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
+        // Server already knows ESP32 prefers DERP 28 from initial map request
+        // Peers can reach ESP32 via DERP without additional endpoint updates
+        //
+        // Original code tried to reconnect control plane here but caused OOM:
+        // - Control plane reconnection needs ~70KB for TLS + HTTP/2
+        // - DERP connection already uses memory
+        // - Not enough free memory for both simultaneously
+        //
+        // if (!this->initial_endpoint_sent_ && !this->discovered_endpoint_.empty()) {
+        //   ESP_LOGI(TAG, "→ Sending initial endpoint update to server...");
+        //   if (this->send_map_keepalive_()) {
+        //     ESP_LOGI(TAG, "✓ Initial endpoint update sent successfully");
+        //     this->initial_endpoint_sent_ = true;
+        //   } else {
+        //     ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
+        //   }
+        // }
       } else {
         ESP_LOGW(TAG, "Failed to connect to DERP relay");
       }
@@ -438,6 +459,9 @@ void TailscaleComponent::handle_connected_state_() {
   // Process DERP client if initialized
   if (this->derp_client_ && this->derp_client_->is_ready()) {
     this->derp_client_->process();
+
+    // Process UDP relay for WireGuard → DERP forwarding
+    this->process_udp_relay_();
   }
 
   // Check for incoming Disco responses
@@ -582,10 +606,18 @@ bool TailscaleComponent::configure_wireguard_() {
                peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
 
       // peer.endpoint already contains just the host (port was extracted during parsing)
-      ESP_LOGI(TAG, "  Setting endpoint: %s", peer.endpoint.c_str());
-      ESP_LOGI(TAG, "  Setting port: %u", peer.port);
-      wg->set_peer_endpoint(peer.endpoint);
-      wg->set_peer_port(peer.port);
+      // When DERP client exists, use localhost UDP relay instead of direct endpoint
+      // Note: We check for existence, not readiness, because DERP connects AFTER WireGuard configuration
+      if (this->derp_client_) {
+        ESP_LOGI(TAG, "  Using DERP relay mode: localhost:51821");
+        wg->set_peer_endpoint("127.0.0.1");
+        wg->set_peer_port(51821);
+      } else {
+        ESP_LOGI(TAG, "  Setting endpoint: %s", peer.endpoint.c_str());
+        ESP_LOGI(TAG, "  Setting port: %u", peer.port);
+        wg->set_peer_endpoint(peer.endpoint);
+        wg->set_peer_port(peer.port);
+      }
 
       // Strip "nodekey:" prefix if present (Tailscale format)
       std::string peer_wg_key = peer.public_key;
@@ -594,6 +626,32 @@ bool TailscaleComponent::configure_wireguard_() {
       }
       ESP_LOGI(TAG, "  Setting peer public key: %.20s...", peer_wg_key.c_str());
       wg->set_peer_public_key(peer_wg_key);
+
+      // Store peer's node key in binary format for DERP relay
+      // Detect format: 64 chars = hex, 44 chars = base64
+      std::string peer_key_decoded;
+      if (peer_wg_key.length() == 64) {
+        // Hex-encoded (from static map parser)
+        peer_key_decoded = hex_decode(peer_wg_key);
+        ESP_LOGD(TAG, "  Decoded peer key from hex (%d bytes)", peer_key_decoded.size());
+      } else if (peer_wg_key.length() == 44 || peer_wg_key.length() == 43) {
+        // Base64-encoded (44 chars with padding, 43 without)
+        peer_key_decoded = base64_decode(peer_wg_key);
+        ESP_LOGD(TAG, "  Decoded peer key from base64 (%d bytes)", peer_key_decoded.size());
+      } else {
+        ESP_LOGW(TAG, "  Unexpected peer key length: %d (expected 64 for hex or 44 for base64)", peer_wg_key.length());
+      }
+
+      if (peer_key_decoded.size() == 32) {
+        memcpy(this->wg_peer_node_key_, peer_key_decoded.data(), 32);
+        this->wg_peer_node_key_valid_ = true;
+        ESP_LOGD(TAG, "  ✓ Stored peer node key for DERP relay (%02x%02x%02x%02x...)",
+                 this->wg_peer_node_key_[0], this->wg_peer_node_key_[1],
+                 this->wg_peer_node_key_[2], this->wg_peer_node_key_[3]);
+      } else {
+        ESP_LOGW(TAG, "  Failed to decode peer node key (expected 32 bytes, got %d)", peer_key_decoded.size());
+        this->wg_peer_node_key_valid_ = false;
+      }
 
       // For simplicity, only add the Tailscale CGNAT range (100.64.0.0/10)
       // This allows communication with all Tailscale peers
@@ -1207,6 +1265,15 @@ bool TailscaleComponent::perform_registration_() {
 
   reg_payload.hostinfo_json = build_hostinfo_json(hostinfo);
 
+  // CRITICAL: Include DERP region preference in registration
+  // Normal Tailscale clients send this in MapRequest after registration,
+  // but ESP32 closes control plane immediately to save memory (~70KB for TLS+HTTP/2).
+  // We never send the follow-up MapRequest, so Headscale wouldn't know we're available via DERP.
+  // Workaround: Include Endpoints and PreferredDERP directly in RegisterRequest.
+  // Endpoints array can be empty (no direct connectivity), but PreferredDERP tells Headscale
+  // that we're reachable via DERP Region 28.
+  reg_payload.preferred_derp = this->preferred_derp_;
+
   std::string payload_json = render_register_request(reg_payload);
   print_chunked(TAG, "Registration request JSON", payload_json.c_str(), payload_json.length());
 
@@ -1545,6 +1612,43 @@ std::string TailscaleComponent::base64_decode(const std::string& encoded) {
   }
   
   return std::string(buffer.begin(), buffer.begin() + olen);
+}
+
+std::string TailscaleComponent::hex_decode(const std::string& hex_str) {
+  if (hex_str.length() % 2 != 0) {
+    ESP_LOGE(TAG, "Hex string has odd length");
+    return "";
+  }
+
+  std::string result;
+  result.reserve(hex_str.length() / 2);
+
+  for (size_t i = 0; i < hex_str.length(); i += 2) {
+    char high = hex_str[i];
+    char low = hex_str[i + 1];
+
+    // Convert hex characters to nibbles
+    uint8_t high_nibble, low_nibble;
+    if (high >= '0' && high <= '9') high_nibble = high - '0';
+    else if (high >= 'a' && high <= 'f') high_nibble = high - 'a' + 10;
+    else if (high >= 'A' && high <= 'F') high_nibble = high - 'A' + 10;
+    else {
+      ESP_LOGE(TAG, "Invalid hex character: %c", high);
+      return "";
+    }
+
+    if (low >= '0' && low <= '9') low_nibble = low - '0';
+    else if (low >= 'a' && low <= 'f') low_nibble = low - 'a' + 10;
+    else if (low >= 'A' && low <= 'F') low_nibble = low - 'A' + 10;
+    else {
+      ESP_LOGE(TAG, "Invalid hex character: %c", low);
+      return "";
+    }
+
+    result.push_back(static_cast<char>((high_nibble << 4) | low_nibble));
+  }
+
+  return result;
 }
 
 void TailscaleComponent::handle_error_state_() {
@@ -2696,18 +2800,131 @@ bool TailscaleComponent::send_endpoint_update_() {
 void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len) {
   ESP_LOGI(TAG, "← Received packet from DERP relay (%d bytes)", len);
 
-  // TODO: Route to WireGuard interface
-  // This packet is already encrypted WireGuard traffic
-  // Need to inject it into the WireGuard receive path
-
-  // For now, just log
   ESP_LOGD(TAG, "  From peer: %02x%02x%02x%02x...",
            peer_key[0], peer_key[1], peer_key[2], peer_key[3]);
-  ESP_LOGD(TAG, "  Packet: %02x%02x%02x%02x... (%d bytes)",
+  ESP_LOGD(TAG, "  Packet header: %02x%02x%02x%02x... (%d bytes)",
            packet[0], packet[1], packet[2], packet[3], len);
 
-  // TODO: Call WireGuard receive function
-  // wireguard_receive_packet(packet, len);
+#ifdef USE_WIREGUARD
+  // Inject DERP packet into WireGuard by sending it to localhost:51820
+  // This makes it appear as if the packet arrived via UDP
+
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
+    ESP_LOGE(TAG, "Failed to create UDP socket for DERP→WG injection: %d", errno);
+    return;
+  }
+
+  struct sockaddr_in dest_addr = {};
+  dest_addr.sin_family = AF_INET;
+  dest_addr.sin_port = htons(51820);  // WireGuard listening port
+  dest_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1
+
+  ssize_t sent = sendto(sock, packet, len, 0,
+                        (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+
+  close(sock);
+
+  if (sent < 0) {
+    ESP_LOGE(TAG, "Failed to inject DERP packet into WireGuard: %d", errno);
+  } else if ((size_t)sent != len) {
+    ESP_LOGW(TAG, "Partial DERP packet injected: %d/%d bytes", sent, len);
+  } else {
+    ESP_LOGD(TAG, "✓ DERP packet injected into WireGuard (%d bytes)", sent);
+  }
+#else
+  ESP_LOGW(TAG, "WireGuard support not compiled in - cannot inject packet");
+#endif
+}
+
+// UDP Relay for WireGuard → DERP forwarding
+// Creates a UDP socket listening on port 51821 that WireGuard will send packets to
+void TailscaleComponent::start_udp_relay_() {
+#ifdef USE_WIREGUARD
+  if (this->udp_relay_socket_ >= 0) {
+    ESP_LOGD(TAG, "UDP relay already started");
+    return;
+  }
+
+  // Create UDP socket
+  this->udp_relay_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (this->udp_relay_socket_ < 0) {
+    ESP_LOGE(TAG, "Failed to create UDP relay socket: %d", errno);
+    return;
+  }
+
+  // Set non-blocking
+  int flags = fcntl(this->udp_relay_socket_, F_GETFL, 0);
+  fcntl(this->udp_relay_socket_, F_SETFL, flags | O_NONBLOCK);
+
+  // Bind to localhost:51821
+  struct sockaddr_in bind_addr = {};
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_port = htons(51821);  // WireGuard will send packets here
+  bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  if (bind(this->udp_relay_socket_, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+    ESP_LOGE(TAG, "Failed to bind UDP relay socket to port 51821: %d", errno);
+    close(this->udp_relay_socket_);
+    this->udp_relay_socket_ = -1;
+    return;
+  }
+
+  ESP_LOGI(TAG, "✓ UDP relay started on 127.0.0.1:51821 (WireGuard → DERP)");
+#endif
+}
+
+// Check for WireGuard packets and forward them to DERP (non-blocking)
+void TailscaleComponent::process_udp_relay_() {
+#ifdef USE_WIREGUARD
+  if (this->udp_relay_socket_ < 0 || !this->wg_peer_node_key_valid_) {
+    return;  // Relay not started or no peer configured
+  }
+
+  if (!this->derp_client_ || !this->derp_client_->is_ready()) {
+    return;  // DERP not ready
+  }
+
+  // Try to receive packet (non-blocking)
+  uint8_t buffer[2048];  // WireGuard packets are typically < 1500 bytes
+  struct sockaddr_in src_addr;
+  socklen_t addr_len = sizeof(src_addr);
+
+  ssize_t len = recvfrom(this->udp_relay_socket_, buffer, sizeof(buffer), 0,
+                         (struct sockaddr*)&src_addr, &addr_len);
+
+  if (len < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ESP_LOGW(TAG, "UDP relay recvfrom error: %d", errno);
+    }
+    return;  // No packet available or error
+  }
+
+  if (len == 0) {
+    return;  // Empty packet
+  }
+
+  // Forward packet to DERP
+  ESP_LOGD(TAG, "→ Relaying WireGuard packet to DERP (%d bytes)", len);
+
+  if (!this->derp_client_->send_packet(this->wg_peer_node_key_, buffer, len)) {
+    ESP_LOGE(TAG, "Failed to send packet via DERP relay");
+  } else {
+    ESP_LOGD(TAG, "✓ Packet forwarded to DERP");
+  }
+#endif
+}
+
+// Clean up UDP relay resources
+void TailscaleComponent::stop_udp_relay_() {
+#ifdef USE_WIREGUARD
+  if (this->udp_relay_socket_ >= 0) {
+    close(this->udp_relay_socket_);
+    this->udp_relay_socket_ = -1;
+    ESP_LOGI(TAG, "UDP relay stopped");
+  }
+  this->wg_peer_node_key_valid_ = false;
+#endif
 }
 
 }  // namespace tailscale

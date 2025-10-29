@@ -97,7 +97,8 @@ class TailscaleComponent : public PollingComponent {
   bool fetch_map_response_();
   std::string base64_encode(const uint8_t* data, size_t len);
   std::string base64_decode(const std::string& encoded);
-  
+  std::string hex_decode(const std::string& hex_str);
+
   // NVS key persistence
   bool load_keys_from_nvs_();
   bool save_keys_to_nvs_();
@@ -155,6 +156,14 @@ class TailscaleComponent : public PollingComponent {
   bool send_endpoint_update_();      // Send endpoint to control server
   bool perform_stun_query_();         // Query DERP server for our public IP
   void handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len);
+
+  // UDP Relay for WireGuard → DERP forwarding
+  int udp_relay_socket_{-1};  // Socket listening on port 51821 for WireGuard packets
+  uint8_t wg_peer_node_key_[32]{};  // Binary node key of the WireGuard peer (for DERP send_packet)
+  bool wg_peer_node_key_valid_{false};  // Whether we have a valid peer node key
+  void start_udp_relay_();  // Initialize UDP relay socket
+  void process_udp_relay_();  // Check for and forward packets (non-blocking)
+  void stop_udp_relay_();  // Clean up UDP relay resources
 
   // Timing
   uint32_t last_update_time_{0};

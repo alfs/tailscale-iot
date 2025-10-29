@@ -20,6 +20,8 @@ struct RegisterPayload {
   bool machine_authorized{false};
   bool is_ephemeral{false};
   std::vector<std::string> capabilities;
+  std::vector<std::string> endpoints;  // Our public endpoints from STUN/disco
+  uint32_t preferred_derp{0};  // Preferred DERP region (0 = not set)
 };
 
 std::string render_register_request(const RegisterPayload &payload);
