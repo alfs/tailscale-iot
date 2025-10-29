@@ -16,12 +16,26 @@ extern "C" {
 
 /**
  * Simple crypto_box_easy implementation using available libsodium primitives
- * Uses: crypto_scalarmult for key exchange + crypto_aead_chacha20poly1305 for encryption
+ * Uses: crypto_scalarmult_curve25519 for key exchange + crypto_stream_xsalsa20 + crypto_onetimeauth_poly1305 for encryption
+ * This matches NaCl's crypto_box: Curve25519-XSalsa20-Poly1305
  */
 int crypto_box_easy_simple(
     unsigned char *c,           // Output: ciphertext (mlen + MACBYTES)
     const unsigned char *m,     // Input: plaintext
     unsigned long long mlen,    // Plaintext length
+    const unsigned char *n,     // Nonce (24 bytes)
+    const unsigned char *pk,    // Peer's public key (32 bytes)
+    const unsigned char *sk     // Our secret key (32 bytes)
+);
+
+/**
+ * Simple crypto_box_open_easy implementation for decryption
+ * Returns 0 on success, -1 on failure (MAC verification failed)
+ */
+int crypto_box_open_easy_simple(
+    unsigned char *m,           // Output: plaintext (clen - MACBYTES)
+    const unsigned char *c,     // Input: ciphertext (MAC + encrypted data)
+    unsigned long long clen,    // Ciphertext length (includes MAC)
     const unsigned char *n,     // Nonce (24 bytes)
     const unsigned char *pk,    // Peer's public key (32 bytes)
     const unsigned char *sk     // Our secret key (32 bytes)

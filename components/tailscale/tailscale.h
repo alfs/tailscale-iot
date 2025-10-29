@@ -137,7 +137,7 @@ class TailscaleComponent : public PollingComponent {
   void setup_disco_socket_();
   void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
   void send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
-                        const uint8_t* tx_id, const std::string& peer_disco_key);
+                        const std::string& peer_disco_key);
   void check_disco_responses_();              // Check for incoming Disco messages
   bool decrypt_disco_payload_(const uint8_t* encrypted, size_t enc_len,
                                const uint8_t* nonce, const std::string& peer_disco_key,

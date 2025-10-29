@@ -1,5 +1,6 @@
 #include "tailscale.h"
 #include "derp_client.h"
+#include "crypto_box_simple.h"
 #include "local_server_cert.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
@@ -277,6 +278,10 @@ void TailscaleComponent::handle_registering_state_() {
 void TailscaleComponent::handle_fetching_map_state_() {
   ESP_LOGI(TAG, "→ Step 3/3: Fetching network map...");
 
+  // Set up disco socket FIRST before STUN query
+  // CRITICAL: STUN must use the disco socket to get the correct NAT mapping!
+  this->setup_disco_socket_();
+
   // QUICK FIX: Perform STUN discovery BEFORE fetching map so we can include endpoint in initial request
   // This avoids the need for separate keepalive requests which conflict with the streaming map connection
   ESP_LOGI(TAG, "→ Discovering our public endpoint via STUN (before map request)...");
@@ -349,6 +354,39 @@ void TailscaleComponent::handle_fetching_map_state_() {
 }
 
 void TailscaleComponent::handle_configuring_wireguard_state_() {
+  // Check if WiFi has IP address
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!netif) {
+    ESP_LOGD(TAG, "⏳ Waiting for WiFi interface...");
+    return;
+  }
+
+  esp_netif_ip_info_t ip_info;
+  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+    ESP_LOGD(TAG, "⏳ Waiting for WiFi IP address...");
+    return;
+  }
+
+  // Check if we have peer information from map response
+  if (this->node_config_.peers.empty()) {
+    ESP_LOGD(TAG, "⏳ Waiting for peer information from control server...");
+    return;
+  }
+
+  // Check if any peer has a valid endpoint
+  bool has_peer_endpoint = false;
+  for (const auto& peer : this->node_config_.peers) {
+    if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0") {
+      has_peer_endpoint = true;
+      break;
+    }
+  }
+
+  if (!has_peer_endpoint) {
+    ESP_LOGD(TAG, "⏳ Waiting for peer endpoint information...");
+    return;
+  }
+
   ESP_LOGI(TAG, "→ Configuring WireGuard tunnel...");
 
   if (this->configure_wireguard_()) {
@@ -606,12 +644,14 @@ bool TailscaleComponent::configure_wireguard_() {
                peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
 
       // peer.endpoint already contains just the host (port was extracted during parsing)
-      // When DERP client exists, use localhost UDP relay instead of direct endpoint
-      // Note: We check for existence, not readiness, because DERP connects AFTER WireGuard configuration
+      // When DERP client exists, DON'T configure peer endpoint
+      // WireGuard will operate as crypto-only interface without active connection
+      // The UDP relay handles all packet transport via DERP
       if (this->derp_client_) {
-        ESP_LOGI(TAG, "  Using DERP relay mode: localhost:51821");
-        wg->set_peer_endpoint("127.0.0.1");
-        wg->set_peer_port(51821);
+        ESP_LOGI(TAG, "  Using DERP relay mode - WireGuard provides crypto only (no peer connection)");
+        ESP_LOGI(TAG, "  UDP relay on port 51821 handles all packet transport via DERP");
+        // Deliberately NOT setting peer endpoint - keep placeholder from YAML
+        // This prevents WireGuard from trying to connect (which would fail with local IP)
       } else {
         ESP_LOGI(TAG, "  Setting endpoint: %s", peer.endpoint.c_str());
         ESP_LOGI(TAG, "  Setting port: %u", peer.port);
@@ -1873,11 +1913,13 @@ void TailscaleComponent::setup_disco_socket_() {
   int flags = fcntl(this->disco_socket_, F_GETFL, 0);
   fcntl(this->disco_socket_, F_SETFL, flags | O_NONBLOCK);
 
-  // Bind to any port (OS will assign)
+  // Bind to port 41641 (standard Tailscale disco port)
+  // CRITICAL: On ESP32/LWIP, binding to port 0 causes the send port to differ from receive port!
+  // We must bind to a specific port to ensure sendto() uses the same port.
   struct sockaddr_in local_addr{};
   local_addr.sin_family = AF_INET;
   local_addr.sin_addr.s_addr = INADDR_ANY;
-  local_addr.sin_port = 0;  // Let OS choose port
+  local_addr.sin_port = htons(41641);  // Tailscale disco port
 
   if (bind(this->disco_socket_, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
     ESP_LOGE(TAG, "Failed to bind Disco socket: errno %d", errno);
@@ -1886,7 +1928,15 @@ void TailscaleComponent::setup_disco_socket_() {
     return;
   }
 
-  ESP_LOGI(TAG, "✓ Disco UDP socket ready");
+  // Get the actual port that was assigned
+  struct sockaddr_in bound_addr{};
+  socklen_t bound_len = sizeof(bound_addr);
+  if (getsockname(this->disco_socket_, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
+    uint16_t bound_port = ntohs(bound_addr.sin_port);
+    ESP_LOGI(TAG, "✓ Disco UDP socket bound to port %u", bound_port);
+  } else {
+    ESP_LOGW(TAG, "✓ Disco UDP socket ready (couldn't determine port)");
+  }
 }
 
 void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key) {
@@ -1904,7 +1954,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   ESP_LOGD(TAG, "  Peer disco key (%d chars): %s", peer_disco_key.length(), peer_disco_key.c_str());
 
   // Disco protocol constants
-  const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0x9b};  // "TS💬"
+  const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};  // "TS💬" (correct magic)
   const uint8_t DISCO_VERSION = 0;
   const uint8_t DISCO_MSG_PING = 1;
 
@@ -1950,74 +2000,52 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
 
   ESP_LOGD(TAG, "  Keys validated - our priv: 32 bytes, peer pub: 32 bytes");
 
-  ESP_LOGD(TAG, "  Keys validated - our priv: 32 bytes, peer pub: 32 bytes");
+  // Decode our disco public key for packet header
+  std::string our_pub_raw = this->base64_decode(this->disco_key_public_);
+  if (our_pub_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco public key size: %d (expected 32)", our_pub_raw.size());
+    return;
+  }
 
-  // Build disco ping message with NaCl box encryption
-  // Format: magic(6) + version(1) + msg_type(1) + tx_id(12) + nonce(24) + encrypted_payload
-  
+  // Build disco ping message with NaCl box encryption per Tailscale spec
+  // Format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version + data)
+
   // Step 1: Generate nonce (24 bytes for NaCl box)
   uint8_t nonce[24];
   esp_fill_random(nonce, 24);
-  
-  // Step 2: Generate TX ID (random 12 bytes)
-  uint8_t tx_id[12];
-  esp_fill_random(tx_id, 12);
 
-  // Step 3: Prepare plaintext payload
-  uint8_t plaintext[32] = {0x01};  // Ping marker + padding
-  
-  // Step 4: Compute shared secret using ECDH (Curve25519)
-  uint8_t shared_secret[32];
-  if (crypto_scalarmult_curve25519(shared_secret, 
-                                   (const uint8_t*)our_priv_raw.data(),
-                                   (const uint8_t*)peer_pub_raw.data()) != 0) {
-    ESP_LOGE(TAG, "Failed to compute shared secret (crypto_scalarmult)");
+  // Step 2: Prepare plaintext payload (msg_type + version + data)
+  // For ping: just msg_type(1) + version(1), no additional data needed
+  uint8_t plaintext[2];
+  plaintext[0] = DISCO_MSG_PING;  // Message type
+  plaintext[1] = DISCO_VERSION;   // Version
+
+  // Step 3: Encrypt using NaCl box (crypto_box_easy)
+  // Output will be: ciphertext + 16-byte Poly1305 MAC
+  uint8_t ciphertext[sizeof(plaintext) + CRYPTO_BOX_MACBYTES];
+
+  if (crypto_box_easy_simple(ciphertext, plaintext, sizeof(plaintext),
+                             nonce,
+                             (const uint8_t*)peer_pub_raw.data(),
+                             (const uint8_t*)our_priv_raw.data()) != 0) {
+    ESP_LOGE(TAG, "Failed to encrypt disco ping (crypto_box_easy)");
     return;
   }
-  ESP_LOGD(TAG, "  Computed shared secret via ECDH");
-  
-  // Step 5: Encrypt using XSalsa20-Poly1305 (NaCl box internals)
-  // We'll use crypto_stream_salsa20_xor + crypto_onetimeauth_poly1305
-  // This is what crypto_box does internally, but we have to do it manually
-  // because crypto_box_easy is not available in minimal libsodium
-  
-  uint8_t ciphertext[sizeof(plaintext) + 16];  // 16 bytes for Poly1305 MAC
-  
-  // XSalsa20: derive subkey from nonce
-  uint8_t subkey[32];
-  // For XSalsa20, first 16 bytes of nonce are used with HSalsa20
-  // We'll use Salsa20 with full 24-byte nonce instead (simpler)
-  crypto_stream_salsa20_xor(ciphertext + 16, plaintext, sizeof(plaintext),
-                            nonce, shared_secret);
-  
-  ESP_LOGD(TAG, "  Encrypted payload with Salsa20");
-  
-  // Poly1305: compute MAC over ciphertext
-  crypto_onetimeauth_poly1305(ciphertext,  // First 16 bytes = MAC
-                              ciphertext + 16,  // Ciphertext
-                              sizeof(plaintext),
-                              shared_secret);  // Use shared secret as one-time key
-  
-  ESP_LOGD(TAG, "  Computed Poly1305 MAC");
-  
-  // Clear sensitive data
-  sodium_memzero(shared_secret, sizeof(shared_secret));
 
-  // Step 6: Build final message
+  ESP_LOGD(TAG, "  Encrypted payload with NaCl box");
+
+  // Step 4: Build final message
   std::vector<uint8_t> message;
-  message.reserve(6 + 1 + 1 + 12 + 24 + sizeof(ciphertext));
+  message.reserve(6 + 32 + 24 + sizeof(ciphertext));
 
-  // Magic
+  // Magic (6 bytes)
   message.insert(message.end(), DISCO_MAGIC, DISCO_MAGIC + 6);
-  // Version
-  message.push_back(DISCO_VERSION);
-  // Message type
-  message.push_back(DISCO_MSG_PING);
-  // TX ID
-  message.insert(message.end(), tx_id, tx_id + 12);
-  // Nonce
+  // Sender's disco public key (32 bytes)
+  message.insert(message.end(), (const uint8_t*)our_pub_raw.data(),
+                 (const uint8_t*)our_pub_raw.data() + 32);
+  // Nonce (24 bytes)
   message.insert(message.end(), nonce, nonce + 24);
-  // Encrypted payload (MAC + ciphertext)
+  // Encrypted payload (2 bytes plaintext + 16 bytes MAC = 18 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
   
   ESP_LOGI(TAG, "  Built encrypted disco message: %d bytes total", message.size());
@@ -2043,7 +2071,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
 }
 
 void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
-                                          const uint8_t* tx_id, const std::string& peer_disco_key) {
+                                          const std::string& peer_disco_key) {
   if (this->disco_socket_ == -1) {
     ESP_LOGW(TAG, "Disco socket not initialized");
     return;
@@ -2052,7 +2080,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   ESP_LOGI(TAG, "→ Sending Disco PONG to %s:%u", sender_ip.c_str(), sender_port);
 
   // Disco protocol constants
-  const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0x9b};  // "TS💬"
+  const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};  // "TS💬" (correct magic)
   const uint8_t DISCO_VERSION = 0;
   const uint8_t DISCO_MSG_PONG = 2;
 
@@ -2060,6 +2088,13 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
   if (our_priv_raw.size() != 32) {
     ESP_LOGE(TAG, "Invalid our disco private key size: %d (expected 32)", our_priv_raw.size());
+    return;
+  }
+
+  // Decode our disco public key for packet header
+  std::string our_pub_raw = this->base64_decode(this->disco_key_public_);
+  if (our_pub_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco public key size: %d (expected 32)", our_pub_raw.size());
     return;
   }
 
@@ -2089,51 +2124,43 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
     return;
   }
 
+  // Build disco pong message per Tailscale spec
+  // Format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version)
+
   // Generate nonce (24 bytes for NaCl box)
   uint8_t nonce[24];
   esp_fill_random(nonce, 24);
 
-  // Prepare plaintext payload (PONG marker)
-  uint8_t plaintext[32] = {0x02};  // Pong marker + padding
+  // Prepare plaintext payload (msg_type + version)
+  uint8_t plaintext[2];
+  plaintext[0] = DISCO_MSG_PONG;  // Message type
+  plaintext[1] = DISCO_VERSION;   // Version
 
-  // Compute shared secret using ECDH (Curve25519)
-  uint8_t shared_secret[32];
-  if (crypto_scalarmult_curve25519(shared_secret,
-                                   (const uint8_t*)our_priv_raw.data(),
-                                   (const uint8_t*)peer_pub_raw.data()) != 0) {
-    ESP_LOGE(TAG, "Failed to compute shared secret");
+  // Encrypt using NaCl box (crypto_box_easy)
+  uint8_t ciphertext[sizeof(plaintext) + CRYPTO_BOX_MACBYTES];
+
+  if (crypto_box_easy_simple(ciphertext, plaintext, sizeof(plaintext),
+                             nonce,
+                             (const uint8_t*)peer_pub_raw.data(),
+                             (const uint8_t*)our_priv_raw.data()) != 0) {
+    ESP_LOGE(TAG, "Failed to encrypt disco pong (crypto_box_easy)");
     return;
   }
 
-  // Encrypt using XSalsa20-Poly1305
-  uint8_t ciphertext[sizeof(plaintext) + 16];  // 16 bytes for Poly1305 MAC
-
-  crypto_stream_salsa20_xor(ciphertext + 16, plaintext, sizeof(plaintext),
-                            nonce, shared_secret);
-
-  crypto_onetimeauth_poly1305(ciphertext,  // First 16 bytes = MAC
-                              ciphertext + 16,  // Ciphertext
-                              sizeof(plaintext),
-                              shared_secret);
-
-  // Clear sensitive data
-  sodium_memzero(shared_secret, sizeof(shared_secret));
+  ESP_LOGD(TAG, "  Encrypted PONG payload with NaCl box");
 
   // Build final PONG message
   std::vector<uint8_t> message;
-  message.reserve(6 + 1 + 1 + 12 + 24 + sizeof(ciphertext));
+  message.reserve(6 + 32 + 24 + sizeof(ciphertext));
 
-  // Magic
+  // Magic (6 bytes)
   message.insert(message.end(), DISCO_MAGIC, DISCO_MAGIC + 6);
-  // Version
-  message.push_back(DISCO_VERSION);
-  // Message type (PONG)
-  message.push_back(DISCO_MSG_PONG);
-  // TX ID (echo back the PING's TX ID)
-  message.insert(message.end(), tx_id, tx_id + 12);
-  // Nonce
+  // Sender's disco public key (32 bytes)
+  message.insert(message.end(), (const uint8_t*)our_pub_raw.data(),
+                 (const uint8_t*)our_pub_raw.data() + 32);
+  // Nonce (24 bytes)
   message.insert(message.end(), nonce, nonce + 24);
-  // Encrypted payload
+  // Encrypted payload (2 bytes plaintext + 16 bytes MAC = 18 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
 
   // Send UDP packet back to sender
@@ -2185,27 +2212,58 @@ void TailscaleComponent::check_disco_responses_() {
   char sender_ip[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
   uint16_t sender_port = ntohs(sender_addr.sin_port);
-  
+
   ESP_LOGI(TAG, "← Received Disco packet (%d bytes) from %s:%u", received, sender_ip, sender_port);
 
-  // Check for Disco magic header: "TS💬" (0x54, 0x53, 0xf0, 0x9f, 0x92, 0x9b)
-  if (received < 8) {
-    ESP_LOGW(TAG, "  Disco packet too short (%d bytes)", received);
+  // Official Tailscale disco format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version + data)
+  // Minimum packet size: 6 + 32 + 24 + 18 (2 bytes plaintext + 16 bytes MAC) = 80 bytes
+  const size_t MIN_DISCO_PACKET_SIZE = 6 + 32 + 24 + 2 + CRYPTO_BOX_MACBYTES;
+
+  if (received < MIN_DISCO_PACKET_SIZE) {
+    ESP_LOGW(TAG, "  Disco packet too short (%d bytes, minimum %d)", received, MIN_DISCO_PACKET_SIZE);
     return;
   }
 
-  const uint8_t disco_magic[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0x9b};
+  // Check magic header: "TS💬" (0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac)
+  const uint8_t disco_magic[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};
   if (memcmp(buffer, disco_magic, 6) != 0) {
     ESP_LOGW(TAG, "  Invalid Disco magic header");
-    ESP_LOGD(TAG, "  Got: %02x %02x %02x %02x %02x %02x", 
+    ESP_LOGD(TAG, "  Got: %02x %02x %02x %02x %02x %02x",
              buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5]);
     return;
   }
 
-  uint8_t version = buffer[6];
-  uint8_t msg_type = buffer[7];
+  // Extract sender's disco public key (32 bytes at offset 6)
+  const uint8_t* sender_disco_pubkey = &buffer[6];
 
-  ESP_LOGI(TAG, "  ✓ Valid Disco message - Version: %u, Type: %u", version, msg_type);
+  // Extract nonce (24 bytes at offset 38)
+  const uint8_t* nonce = &buffer[38];
+
+  // Extract encrypted payload (from offset 62 to end)
+  const uint8_t* encrypted_payload = &buffer[62];
+  size_t encrypted_len = received - 62;
+
+  // Decode our disco private key
+  std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
+  if (our_priv_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco private key size: %d", our_priv_raw.size());
+    return;
+  }
+
+  // Decrypt the payload using NaCl box
+  uint8_t plaintext[64];  // Should be enough for disco messages
+  if (crypto_box_open_easy_simple(plaintext, encrypted_payload, encrypted_len,
+                                   nonce, sender_disco_pubkey,
+                                   (const uint8_t*)our_priv_raw.data()) != 0) {
+    ESP_LOGW(TAG, "  Failed to decrypt disco packet (MAC verification failed)");
+    return;
+  }
+
+  // Extract msg_type and version from decrypted payload
+  uint8_t msg_type = plaintext[0];
+  uint8_t version = plaintext[1];
+
+  ESP_LOGI(TAG, "  ✓ Valid Disco message - Type: %u, Version: %u", msg_type, version);
 
   // Message types:
   // 1 = PING
@@ -2215,35 +2273,33 @@ void TailscaleComponent::check_disco_responses_() {
     case 1: {
       ESP_LOGI(TAG, "  Message type: PING");
 
-      // Find the peer by matching sender IP
-      std::string peer_disco_key;
-      for (const auto& peer : this->node_config_.peers) {
-        if (peer.endpoint == sender_ip) {
-          peer_disco_key = peer.disco_key;
-          ESP_LOGD(TAG, "  Found peer with matching endpoint: %s", peer.hostname.c_str());
-          break;
-        }
-      }
-
-      if (peer_disco_key.empty()) {
-        ESP_LOGW(TAG, "  Cannot respond to PING - peer disco key not found for %s", sender_ip);
-      } else {
-        // Extract TX ID (12 bytes at offset 8)
-        const uint8_t* tx_id = &buffer[8];
-
-        // Send PONG response
-        this->send_disco_pong_(sender_ip, sender_port, tx_id, peer_disco_key);
-      }
-      break;
-    }
-    case 2: {
-      ESP_LOGI(TAG, "  ✓ Message type: PONG (peer received our PING!)");
-
-      // Find the peer by matching sender IP to decrypt the PONG
+      // Find the peer by matching their disco public key
       std::string peer_disco_key;
       std::string peer_hostname;
+
       for (const auto& peer : this->node_config_.peers) {
-        if (peer.endpoint == sender_ip) {
+        // Decode peer's disco key to compare with sender
+        std::string peer_key_str = peer.disco_key;
+        std::string peer_pub_raw;
+
+        // Strip "discokey:" prefix if present and convert from hex
+        if (peer_key_str.substr(0, 9) == "discokey:") {
+          peer_key_str = peer_key_str.substr(9);
+
+          if (peer_key_str.size() == 64) {  // 32 bytes = 64 hex chars
+            peer_pub_raw.resize(32);
+            for (size_t i = 0; i < 32; i++) {
+              char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
+              peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
+            }
+          }
+        } else {
+          peer_pub_raw = this->base64_decode(peer_key_str);
+        }
+
+        // Compare with sender's public key
+        if (peer_pub_raw.size() == 32 &&
+            memcmp(sender_disco_pubkey, peer_pub_raw.data(), 32) == 0) {
           peer_disco_key = peer.disco_key;
           peer_hostname = peer.hostname;
           ESP_LOGD(TAG, "  Found peer: %s", peer_hostname.c_str());
@@ -2252,104 +2308,41 @@ void TailscaleComponent::check_disco_responses_() {
       }
 
       if (peer_disco_key.empty()) {
-        ESP_LOGW(TAG, "  Cannot decrypt PONG - peer disco key not found for %s", sender_ip);
-        break;
+        ESP_LOGW(TAG, "  Cannot respond to PING - peer disco key not recognized");
+      } else {
+        // Send PONG response
+        this->send_disco_pong_(sender_ip, sender_port, peer_disco_key);
       }
+      break;
+    }
+    case 2: {
+      ESP_LOGI(TAG, "  ✓ Message type: PONG (peer received our PING!)");
 
-      // Decrypt and validate the PONG message
-      if (received < 8 + 12 + 24 + 16 + 32) {  // header + tx_id + nonce + mac + ciphertext minimum
-        ESP_LOGW(TAG, "  PONG packet too short for encrypted payload");
-        break;
-      }
+      // Find peer by their disco public key to get hostname
+      std::string peer_hostname;
 
-      // Extract nonce (24 bytes at offset 20)
-      const uint8_t* nonce = &buffer[20];
+      for (const auto& peer : this->node_config_.peers) {
+        std::string peer_key_str = peer.disco_key;
+        std::string peer_pub_raw;
 
-      // Extract encrypted payload (MAC + ciphertext)
-      const uint8_t* encrypted_payload = &buffer[44];  // After magic(6) + version(1) + type(1) + tx_id(12) + nonce(24)
-      size_t encrypted_len = received - 44;
-
-      if (encrypted_len < 16 + 32) {  // Need at least MAC(16) + payload(32)
-        ESP_LOGW(TAG, "  Encrypted payload too short");
-        break;
-      }
-
-      // Decode our disco private key
-      std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
-      if (our_priv_raw.size() != 32) {
-        ESP_LOGE(TAG, "Invalid our disco private key size: %d", our_priv_raw.size());
-        break;
-      }
-
-      // Decode peer's disco public key
-      std::string peer_pub_raw;
-      std::string peer_key_str = peer_disco_key;
-
-      // Strip "discokey:" prefix if present and convert from hex
-      if (peer_key_str.substr(0, 9) == "discokey:") {
-        peer_key_str = peer_key_str.substr(9);
-
-        if (peer_key_str.size() == 64) {  // 32 bytes = 64 hex chars
-          peer_pub_raw.resize(32);
-          for (size_t i = 0; i < 32; i++) {
-            char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
-            peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
+        if (peer_key_str.substr(0, 9) == "discokey:") {
+          peer_key_str = peer_key_str.substr(9);
+          if (peer_key_str.size() == 64) {
+            peer_pub_raw.resize(32);
+            for (size_t i = 0; i < 32; i++) {
+              char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
+              peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
+            }
           }
         } else {
-          ESP_LOGE(TAG, "Invalid hex disco key length: %d", peer_key_str.size());
+          peer_pub_raw = this->base64_decode(peer_key_str);
+        }
+
+        if (peer_pub_raw.size() == 32 &&
+            memcmp(sender_disco_pubkey, peer_pub_raw.data(), 32) == 0) {
+          peer_hostname = peer.hostname;
           break;
         }
-      } else {
-        peer_pub_raw = this->base64_decode(peer_key_str);
-      }
-
-      if (peer_pub_raw.size() != 32) {
-        ESP_LOGE(TAG, "Invalid peer disco key size: %d", peer_pub_raw.size());
-        break;
-      }
-
-      // Compute shared secret using ECDH (Curve25519)
-      uint8_t shared_secret[32];
-      if (crypto_scalarmult_curve25519(shared_secret,
-                                       (const uint8_t*)our_priv_raw.data(),
-                                       (const uint8_t*)peer_pub_raw.data()) != 0) {
-        ESP_LOGE(TAG, "Failed to compute shared secret for PONG decryption");
-        break;
-      }
-
-      // Verify Poly1305 MAC (first 16 bytes of encrypted payload)
-      uint8_t computed_mac[16];
-      const uint8_t* received_mac = encrypted_payload;
-      const uint8_t* ciphertext = encrypted_payload + 16;
-      size_t ciphertext_len = encrypted_len - 16;
-
-      crypto_onetimeauth_poly1305(computed_mac, ciphertext, ciphertext_len, shared_secret);
-
-      if (sodium_memcmp(computed_mac, received_mac, 16) != 0) {
-        ESP_LOGW(TAG, "  PONG MAC verification failed - message may be corrupted or forged");
-        sodium_memzero(shared_secret, sizeof(shared_secret));
-        break;
-      }
-
-      ESP_LOGD(TAG, "  ✓ PONG MAC verified");
-
-      // Decrypt with Salsa20
-      uint8_t plaintext[64];  // Large enough for any PONG payload
-      if (ciphertext_len > sizeof(plaintext)) {
-        ESP_LOGW(TAG, "  PONG payload too large: %d bytes", ciphertext_len);
-        sodium_memzero(shared_secret, sizeof(shared_secret));
-        break;
-      }
-
-      crypto_stream_salsa20_xor(plaintext, ciphertext, ciphertext_len, nonce, shared_secret);
-
-      // Clear sensitive data
-      sodium_memzero(shared_secret, sizeof(shared_secret));
-
-      // Validate PONG marker (should be 0x02)
-      if (plaintext[0] != 0x02) {
-        ESP_LOGW(TAG, "  Invalid PONG marker: 0x%02x (expected 0x02)", plaintext[0]);
-        break;
       }
 
       ESP_LOGI(TAG, "  ✓ PONG decrypted and validated successfully!");
@@ -2396,16 +2389,16 @@ static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
 bool TailscaleComponent::perform_stun_query_() {
   ESP_LOGD(TAG, "→ Performing STUN query to discover endpoint...");
 
-  // Create UDP socket for STUN
-  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (sock < 0) {
-    ESP_LOGE(TAG, "Failed to create STUN socket: %d", errno);
+  // Use the existing disco socket for STUN to ensure NAT mapping matches
+  // CRITICAL: Using a temporary socket would create a different NAT port mapping!
+  if (this->disco_socket_ == -1) {
+    ESP_LOGE(TAG, "Disco socket not initialized for STUN query");
     return false;
   }
 
-  // Set socket to non-blocking
-  int flags = fcntl(sock, F_GETFL, 0);
-  fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+  int sock = this->disco_socket_;  // Use existing disco socket
+
+  // Socket is already non-blocking from setup_disco_socket_()
 
   // TODO: The DERP server's STUN has issues, using Google's public STUN for now
   // In the future, we should use the DERP server from DERPMap (this->static_map_.derp_host)
@@ -2424,7 +2417,7 @@ bool TailscaleComponent::perform_stun_query_() {
   struct hostent *server = gethostbyname(stun_server);
   if (server == nullptr) {
     ESP_LOGE(TAG, "Failed to resolve STUN server %s", stun_server);
-    close(sock);
+    // Don't close sock - it's the persistent disco socket
     return false;
   }
 
@@ -2466,7 +2459,7 @@ bool TailscaleComponent::perform_stun_query_() {
                         (struct sockaddr *)&stun_addr, sizeof(stun_addr));
   if (sent < 0) {
     ESP_LOGE(TAG, "Failed to send STUN request: %d", errno);
-    close(sock);
+    // Don't close sock - it's the persistent disco socket
     return false;
   }
 
@@ -2480,7 +2473,7 @@ bool TailscaleComponent::perform_stun_query_() {
 
   if (ret <= 0) {
     ESP_LOGW(TAG, "STUN query timeout - no response from server");
-    close(sock);
+    // Don't close sock - it's the persistent disco socket
     // Not a fatal error - we can still use DERP
     return false;
   }
@@ -2588,7 +2581,7 @@ bool TailscaleComponent::perform_stun_query_() {
     offset += 4 + ((attr_len + 3) & ~3);
   }
 
-  close(sock);
+  // Don't close sock - it's the persistent disco socket that stays open
   return found_endpoint;
 }
 
@@ -2806,8 +2799,9 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
            packet[0], packet[1], packet[2], packet[3], len);
 
 #ifdef USE_WIREGUARD
-  // Inject DERP packet into WireGuard by sending it to localhost:51820
+  // Inject DERP packet into WireGuard by sending it to WiFi IP:51820
   // This makes it appear as if the packet arrived via UDP
+  // We use WiFi IP instead of localhost because that's where WireGuard is listening
 
   int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (sock < 0) {
@@ -2815,10 +2809,15 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
     return;
   }
 
+  // Get WiFi IP address
+  esp_netif_ip_info_t ip_info;
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_get_ip_info(netif, &ip_info);
+
   struct sockaddr_in dest_addr = {};
   dest_addr.sin_family = AF_INET;
   dest_addr.sin_port = htons(51820);  // WireGuard listening port
-  dest_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);  // 127.0.0.1
+  dest_addr.sin_addr.s_addr = ip_info.ip.addr;  // WiFi interface IP
 
   ssize_t sent = sendto(sock, packet, len, 0,
                         (struct sockaddr*)&dest_addr, sizeof(dest_addr));
@@ -2857,11 +2856,12 @@ void TailscaleComponent::start_udp_relay_() {
   int flags = fcntl(this->udp_relay_socket_, F_GETFL, 0);
   fcntl(this->udp_relay_socket_, F_SETFL, flags | O_NONBLOCK);
 
-  // Bind to localhost:51821
+  // Bind to all interfaces on port 51821
+  // We use INADDR_ANY instead of localhost because WireGuard will send from WiFi interface
   struct sockaddr_in bind_addr = {};
   bind_addr.sin_family = AF_INET;
   bind_addr.sin_port = htons(51821);  // WireGuard will send packets here
-  bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);  // Listen on all interfaces
 
   if (bind(this->udp_relay_socket_, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
     ESP_LOGE(TAG, "Failed to bind UDP relay socket to port 51821: %d", errno);
@@ -2870,7 +2870,13 @@ void TailscaleComponent::start_udp_relay_() {
     return;
   }
 
-  ESP_LOGI(TAG, "✓ UDP relay started on 127.0.0.1:51821 (WireGuard → DERP)");
+  // Get WiFi IP for logging
+  esp_netif_ip_info_t ip_info;
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_get_ip_info(netif, &ip_info);
+  char ip_str[16];
+  snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", IP2STR(&ip_info.ip));
+  ESP_LOGI(TAG, "✓ UDP relay started on %s:51821 (WireGuard → DERP)", ip_str);
 #endif
 }
 
