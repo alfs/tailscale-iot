@@ -9,11 +9,13 @@ So here it is. The Frankenstein proof-of-concept. Slashed and stitched by many h
 
 You probably don't want to touch this code by hand. But it works, with some quirks. I hope it will give inspiration to a clean, optimized, smaller, implementation.
 
-Current status: Connects to self-hosted headscale servers (probably also tailscale servers - haven't tested), registers successfully, gets IP address, gets peer names and addresses.
+Current status: Connects to self-hosted headscale servers (probably also tailscale servers - haven't tested), registers successfully, gets IP address, gets peer names and addresses. External STUN via google works and records the external NAT address and port in the headscale database. STUN via DERP does not work.
 
-TODO: go from peers to wireguard connectivity to testing of echo server.
+What does not (even if Claude claims it's fixed in the git logs!): DERP tunneling of wireguard packets, or DISCO nat punching. Some packets get through, as evident by tcpdump, but there is no ping/pong despite many hours of troubleshooting and flipping back and forth between crypto implementations.
 
-Current problem: Lack of Claude tokens ;)
+TODO: go from peer, stun and registration with the server to gain wireguard connectivity and test of echo application.
+
+Current problem: Claude doesn't progress in solving the more intricate protocol issues with DERP and DISCO and goes back and forth among tests and adjustments. Dumping the esp32 wifi traffic towards DERP and peers can give more insights.
 
 
 ## Build & Flash Instructions
