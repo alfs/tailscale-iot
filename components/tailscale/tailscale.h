@@ -106,6 +106,7 @@ class TailscaleComponent : public PollingComponent {
   // Configuration
   std::string auth_key_;
   std::string control_url_;
+  std::string control_authority_;   // Cached authority (host:port) from control_url_
   std::string control_public_key_;  // Optional server public key
   std::string device_name_;
   uint32_t preferred_derp_{28};  // Preferred DERP region (default 28)
@@ -168,10 +169,12 @@ class TailscaleComponent : public PollingComponent {
   // Timing
   uint32_t last_update_time_{0};
   uint32_t last_keepalive_time_{0};
+  uint32_t last_control_plane_connect_time_{0};  // Track when control plane was established
   uint32_t retry_count_{0};
   static const uint32_t MAX_RETRIES = 5;
   static const uint32_t RETRY_DELAY_MS = 5000;
   static const uint32_t KEEPALIVE_INTERVAL_MS = 60000;  // Send keepalive every 60 seconds
+  static const uint32_t CONTROL_PLANE_RECONNECT_INTERVAL_MS = 2000;  // Reconnect every ~2-4s (with 2s update_interval) to stay within Headscale's 10-second grace period
 
   // Keepalive
   bool send_map_keepalive_();  // Send periodic keepalive map request with endpoints

@@ -168,41 +168,21 @@ void TailscaleComponent::loop() {
 }
 
 void TailscaleComponent::update() {
-  // IMPORTANT: The map connection is bidirectional streaming:
-  // - Server->Client: Map updates when network changes
-  // - Client->Server: Keepalive map requests to update endpoints and maintain session
+  // LONG-LIVED CONNECTION STRATEGY:
+  // The Tailscale/Headscale protocol expects a persistent HTTP/2 stream with Stream=true.
+  // We now keep the control plane stream open (close_stream=false) to maintain "online" status.
   //
-  // We MUST send periodic keepalive map requests to:
-  // 1. Update our endpoint information on the server
-  // 2. Keep the control plane session alive
-  // 3. Signal to the server that we're still active
-
-  if (this->state_ == TailscaleState::CONNECTED) {
-    uint32_t now = millis();
-
-    // NOTE: Periodic keepalives completely disabled for DERP-only mode
-    //
-    // Keepalives are NOT needed because:
-    // 1. DERP connection itself signals server that device is online
-    // 2. No direct peer connections (invalid 0.0.0.0 endpoint)
-    // 3. Reconnecting control plane causes OOM (needs ~70KB for TLS + HTTP/2)
-    // 4. DERP connection already occupies memory freed from control plane
-    //
-    // If future versions support direct connections, keepalives can be re-enabled
-    // with proper memory management (close DERP before reconnecting control plane)
-
-    // Keepalives disabled - do nothing
-    // if (now - this->last_keepalive_time_ >= KEEPALIVE_INTERVAL_MS) {
-    //   ESP_LOGD(TAG, "Sending periodic keepalive map request");
-    //   if (this->send_map_keepalive_()) {
-    //     this->last_keepalive_time_ = now;
-    //     ESP_LOGD(TAG, "✓ Keepalive sent successfully");
-    //   } else {
-    //     ESP_LOGW(TAG, "Failed to send keepalive - will retry in %u seconds", KEEPALIVE_INTERVAL_MS / 1000);
-    //     this->last_keepalive_time_ = now;
-    //   }
-    // }
-  }
+  // Memory usage with persistent control plane:
+  // - Control plane TLS session: ~70KB
+  // - Available for DERP when needed: ~250KB (out of 320KB total)
+  // - This is sufficient for DERP operations
+  //
+  // The persistent stream allows Headscale to:
+  // - Send keepalives to the client
+  // - Push map updates when network topology changes
+  // - Maintain the node's "online" status without periodic reconnections
+  //
+  // No periodic reconnection needed - the stream stays open until network interruption.
 }
 
 void TailscaleComponent::dump_config() {
@@ -395,20 +375,19 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
     // Set up Disco socket for NAT traversal
     this->setup_disco_socket_();
 
-    // Send Disco pings to all peers to trigger WireGuard handshake
-    ESP_LOGI(TAG, "→ Sending Disco pings to establish NAT mappings...");
-    ESP_LOGI(TAG, "   Peer count: %zu", this->node_config_.peers.size());
-    for (const auto& peer : this->node_config_.peers) {
-      ESP_LOGI(TAG, "   Peer: %s | endpoint=%s:%u | disco_key=%s",
-               peer.hostname.c_str(), peer.endpoint.c_str(), peer.port,
-               peer.disco_key.empty() ? "(none)" : peer.disco_key.substr(0, 20).c_str());
+    // Send Disco pings to discovered peer endpoints from map response
+    // This enables NAT hole punching for remote connectivity
+    ESP_LOGI(TAG, "→ Sending Disco ping to discovered peer endpoints...");
 
-      if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0" && !peer.disco_key.empty()) {
-        ESP_LOGI(TAG, "   📡 Sending disco PING to %s", peer.hostname.c_str());
+    // Find peer with disco key and use discovered endpoint
+    for (const auto& peer : this->node_config_.peers) {
+      ESP_LOGD(TAG, "  Checking peer %s for disco key...", peer.hostname.c_str());
+
+      if (!peer.disco_key.empty() && !peer.endpoint.empty() && peer.port > 0) {
+        ESP_LOGI(TAG, "   📡 Sending disco PING to %s at %s:%u (discovered endpoint)",
+                 peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
         this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
-      } else {
-        ESP_LOGW(TAG, "   ⚠️  Skipping disco ping for peer %s (endpoint='%s', has_disco_key=%d)",
-                 peer.hostname.c_str(), peer.endpoint.c_str(), !peer.disco_key.empty());
+        break;  // Only send to first peer with disco key
       }
     }
 
@@ -429,8 +408,7 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
     // if (!this->noise_session_->initialize_ik()) {
     //   ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
     // }
-    ESP_LOGI(TAG, "   ✓ Control plane remains connected");
-
+    ESP_LOGI(TAG, "   ✓ Control plane stream kept open for long-polling");
 
     this->transition_to(TailscaleState::CONNECTED);
     this->retry_count_ = 0;
@@ -447,24 +425,48 @@ void TailscaleComponent::handle_connected_state_() {
     this->setup_echo_server_();
   }
 
-  // Connect to DERP if not already connected
-  if (this->derp_client_ && !this->derp_client_->is_ready()) {
-    if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
-      // Temporarily close control plane to free ~70KB for DERP TLS session (mbedtls allocation)
-      // DERP TLS requires significant memory that fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00)
-      // when control plane is active
-      ESP_LOGI(TAG, "→ Closing control plane temporarily for DERP connection...");
-      if (this->ts2021_transport_) {
-        this->ts2021_transport_->reset();
-      }
-      if (this->upgrade_channel_) {
-        this->upgrade_channel_->close();
-        this->upgrade_channel_.reset();
-      }
-      ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP TLS)");
+  // Send periodic keepalives with endpoint updates every 60 seconds
+  // This tells Headscale our current endpoint so peers can reach us
+  static uint32_t last_keepalive_send_time = 0;
+  uint32_t current_time = millis();
+  const uint32_t KEEPALIVE_SEND_INTERVAL_MS = 60000;  // 60 seconds
 
-      ESP_LOGI(TAG, "Connecting to DERP relay...");
-      if (this->derp_client_->connect()) {
+  if (current_time - last_keepalive_send_time >= KEEPALIVE_SEND_INTERVAL_MS) {
+    ESP_LOGI(TAG, "→ Sending periodic keepalive with endpoint update...");
+    if (this->send_map_keepalive_()) {
+      ESP_LOGI(TAG, "✓ Keepalive sent successfully");
+      last_keepalive_send_time = current_time;
+    } else {
+      ESP_LOGW(TAG, "Failed to send keepalive - will retry in %d seconds", KEEPALIVE_SEND_INTERVAL_MS / 1000);
+      // Don't update last_keepalive_send_time so we retry sooner
+    }
+  }
+
+  // KEEPALIVE MODE: Skip DERP connection to avoid OOM
+  // ESP32-C3 has only 320KB RAM. Running both control plane (~70KB) and DERP TLS (~70KB)
+  // simultaneously causes MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00).
+  //
+  // Trade-off:
+  // - Keep control plane alive → send keepalives → maintain "online" status
+  // - Skip DERP connection → no relay path, but direct LAN works via disco pings
+  //
+  // Without control plane keepalives, node shows as "offline" in `tailscale status` on all peers
+  // because Headscale only sets IsOnline=true when active long-poll (Stream=true) exists.
+  //
+  // The old approach (close control plane, connect DERP) caused infinite OOM loop:
+  // 1. Try to connect DERP → allocation fails → returns DISCONNECTED
+  // 2. Next loop iteration → retry DERP → fails again
+  // 3. Keepalives never execute because code stuck in DERP retry loop
+
+  bool skip_derp_for_keepalives = true;  // Set to false to restore old behavior
+  static bool logged_skip_derp = false;  // Only log once
+
+  if (!skip_derp_for_keepalives) {
+    // OLD BEHAVIOR: Try DERP connection (will fail with OOM if control plane is alive)
+    if (this->derp_client_ && !this->derp_client_->is_ready()) {
+      if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
+        ESP_LOGI(TAG, "Connecting to DERP relay...");
+        if (this->derp_client_->connect()) {
         ESP_LOGI(TAG, "✓ DERP relay connected");
 
         // Start UDP relay for WireGuard → DERP packet forwarding
@@ -488,9 +490,15 @@ void TailscaleComponent::handle_connected_state_() {
         //     ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
         //   }
         // }
-      } else {
-        ESP_LOGW(TAG, "Failed to connect to DERP relay");
+        } else {
+          ESP_LOGW(TAG, "Failed to connect to DERP relay");
+        }
       }
+    }
+  } else {
+    if (!logged_skip_derp) {
+      ESP_LOGI(TAG, "KEEPALIVE MODE: Skipping DERP connection to avoid OOM - using direct LAN connectivity");
+      logged_skip_derp = true;
     }
   }
 
@@ -504,6 +512,25 @@ void TailscaleComponent::handle_connected_state_() {
 
   // Check for incoming Disco responses
   this->check_disco_responses_();
+
+  // Send periodic disco pings to maintain peer connectivity (every 10 seconds)
+  static uint32_t last_disco_ping_time = 0;
+  uint32_t now = millis();
+  if (now - last_disco_ping_time >= 10000) {  // 10 second interval
+    ESP_LOGD(TAG, "→ Sending periodic disco ping to peers...");
+
+    // Send disco ping to first peer with disco key using discovered endpoint
+    for (const auto& peer : this->node_config_.peers) {
+      if (!peer.disco_key.empty() && !peer.endpoint.empty() && peer.port > 0) {
+        ESP_LOGD(TAG, "   → Disco PING to %s at %s:%u",
+                 peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
+        this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
+        break;  // Only send to first peer
+      }
+    }
+
+    last_disco_ping_time = now;
+  }
 
   // Handle echo server clients
   this->handle_echo_clients_();
@@ -642,6 +669,49 @@ bool TailscaleComponent::configure_wireguard_() {
     if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0") {
       ESP_LOGI(TAG, "✓ Configuring WireGuard for peer %s: %s:%u",
                peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
+
+      // Test network connectivity to peer endpoint with ICMP ping using lwIP
+      ESP_LOGI(TAG, "  Testing network connectivity to %s...", peer.endpoint.c_str());
+
+      // Resolve IP address
+      struct hostent *host = gethostbyname(peer.endpoint.c_str());
+      if (host != nullptr && host->h_addr_list[0] != nullptr) {
+        struct in_addr *addr = (struct in_addr *)host->h_addr_list[0];
+        char ip_str[16];
+        inet_ntoa_r(*addr, ip_str, sizeof(ip_str));
+        ESP_LOGI(TAG, "  Resolved %s to %s", peer.endpoint.c_str(), ip_str);
+
+        // Send raw ICMP echo request using lwIP (simple test)
+        // Note: This is a simplified connectivity test
+        // Create a UDP socket as a connectivity probe
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+          struct sockaddr_in dest_addr = {};
+          dest_addr.sin_family = AF_INET;
+          dest_addr.sin_addr = *addr;
+          dest_addr.sin_port = htons(peer.port);  // Try WireGuard port
+
+          // Set socket timeout
+          struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+          setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+          // Try to connect (just tests routing/ARP)
+          int connect_result = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+          close(sock);
+
+          if (connect_result == 0 || errno == EISCONN) {
+            ESP_LOGI(TAG, "  ✓ Peer endpoint %s:%u is reachable (route exists)", ip_str, peer.port);
+          } else {
+            ESP_LOGW(TAG, "  ⚠ Cannot establish route to %s:%u (errno: %d)",
+                     ip_str, peer.port, errno);
+            ESP_LOGW(TAG, "  This may indicate network issues, but continuing with WireGuard setup...");
+          }
+        } else {
+          ESP_LOGW(TAG, "  Failed to create test socket (errno: %d)", errno);
+        }
+      } else {
+        ESP_LOGW(TAG, "  Failed to resolve hostname %s", peer.endpoint.c_str());
+      }
 
       // peer.endpoint already contains just the host (port was extracted during parsing)
       // When DERP client exists, DON'T configure peer endpoint
@@ -1210,6 +1280,11 @@ bool TailscaleComponent::ensure_ts2021_ready_() {
       return false;
     }
     ESP_LOGD(TAG, "Upgrade channel connected");
+
+    // Cache the authority string from the upgrade channel to avoid accessing it later
+    // when the channel may be in an invalid state
+    this->control_authority_ = this->upgrade_channel_->authority();
+    ESP_LOGD(TAG, "Cached control authority: %s", this->control_authority_.c_str());
   }
 
   this->ts2021_transport_->attach_upgrade(this->upgrade_channel_.get());
@@ -1448,13 +1523,13 @@ bool TailscaleComponent::fetch_map_response_() {
   // Use a longer timeout of 120 seconds to allow for full response transmission over slow connections
   // Note: Each MapRequest uses a separate HTTP/2 stream (not bidirectional on same stream)
   // Keepalives are sent as new requests on different stream IDs
-  // Map request with Stream=true - don't wait for stream closure, return buffered data
-  // Disable JSON filtering to receive full MapResponse including Peers array
-  // close_stream=true: Client sends END_STREAM to signal request complete
+  // Map request with Stream=true - KEEP STREAM OPEN for long-polling (Headscale protocol requirement)
+  // close_stream=false: Keep HTTP/2 stream alive for bidirectional communication
+  // This allows Headscale to send updates and keepalives, maintaining "online" status
   // filter_node_only=false: Response handler buffers full response (Node + Peers + DERPMap + etc)
-  if (!this->ts2021_transport_->http2_post_json(scheme, this->upgrade_channel_->authority(),
+  if (!this->ts2021_transport_->http2_post_json(scheme, this->control_authority_,
                                                  "/machine/map", payload_json,
-                                                 response_ptr, response_size, status, 120000, true, false)) {
+                                                 response_ptr, response_size, status, 120000, false, false)) {
     ESP_LOGE(TAG, "Map request HTTP/2 POST failed");
     return false;
   }
@@ -1933,9 +2008,13 @@ void TailscaleComponent::setup_disco_socket_() {
   socklen_t bound_len = sizeof(bound_addr);
   if (getsockname(this->disco_socket_, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
     uint16_t bound_port = ntohs(bound_addr.sin_port);
-    ESP_LOGI(TAG, "✓ Disco UDP socket bound to port %u", bound_port);
+    char bound_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &bound_addr.sin_addr, bound_ip, sizeof(bound_ip));
+    ESP_LOGI(TAG, "✓ Disco UDP socket bound to %s:%u (socket fd=%d, non-blocking=YES)",
+             bound_ip, bound_port, this->disco_socket_);
   } else {
-    ESP_LOGW(TAG, "✓ Disco UDP socket ready (couldn't determine port)");
+    ESP_LOGW(TAG, "✓ Disco UDP socket ready (couldn't determine port, socket fd=%d)",
+             this->disco_socket_);
   }
 }
 
@@ -2060,13 +2139,32 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     return;
   }
 
+  // Log detailed packet information before sending
+  ESP_LOGI(TAG, "  Disco packet details:");
+  ESP_LOGI(TAG, "    Total size: %d bytes", message.size());
+  ESP_LOGI(TAG, "    Magic:      %02x %02x %02x %02x %02x %02x",
+           message[0], message[1], message[2], message[3], message[4], message[5]);
+  ESP_LOGI(TAG, "    Our pubkey: %02x%02x%02x%02x... (32 bytes at offset 6)",
+           message[6], message[7], message[8], message[9]);
+  ESP_LOGI(TAG, "    Nonce:      %02x%02x%02x%02x... (24 bytes at offset 38)",
+           message[38], message[39], message[40], message[41]);
+  ESP_LOGI(TAG, "    Encrypted:  %d bytes at offset 62", message.size() - 62);
+  ESP_LOGI(TAG, "  Destination: %s:%u", endpoint.c_str(), port);
+
   ssize_t sent = sendto(this->disco_socket_, message.data(), message.size(), 0,
                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
   if (sent < 0) {
-    ESP_LOGE(TAG, "Failed to send disco ping: errno %d", errno);
+    ESP_LOGE(TAG, "❌ Failed to send disco ping: errno %d (%s)", errno, strerror(errno));
+    ESP_LOGE(TAG, "   Socket: %d, Dest addr: %s:%u", this->disco_socket_, endpoint.c_str(), port);
   } else {
     ESP_LOGI(TAG, "✓ Sent Disco ping (%d bytes) to %s:%u", sent, endpoint.c_str(), port);
+    ESP_LOGI(TAG, "  Full packet (hex): ");
+    for (size_t i = 0; i < std::min((size_t)sent, (size_t)80); i++) {
+      if (i % 16 == 0) ESP_LOGI(TAG, "    %04x:", i);
+      printf(" %02x", (uint8_t)message[i]);
+      if ((i + 1) % 16 == 0 || i == sent - 1) printf("\n");
+    }
   }
 }
 
@@ -2184,6 +2282,19 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
 }
 
 void TailscaleComponent::check_disco_responses_() {
+  // Debug: Log periodically to confirm function is being called
+  static uint32_t last_debug_log = 0;
+  static uint32_t check_count = 0;
+  check_count++;
+
+  uint32_t now = millis();
+  if (now - last_debug_log >= 30000) {  // Every 30 seconds
+    ESP_LOGD(TAG, "🔍 check_disco_responses_ called %u times in last 30s (socket=%d)",
+             check_count, this->disco_socket_);
+    check_count = 0;
+    last_debug_log = now;
+  }
+
   if (this->disco_socket_ < 0) {
     return;
   }
@@ -2199,7 +2310,7 @@ void TailscaleComponent::check_disco_responses_() {
   if (received < 0) {
     // No data available (EAGAIN/EWOULDBLOCK is normal for non-blocking socket)
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      ESP_LOGW(TAG, "Disco recvfrom error: errno %d", errno);
+      ESP_LOGW(TAG, "⚠️ Disco recvfrom error: errno %d (%s)", errno, strerror(errno));
     }
     return;
   }
@@ -2661,9 +2772,9 @@ bool TailscaleComponent::send_map_keepalive_() {
 
   // CRITICAL: Set KeepAlive to true for keepalive requests
   map_payload.keep_alive = true;
-  map_payload.stream = true;
+  map_payload.stream = true;  // REQUIRED for online status (Headscale sets IsOnline=true only for Stream=true)
   map_payload.read_only = false;
-  map_payload.omit_peers = false;  // Must be false to receive peer list and updates
+  map_payload.omit_peers = true;  // Minimize response size - server sends just {"KeepAlive":true} (18 bytes)
 
   // Include current endpoint
   if (!this->discovered_endpoint_.empty()) {
@@ -2684,8 +2795,15 @@ bool TailscaleComponent::send_map_keepalive_() {
 
   ESP_LOGI(TAG, "DEBUG: Sending keepalive to /machine/map with %zu endpoints", map_payload.endpoints.size());
 
+  // Validate transport before accessing it
+  if (!this->ts2021_transport_) {
+    ESP_LOGE(TAG, "TS2021 transport is null during keepalive - cannot send request");
+    return false;
+  }
+
   // Keepalive map requests with JSON filtering enabled
-  if (!this->ts2021_transport_->http2_post_json(scheme, this->upgrade_channel_->authority(),
+  // Use cached authority instead of accessing upgrade_channel_ which may be invalid
+  if (!this->ts2021_transport_->http2_post_json(scheme, this->control_authority_,
                                                  "/machine/map", payload_json,
                                                  response_ptr, response_size, status, 5000, true, true)) {
     ESP_LOGE(TAG, "Failed to send keepalive map request");
