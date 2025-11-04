@@ -16,6 +16,8 @@
 #include <vector>
 #include <memory>
 #include <cstring>  // for memset
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 namespace esphome {
 namespace tailscale {
@@ -132,8 +134,17 @@ class TailscaleComponent : public PollingComponent {
   StaticMapResponse static_map_;              // STATIC buffer for map response (NO heap)
   bool keys_loaded_from_nvs_{false};          // Track if keys were loaded from NVS
 
-  // Disco protocol
-  int disco_socket_{-1};                      // UDP socket for Disco protocol
+  // Unified socket for all UDP traffic (Disco, STUN, WireGuard)
+  int unified_socket_{-1};                    // Single UDP socket for all traffic
+  uint16_t unified_port_{41641};              // Port for unified socket
+  void setup_unified_socket_();               // Initialize unified socket
+  void route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);  // Demultiplex packets
+  void handle_disco_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);    // Handle Disco protocol
+  void handle_stun_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);     // Handle STUN responses
+  void handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src); // Forward to WireGuard
+
+  // Disco protocol (DEPRECATED - migrating to unified socket)
+  int disco_socket_{-1};                      // UDP socket for Disco protocol (to be removed)
   std::vector<std::string> disco_ping_targets_;  // Hostnames to send Disco pings to (configured by user)
   void setup_disco_socket_();
   void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
@@ -152,10 +163,12 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<DerpClient> derp_client_;
 
   // Endpoint discovery and advertisement
-  std::string discovered_endpoint_;  // Our public IP:port
+  std::string discovered_endpoint_;  // Our public IP:port (STUN-discovered)
+  std::vector<std::string> discovered_endpoints_;  // All discovered endpoints (local + external)
   bool initial_endpoint_sent_{false};  // Track if initial endpoint update was sent
   bool send_endpoint_update_();      // Send endpoint to control server
   bool perform_stun_query_();         // Query DERP server for our public IP
+  void discover_local_endpoints_();   // Discover local network endpoints
   void handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len);
 
   // UDP Relay for WireGuard → DERP forwarding

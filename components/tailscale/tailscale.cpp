@@ -38,6 +38,13 @@ namespace tailscale {
 
 static const char *const TAG = "tailscale";
 
+// STUN protocol constants (RFC 5389)
+static const uint32_t STUN_MAGIC_COOKIE = 0x2112A442;
+static const uint16_t STUN_BINDING_REQUEST = 0x0001;
+static const uint16_t STUN_BINDING_RESPONSE = 0x0101;
+static const uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
+static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
+
 // Convert base64 to hex (for Tailscale wire format keys)
 static std::string base64_to_hex(const std::string &base64_input) {
   // Decode from base64
@@ -258,18 +265,23 @@ void TailscaleComponent::handle_registering_state_() {
 void TailscaleComponent::handle_fetching_map_state_() {
   ESP_LOGI(TAG, "→ Step 3/3: Fetching network map...");
 
-  // Set up disco socket FIRST before STUN query
-  // CRITICAL: STUN must use the disco socket to get the correct NAT mapping!
-  this->setup_disco_socket_();
+  // Set up UNIFIED socket FIRST before STUN query
+  // CRITICAL: STUN must use the unified socket to get the correct NAT mapping!
+  this->setup_unified_socket_();
 
-  // QUICK FIX: Perform STUN discovery BEFORE fetching map so we can include endpoint in initial request
-  // This avoids the need for separate keepalive requests which conflict with the streaming map connection
+  // Discover local network endpoints (WiFi IP + port)
+  ESP_LOGI(TAG, "→ Discovering local endpoints...");
+  this->discover_local_endpoints_();
+
+  // Perform STUN discovery to get external endpoint
   ESP_LOGI(TAG, "→ Discovering our public endpoint via STUN (before map request)...");
   if (this->perform_stun_query_()) {
-    ESP_LOGI(TAG, "✓ Discovered endpoint: %s", this->discovered_endpoint_.c_str());
-    ESP_LOGI(TAG, "  Endpoint will be included in initial map request");
+    ESP_LOGI(TAG, "✓ Discovered external endpoint: %s", this->discovered_endpoint_.c_str());
+    // Update discovered_endpoints_ with new external endpoint
+    this->discover_local_endpoints_();  // Refresh with both local + external
+    ESP_LOGI(TAG, "  Endpoints will be included in initial map request");
   } else {
-    ESP_LOGW(TAG, "STUN query failed - endpoint will not be available");
+    ESP_LOGW(TAG, "STUN query failed - only local endpoint available");
   }
 
   // Now fetch map WITH endpoint included in the request
@@ -372,8 +384,9 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
   if (this->configure_wireguard_()) {
     ESP_LOGI(TAG, "✓ WireGuard configured");
 
-    // Set up Disco socket for NAT traversal
-    this->setup_disco_socket_();
+    // Unified socket should already be set up from FETCHING_MAP state
+    // But ensure it's ready for disco pings
+    this->setup_unified_socket_();
 
     // Send Disco pings to discovered peer endpoints from map response
     // This enables NAT hole punching for remote connectivity
@@ -529,12 +542,27 @@ void TailscaleComponent::handle_connected_state_() {
   if (this->derp_client_ && this->derp_client_->is_ready()) {
     this->derp_client_->process();
 
-    // Process UDP relay for WireGuard → DERP forwarding
-    this->process_udp_relay_();
+    // UDP relay is now integrated into unified socket (WireGuard packets routed automatically)
+    // this->process_udp_relay_();  // DEPRECATED - handled by unified socket
   }
 
-  // Check for incoming Disco responses
-  this->check_disco_responses_();
+  // Check for incoming packets on unified socket (Disco, STUN, WireGuard)
+  // This replaces the old check_disco_responses_() which only checked disco socket
+  if (this->unified_socket_ >= 0) {
+    uint8_t buffer[2048];  // Large enough for WireGuard packets
+    struct sockaddr_in sender_addr{};
+    socklen_t sender_len = sizeof(sender_addr);
+
+    ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
+                                 (struct sockaddr *)&sender_addr, &sender_len);
+
+    if (received > 0) {
+      // Route packet to appropriate handler based on magic bytes
+      this->route_incoming_packet_(buffer, received, &sender_addr);
+    } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      ESP_LOGW(TAG, "⚠️ Unified socket recvfrom error: errno %d (%s)", errno, strerror(errno));
+    }
+  }
 
   // Send periodic disco pings to maintain peer connectivity (every 10 seconds)
   static uint32_t last_disco_ping_time = 0;
@@ -1524,10 +1552,16 @@ bool TailscaleComponent::fetch_map_response_() {
   map_payload.read_only = false;    // Must be false to get full map response (not just lite update)
   map_payload.omit_peers = false;   // Must be false with stream=true (headscale protocol requirement)
 
-  // Include our discovered endpoint if available
-  if (!this->discovered_endpoint_.empty()) {
+  // Include all discovered endpoints (local + external)
+  if (!this->discovered_endpoints_.empty()) {
+    for (const auto& endpoint : this->discovered_endpoints_) {
+      map_payload.endpoints.push_back(endpoint);
+      ESP_LOGI(TAG, "Including endpoint in map request: %s", endpoint.c_str());
+    }
+  } else if (!this->discovered_endpoint_.empty()) {
+    // Fallback to single endpoint if vector not populated
     map_payload.endpoints.push_back(this->discovered_endpoint_);
-    ESP_LOGI(TAG, "Including endpoint in map request: %s", this->discovered_endpoint_.c_str());
+    ESP_LOGI(TAG, "Including endpoint in map request (fallback): %s", this->discovered_endpoint_.c_str());
   }
 
   std::string payload_json = render_map_request(map_payload);
@@ -2046,9 +2080,368 @@ void TailscaleComponent::setup_disco_socket_() {
   }
 }
 
+// ========================================
+// UNIFIED SOCKET SETUP
+// ========================================
+// This function sets up the unified UDP socket that handles all traffic:
+// - Disco protocol (NAT traversal)
+// - STUN responses (endpoint discovery)
+// - WireGuard packets (data plane)
+void TailscaleComponent::setup_unified_socket_() {
+  if (this->unified_socket_ != -1) {
+    return;  // Already set up
+  }
+
+  ESP_LOGI(TAG, "→ Setting up UNIFIED UDP socket (Disco + STUN + WireGuard)...");
+
+  this->unified_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (this->unified_socket_ < 0) {
+    ESP_LOGE(TAG, "❌ Failed to create unified UDP socket: errno %d", errno);
+    return;
+  }
+
+  // Set socket to non-blocking
+  int flags = fcntl(this->unified_socket_, F_GETFL, 0);
+  fcntl(this->unified_socket_, F_SETFL, flags | O_NONBLOCK);
+
+  // Bind to unified port (41641 - standard Tailscale disco port)
+  // CRITICAL: On ESP32/LWIP, binding to port 0 causes the send port to differ from receive port!
+  // We must bind to a specific port to ensure sendto() uses the same port.
+  struct sockaddr_in local_addr{};
+  local_addr.sin_family = AF_INET;
+  local_addr.sin_addr.s_addr = INADDR_ANY;
+  local_addr.sin_port = htons(this->unified_port_);
+
+  if (bind(this->unified_socket_, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+    ESP_LOGE(TAG, "❌ Failed to bind unified socket to port %u: errno %d", this->unified_port_, errno);
+    close(this->unified_socket_);
+    this->unified_socket_ = -1;
+    return;
+  }
+
+  // Get the actual port that was assigned
+  struct sockaddr_in bound_addr{};
+  socklen_t bound_len = sizeof(bound_addr);
+  if (getsockname(this->unified_socket_, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
+    uint16_t bound_port = ntohs(bound_addr.sin_port);
+    char bound_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &bound_addr.sin_addr, bound_ip, sizeof(bound_ip));
+    ESP_LOGI(TAG, "✅ Unified UDP socket bound to %s:%u (fd=%d, non-blocking=YES)",
+             bound_ip, bound_port, this->unified_socket_);
+  } else {
+    ESP_LOGW(TAG, "✓ Unified UDP socket ready (couldn't determine port, fd=%d)",
+             this->unified_socket_);
+  }
+}
+
+// ========================================
+// PACKET ROUTING AND DEMULTIPLEXING
+// ========================================
+// This function inspects incoming packet magic bytes and routes to appropriate handler:
+// - Disco: TS💬 (0x54 0x53 0xf0 0x9f 0x92 0xac)
+// - STUN: byte[0] == 0x00 || byte[0] == 0x01
+// - WireGuard: byte[0] in range 1-4 (message types)
+void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
+  if (len < 1) {
+    ESP_LOGD(TAG, "⚠️ Received empty packet, ignoring");
+    return;
+  }
+
+  // Check for Disco magic: TS💬 (0x54 0x53 0xf0 0x9f 0x92 0xac)
+  const uint8_t disco_magic[6] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};
+  if (len >= 6 && memcmp(buf, disco_magic, 6) == 0) {
+    ESP_LOGD(TAG, "📡 Routing to Disco handler (magic: TS💬)");
+    this->handle_disco_packet_(buf, len, src);
+    return;
+  }
+
+  // Check for STUN magic: first byte is 0x00 or 0x01
+  if (len >= 20 && (buf[0] == 0x00 || buf[0] == 0x01)) {
+    ESP_LOGD(TAG, "🔍 Routing to STUN handler (magic: 0x%02x)", buf[0]);
+    this->handle_stun_packet_(buf, len, src);
+    return;
+  }
+
+  // Check for WireGuard message types (1-4)
+  if (len >= 4 && buf[0] >= 1 && buf[0] <= 4) {
+    ESP_LOGD(TAG, "🔐 Routing to WireGuard handler (type: %u)", buf[0]);
+    this->handle_wireguard_packet_(buf, len, src);
+    return;
+  }
+
+  // Unknown packet type
+  char src_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+  uint16_t src_port = ntohs(src->sin_port);
+  ESP_LOGW(TAG, "⚠️ Unknown packet type from %s:%u (len=%zu, first_byte=0x%02x)",
+           src_ip, src_port, len, buf[0]);
+}
+
+// ========================================
+// PACKET HANDLERS
+// ========================================
+
+// Handle Disco protocol packets (PING, PONG, CALL_ME_MAYBE)
+void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
+  char src_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+  uint16_t src_port = ntohs(src->sin_port);
+
+  ESP_LOGI(TAG, "← Received Disco packet (%zu bytes) from %s:%u", len, src_ip, src_port);
+
+  // Minimum disco packet size: magic(6) + sender_pubkey(32) + nonce(24) + encrypted(2 + 16) = 80 bytes
+  const size_t MIN_DISCO_PACKET_SIZE = 6 + 32 + 24 + 2 + CRYPTO_BOX_MACBYTES;
+  if (len < MIN_DISCO_PACKET_SIZE) {
+    ESP_LOGW(TAG, "  Disco packet too short (%zu bytes, minimum %zu)", len, MIN_DISCO_PACKET_SIZE);
+    return;
+  }
+
+  // Extract sender's disco public key (32 bytes at offset 6)
+  const uint8_t* sender_disco_pubkey = &buf[6];
+
+  // Extract nonce (24 bytes at offset 38)
+  const uint8_t* nonce = &buf[38];
+
+  // Extract encrypted payload (from offset 62 to end)
+  const uint8_t* encrypted_payload = &buf[62];
+  size_t encrypted_len = len - 62;
+
+  // Decode our disco private key
+  std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
+  if (our_priv_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco private key size: %zu", our_priv_raw.size());
+    return;
+  }
+
+  // Decrypt the payload using NaCl box
+  uint8_t plaintext[64];  // Should be enough for disco messages
+  if (crypto_box_open_easy_simple(plaintext, encrypted_payload, encrypted_len,
+                                   nonce, sender_disco_pubkey,
+                                   (const uint8_t*)our_priv_raw.data()) != 0) {
+    ESP_LOGW(TAG, "  Failed to decrypt disco packet (MAC verification failed)");
+    return;
+  }
+
+  // Extract msg_type and version from decrypted payload
+  uint8_t msg_type = plaintext[0];
+  uint8_t version = plaintext[1];
+
+  ESP_LOGI(TAG, "  ✓ Valid Disco message - Type: %u, Version: %u", msg_type, version);
+
+  // Message types: 1 = PING, 2 = PONG, 3 = CALL_ME_MAYBE
+  switch (msg_type) {
+    case 1: {  // PING
+      ESP_LOGI(TAG, "  → Disco PING received, sending PONG...");
+      // Encode sender's disco key to base64 for send_disco_pong_
+      std::string sender_disco_key_b64 = this->base64_encode(sender_disco_pubkey, 32);
+      this->send_disco_pong_(src_ip, src_port, sender_disco_key_b64);
+      break;
+    }
+    case 2:  // PONG
+      ESP_LOGI(TAG, "  ✓ Disco PONG received from %s:%u", src_ip, src_port);
+      this->handle_disco_pong_(src_ip, src_port);
+      break;
+    case 3:  // CALL_ME_MAYBE
+      ESP_LOGI(TAG, "  → Disco CALL_ME_MAYBE received (not implemented)");
+      break;
+    default:
+      ESP_LOGW(TAG, "  Unknown Disco message type: %u", msg_type);
+      break;
+  }
+}
+
+// Handle incoming disco PONG responses
+void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
+  ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
+  // Future: Could track peer reachability, update route table, etc.
+}
+
+// Handle STUN response packets (endpoint discovery)
+void TailscaleComponent::handle_stun_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
+  char src_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+  uint16_t src_port = ntohs(src->sin_port);
+
+  ESP_LOGI(TAG, "← Received STUN packet (%zu bytes) from %s:%u", len, src_ip, src_port);
+
+  if (len < 20) {
+    ESP_LOGW(TAG, "  STUN packet too short (%zu bytes, minimum 20)", len);
+    return;
+  }
+
+  // Parse STUN response header
+  uint16_t msg_type = (buf[0] << 8) | buf[1];
+  uint16_t msg_len = (buf[2] << 8) | buf[3];
+
+  ESP_LOGD(TAG, "  Type: 0x%04x, Length: %u bytes", msg_type, msg_len);
+
+  if (msg_type != STUN_BINDING_RESPONSE) {
+    ESP_LOGW(TAG, "  Unexpected STUN message type: 0x%04x (expected 0x0101)", msg_type);
+    return;
+  }
+
+  // Parse attributes to find XOR-MAPPED-ADDRESS
+  size_t offset = 20;  // Skip header
+  bool found_endpoint = false;
+
+  while (offset + 4 <= len) {
+    uint16_t attr_type = (buf[offset] << 8) | buf[offset + 1];
+    uint16_t attr_len = (buf[offset + 2] << 8) | buf[offset + 3];
+
+    ESP_LOGD(TAG, "  STUN attribute: type=0x%04x, len=%u", attr_type, attr_len);
+
+    if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && attr_len >= 8) {
+      // Parse XOR-MAPPED-ADDRESS
+      uint8_t family = buf[offset + 5];
+      uint16_t xor_port = (buf[offset + 6] << 8) | buf[offset + 7];
+
+      if (family == 0x01) {  // IPv4
+        uint32_t xor_addr = (buf[offset + 8] << 24) |
+                           (buf[offset + 9] << 16) |
+                           (buf[offset + 10] << 8) |
+                           buf[offset + 11];
+
+        // XOR with magic cookie to get real values
+        uint16_t real_port = xor_port ^ (STUN_MAGIC_COOKIE >> 16);
+        uint32_t real_addr = xor_addr ^ STUN_MAGIC_COOKIE;
+
+        // Convert to string
+        char ip_str[INET_ADDRSTRLEN];
+        struct in_addr addr;
+        addr.s_addr = htonl(real_addr);
+        inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+
+        std::string endpoint = std::string(ip_str) + ":" + std::to_string(real_port);
+
+        // Update discovered endpoint if it changed
+        if (this->discovered_endpoint_ != endpoint) {
+          this->discovered_endpoint_ = endpoint;
+          ESP_LOGI(TAG, "  ✅ STUN discovered new endpoint: %s", this->discovered_endpoint_.c_str());
+        } else {
+          ESP_LOGD(TAG, "  ✓ STUN confirmed endpoint: %s", this->discovered_endpoint_.c_str());
+        }
+
+        found_endpoint = true;
+        break;
+      }
+    } else if (attr_type == STUN_ATTR_MAPPED_ADDRESS && attr_len >= 8) {
+      // Fallback to non-XOR MAPPED-ADDRESS (older STUN)
+      uint8_t family = buf[offset + 5];
+      uint16_t port = (buf[offset + 6] << 8) | buf[offset + 7];
+
+      if (family == 0x01) {  // IPv4
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &buf[offset + 8], ip_str, sizeof(ip_str));
+
+        std::string endpoint = std::string(ip_str) + ":" + std::to_string(port);
+
+        if (this->discovered_endpoint_ != endpoint) {
+          this->discovered_endpoint_ = endpoint;
+          ESP_LOGI(TAG, "  ✅ STUN discovered new endpoint (legacy): %s", this->discovered_endpoint_.c_str());
+        }
+
+        found_endpoint = true;
+        break;
+      }
+    }
+
+    // Move to next attribute (with padding to 4-byte boundary)
+    offset += 4 + ((attr_len + 3) & ~3);
+  }
+
+  if (!found_endpoint) {
+    ESP_LOGW(TAG, "  ⚠️ No endpoint found in STUN response");
+  }
+}
+
+// Handle WireGuard packets (forward to DERP relay)
+void TailscaleComponent::handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
+#ifdef USE_WIREGUARD
+  char src_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+  uint16_t src_port = ntohs(src->sin_port);
+
+  ESP_LOGD(TAG, "← Received WireGuard packet (%zu bytes, type=%u) from %s:%u",
+           len, buf[0], src_ip, src_port);
+
+  // Check if we have a valid peer and DERP client
+  if (!this->wg_peer_node_key_valid_) {
+    ESP_LOGW(TAG, "  ⚠️ No WireGuard peer configured, dropping packet");
+    return;
+  }
+
+  if (!this->derp_client_ || !this->derp_client_->is_ready()) {
+    ESP_LOGW(TAG, "  ⚠️ DERP client not ready, dropping packet");
+    return;
+  }
+
+  // Forward packet to DERP
+  ESP_LOGD(TAG, "  → Forwarding to DERP relay...");
+
+  if (!this->derp_client_->send_packet(this->wg_peer_node_key_, buf, len)) {
+    ESP_LOGE(TAG, "  ❌ Failed to send packet via DERP relay");
+  } else {
+    ESP_LOGD(TAG, "  ✅ Packet forwarded to DERP");
+  }
+#else
+  ESP_LOGW(TAG, "← WireGuard packet received but WireGuard support not compiled");
+#endif
+}
+
+// ========================================
+// LOCAL ENDPOINT DISCOVERY
+// ========================================
+// Discover local network endpoints by enumerating WiFi interfaces
+void TailscaleComponent::discover_local_endpoints_() {
+  this->discovered_endpoints_.clear();
+
+  // Get WiFi interface information
+  esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (netif == nullptr) {
+    ESP_LOGW(TAG, "⚠️ WiFi interface not found for endpoint discovery");
+    return;
+  }
+
+  // Get IP address
+  esp_netif_ip_info_t ip_info;
+  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+    ESP_LOGW(TAG, "⚠️ Failed to get IP info for endpoint discovery");
+    return;
+  }
+
+  // Convert IP to string
+  char ip_str[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &ip_info.ip, ip_str, sizeof(ip_str));
+
+  // Check if we have a valid IP (not 0.0.0.0)
+  if (ip_info.ip.addr == 0) {
+    ESP_LOGD(TAG, "WiFi not connected, no local endpoints");
+    return;
+  }
+
+  // Add local endpoint with unified port
+  std::string local_endpoint = std::string(ip_str) + ":" + std::to_string(this->unified_port_);
+  this->discovered_endpoints_.push_back(local_endpoint);
+
+  ESP_LOGI(TAG, "✅ Discovered local endpoint: %s", local_endpoint.c_str());
+
+  // Add external endpoint if discovered via STUN
+  if (!this->discovered_endpoint_.empty()) {
+    // Check if it's different from local endpoint
+    if (this->discovered_endpoint_ != local_endpoint) {
+      this->discovered_endpoints_.push_back(this->discovered_endpoint_);
+      ESP_LOGI(TAG, "✅ Added external endpoint: %s", this->discovered_endpoint_.c_str());
+    } else {
+      ESP_LOGD(TAG, "External endpoint same as local, not duplicating");
+    }
+  }
+
+  ESP_LOGI(TAG, "→ Total endpoints: %zu", this->discovered_endpoints_.size());
+}
+
 void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key) {
-  if (this->disco_socket_ == -1) {
-    ESP_LOGW(TAG, "Disco socket not initialized");
+  if (this->unified_socket_ == -1) {
+    ESP_LOGW(TAG, "Unified socket not initialized");
     return;
   }
 
@@ -2179,12 +2572,12 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   ESP_LOGI(TAG, "    Encrypted:  %d bytes at offset 62", message.size() - 62);
   ESP_LOGI(TAG, "  Destination: %s:%u", endpoint.c_str(), port);
 
-  ssize_t sent = sendto(this->disco_socket_, message.data(), message.size(), 0,
+  ssize_t sent = sendto(this->unified_socket_, message.data(), message.size(), 0,
                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
   if (sent < 0) {
     ESP_LOGE(TAG, "❌ Failed to send disco ping: errno %d (%s)", errno, strerror(errno));
-    ESP_LOGE(TAG, "   Socket: %d, Dest addr: %s:%u", this->disco_socket_, endpoint.c_str(), port);
+    ESP_LOGE(TAG, "   Socket: %d, Dest addr: %s:%u", this->unified_socket_, endpoint.c_str(), port);
   } else {
     ESP_LOGI(TAG, "✓ Sent Disco ping (%d bytes) to %s:%u", sent, endpoint.c_str(), port);
     ESP_LOGI(TAG, "  Full packet (hex): ");
@@ -2198,8 +2591,8 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
 
 void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
                                           const std::string& peer_disco_key) {
-  if (this->disco_socket_ == -1) {
-    ESP_LOGW(TAG, "Disco socket not initialized");
+  if (this->unified_socket_ == -1) {
+    ESP_LOGW(TAG, "Unified socket not initialized");
     return;
   }
 
@@ -2299,7 +2692,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
     return;
   }
 
-  ssize_t sent = sendto(this->disco_socket_, message.data(), message.size(), 0,
+  ssize_t sent = sendto(this->unified_socket_, message.data(), message.size(), 0,
                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
   if (sent < 0) {
@@ -2499,45 +2892,20 @@ void TailscaleComponent::check_disco_responses_() {
   }
 }
 
-}  // namespace tailscale
-}  // namespace esphome
-// Endpoint discovery implementation for Tailscale ESP32 client
-#include "tailscale.h"
-#include "esphome/core/log.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-
-namespace esphome {
-namespace tailscale {
-
-// STUN magic cookie (RFC 5389)
-static const uint32_t STUN_MAGIC_COOKIE = 0x2112A442;
-
-// STUN message types
-static const uint16_t STUN_BINDING_REQUEST = 0x0001;
-static const uint16_t STUN_BINDING_RESPONSE = 0x0101;
-
-// STUN attributes
-static const uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
-static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
-
 // Simple STUN query to discover our public endpoint
 bool TailscaleComponent::perform_stun_query_() {
   ESP_LOGD(TAG, "→ Performing STUN query to discover endpoint...");
 
-  // Use the existing disco socket for STUN to ensure NAT mapping matches
+  // Use the existing unified socket for STUN to ensure NAT mapping matches
   // CRITICAL: Using a temporary socket would create a different NAT port mapping!
-  if (this->disco_socket_ == -1) {
-    ESP_LOGE(TAG, "Disco socket not initialized for STUN query");
+  if (this->unified_socket_ == -1) {
+    ESP_LOGE(TAG, "Unified socket not initialized for STUN query");
     return false;
   }
 
-  int sock = this->disco_socket_;  // Use existing disco socket
+  int sock = this->unified_socket_;  // Use existing unified socket
 
-  // Socket is already non-blocking from setup_disco_socket_()
+  // Socket is already non-blocking from setup_unified_socket_()
 
   // TODO: The DERP server's STUN has issues, using Google's public STUN for now
   // In the future, we should use the DERP server from DERPMap (this->static_map_.derp_host)
@@ -2556,7 +2924,7 @@ bool TailscaleComponent::perform_stun_query_() {
   struct hostent *server = gethostbyname(stun_server);
   if (server == nullptr) {
     ESP_LOGE(TAG, "Failed to resolve STUN server %s", stun_server);
-    // Don't close sock - it's the persistent disco socket
+    // Don't close sock - it's the persistent unified socket
     return false;
   }
 
@@ -2598,7 +2966,7 @@ bool TailscaleComponent::perform_stun_query_() {
                         (struct sockaddr *)&stun_addr, sizeof(stun_addr));
   if (sent < 0) {
     ESP_LOGE(TAG, "Failed to send STUN request: %d", errno);
-    // Don't close sock - it's the persistent disco socket
+    // Don't close sock - it's the persistent unified socket
     return false;
   }
 
@@ -2612,7 +2980,7 @@ bool TailscaleComponent::perform_stun_query_() {
 
   if (ret <= 0) {
     ESP_LOGW(TAG, "STUN query timeout - no response from server");
-    // Don't close sock - it's the persistent disco socket
+    // Don't close sock - it's the persistent unified socket
     // Not a fatal error - we can still use DERP
     return false;
   }
@@ -2720,7 +3088,7 @@ bool TailscaleComponent::perform_stun_query_() {
     offset += 4 + ((attr_len + 3) & ~3);
   }
 
-  // Don't close sock - it's the persistent disco socket that stays open
+  // Don't close sock - it's the persistent unified socket that stays open
   return found_endpoint;
 }
 
@@ -2793,10 +3161,16 @@ bool TailscaleComponent::send_map_keepalive_() {
   map_payload.read_only = false;
   map_payload.omit_peers = true;  // Minimize response size - server sends just {"KeepAlive":true} (18 bytes)
 
-  // Include current endpoint
-  if (!this->discovered_endpoint_.empty()) {
+  // Include all discovered endpoints (local + external)
+  if (!this->discovered_endpoints_.empty()) {
+    for (const auto& endpoint : this->discovered_endpoints_) {
+      map_payload.endpoints.push_back(endpoint);
+      ESP_LOGI(TAG, "Including endpoint in keepalive: %s", endpoint.c_str());
+    }
+  } else if (!this->discovered_endpoint_.empty()) {
+    // Fallback to single endpoint if vector not populated
     map_payload.endpoints.push_back(this->discovered_endpoint_);
-    ESP_LOGI(TAG, "Including endpoint in keepalive: %s", this->discovered_endpoint_.c_str());
+    ESP_LOGI(TAG, "Including endpoint in keepalive (fallback): %s", this->discovered_endpoint_.c_str());
   } else {
     ESP_LOGW(TAG, "No endpoint to include in keepalive");
   }
