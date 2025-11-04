@@ -444,18 +444,40 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
                                       const char *&response_ptr, size_t &response_size,
                                       uint16_t &status_code, uint32_t timeout_ms, bool close_stream,
                                       bool filter_node_only) {
+  ESP_LOGD(TAG, "http2_post_json called: path=%s, payload_size=%zu", path.c_str(), payload.size());
+
   if (!this->http2_session_) {
-    ESP_LOGW(TAG, "HTTP/2 session not ready");
+    ESP_LOGW(TAG, "HTTP/2 session not ready (null pointer)");
     return false;
   }
+
+  if (!this->upgrade_) {
+    ESP_LOGW(TAG, "Upgrade connection not ready (null pointer)");
+    return false;
+  }
+
+  ESP_LOGD(TAG, "HTTP/2 session valid, next_stream_id=%u", this->next_stream_id_);
+
   uint32_t stream_id = this->next_stream_id_;
   this->next_stream_id_ += 2;
+
+  // Track persistent stream for keepalive reception
+  if (!close_stream) {
+    this->persistent_stream_id_ = stream_id;
+    ESP_LOGI(TAG, "Persistent stream established: stream_id=%u", stream_id);
+  }
+
+  ESP_LOGD(TAG, "Using stream_id=%u for request to %s", stream_id, path.c_str());
+
   if (!this->http2_session_->process_control_frames(timeout_ms)) {
     ESP_LOGD(TAG, "No pending control frames processed before request");
   }
+
+  ESP_LOGD(TAG, "Calling http2_session_->post_json() with stream_id=%u", stream_id);
+
   if (!this->http2_session_->post_json(stream_id, scheme, authority, path, payload, response_ptr, response_size,
                                        status_code, timeout_ms, close_stream, filter_node_only)) {
-    ESP_LOGE(TAG, "HTTP/2 POST failed for %s", path.c_str());
+    ESP_LOGE(TAG, "HTTP/2 POST failed for %s (stream_id=%u)", path.c_str(), stream_id);
 
     // DO NOT reset HTTP/2 session for stream desync errors
     // Stream desync happens when multiple streams are active (e.g., streaming map + keepalive)
@@ -469,6 +491,22 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
     return false;
   }
   return true;
+}
+
+bool Ts2021Transport::http2_read_next_message(const char *&response_ptr, size_t &response_size, uint32_t timeout_ms) {
+  if (!this->http2_session_) {
+    ESP_LOGW(TAG, "HTTP/2 session not ready");
+    return false;
+  }
+
+  if (this->persistent_stream_id_ == 0) {
+    ESP_LOGW(TAG, "No persistent stream established");
+    return false;
+  }
+
+  ESP_LOGD(TAG, "Reading next message from persistent stream %u", this->persistent_stream_id_);
+
+  return this->http2_session_->read_next_message(this->persistent_stream_id_, response_ptr, response_size, timeout_ms);
 }
 
 }  // namespace tailscale

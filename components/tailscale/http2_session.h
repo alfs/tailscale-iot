@@ -23,6 +23,11 @@ class Http2Session {
                  size_t &response_size, uint16_t &status_code, uint32_t timeout_ms, bool close_stream = true,
                  bool filter_node_only = false);
 
+  // Read next message from an already-open streaming connection
+  // Used to receive server keepalives on persistent map stream
+  // Returns true if message received, false on timeout or error
+  bool read_next_message(uint32_t stream_id, const char *&response_ptr, size_t &response_size, uint32_t timeout_ms);
+
  private:
   struct Frame {
     uint32_t length{0};

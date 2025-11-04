@@ -45,6 +45,9 @@ class Ts2021Transport {
                        uint16_t &status_code, uint32_t timeout_ms = 5000, bool close_stream = true,
                        bool filter_node_only = false);
 
+  // Read next message from persistent streaming connection (for server keepalives)
+  bool http2_read_next_message(const char *&response_ptr, size_t &response_size, uint32_t timeout_ms);
+
   bool handshake_complete() const { return this->stage_ == Stage::kTransportReady; }
   bool failed() const { return this->stage_ == Stage::kFailed; }
 
@@ -61,6 +64,7 @@ class Ts2021Transport {
   Ts2021Upgrade *upgrade_{nullptr};
   std::unique_ptr<Http2Session> http2_session_;
   uint32_t next_stream_id_{1};
+  uint32_t persistent_stream_id_{0};  // Track persistent map stream for receiving keepalives
   uint64_t tx_count_{0};
   uint64_t rx_count_{0};
 };

@@ -170,14 +170,17 @@ class TailscaleComponent : public PollingComponent {
   uint32_t last_update_time_{0};
   uint32_t last_keepalive_time_{0};
   uint32_t last_control_plane_connect_time_{0};  // Track when control plane was established
+  uint32_t last_server_message_time_{0};  // Track when we last received a message from server (for watchdog)
   uint32_t retry_count_{0};
   static const uint32_t MAX_RETRIES = 5;
   static const uint32_t RETRY_DELAY_MS = 5000;
   static const uint32_t KEEPALIVE_INTERVAL_MS = 60000;  // Send keepalive every 60 seconds
   static const uint32_t CONTROL_PLANE_RECONNECT_INTERVAL_MS = 2000;  // Reconnect every ~2-4s (with 2s update_interval) to stay within Headscale's 10-second grace period
+  static const uint32_t SERVER_KEEPALIVE_WATCHDOG_MS = 120000;  // Expect server message within 120 seconds (official client timeout)
 
   // Keepalive
   bool send_map_keepalive_();  // Send periodic keepalive map request with endpoints
+  bool check_server_keepalive_();  // Check for incoming server keepalive messages
 };
 
 }  // namespace tailscale

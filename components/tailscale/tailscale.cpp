@@ -425,8 +425,17 @@ void TailscaleComponent::handle_connected_state_() {
     this->setup_echo_server_();
   }
 
-  // Send periodic keepalives with endpoint updates every 60 seconds
-  // This tells Headscale our current endpoint so peers can reach us
+  // === PERSISTENT STREAMING CONNECTION MANAGEMENT ===
+  // The official Tailscale protocol uses a persistent HTTP/2 stream where:
+  // 1. Server sends keepalives TO client every ~50 seconds
+  // 2. Client receives these keepalives to stay "online"
+  // 3. Client sends endpoint updates on SEPARATE short-lived streams
+
+  // Check for incoming server keepalive messages (non-blocking)
+  this->check_server_keepalive_();
+
+  // Send periodic endpoint updates every 60 seconds
+  // These are sent on NEW HTTP/2 streams, not on the persistent receiving stream
   static uint32_t last_keepalive_send_time = 0;
   uint32_t current_time = millis();
   const uint32_t KEEPALIVE_SEND_INTERVAL_MS = 60000;  // 60 seconds
@@ -438,7 +447,21 @@ void TailscaleComponent::handle_connected_state_() {
       last_keepalive_send_time = current_time;
     } else {
       ESP_LOGW(TAG, "Failed to send keepalive - will retry in %d seconds", KEEPALIVE_SEND_INTERVAL_MS / 1000);
-      // Don't update last_keepalive_send_time so we retry sooner
+
+      // CRITICAL: Update timer to prevent immediate retry storm
+      // Without this, with update_interval=2s, keepalive retries every 2 seconds → crash after ~6 attempts
+      last_keepalive_send_time = current_time;
+
+      // Force reconnection on next attempt by resetting transport
+      // Keepalive failure likely means underlying connection is dead/stale
+      ESP_LOGI(TAG, "→ Forcing control plane reconnection for next keepalive attempt");
+      if (this->ts2021_transport_) {
+        this->ts2021_transport_->reset();
+      }
+      if (this->upgrade_channel_) {
+        this->upgrade_channel_->close();
+        this->upgrade_channel_.reset();
+      }
     }
   }
 
@@ -1694,6 +1717,11 @@ bool TailscaleComponent::fetch_map_response_() {
 
   ESP_LOGD(TAG, "Converted %d static peers to NodeConfig", this->node_config_.peers.size());
 
+  // Initialize watchdog timer - we just received a message from the server
+  this->last_server_message_time_ = millis();
+  ESP_LOGI(TAG, "✅ Persistent streaming connection established - watchdog timer started");
+  ESP_LOGI(TAG, "   Server will send keepalives every ~50 seconds, we expect messages within 120 seconds");
+
   return true;
 }
 
@@ -2698,39 +2726,28 @@ bool TailscaleComponent::perform_stun_query_() {
 
 // Send periodic keepalive map request with updated endpoints
 bool TailscaleComponent::send_map_keepalive_() {
-  ESP_LOGD(TAG, "→ Sending keepalive map request...");
+  ESP_LOGD(TAG, "→ Sending endpoint update on separate stream...");
 
-  // Check if control plane needs to be reconnected
-  // After initial MAP fetch, we close the control plane to free ~70KB for DERP connections
-  // For keepalives and endpoint updates, we need to temporarily reconnect
+  // With persistent connection model, transport should ALWAYS be ready
+  // If it's not, the watchdog will trigger reconnection
   bool transport_ready = this->ts2021_transport_ && this->ts2021_transport_->handshake_complete();
 
   if (!transport_ready) {
-    ESP_LOGI(TAG, "→ Control plane closed - reconnecting for keepalive...");
-
-    // Recreate upgrade channel if it was closed
-    if (!this->upgrade_channel_) {
-      this->upgrade_channel_ = std::make_unique<Ts2021Upgrade>();
-      ESP_LOGD(TAG, "Created new upgrade channel");
-    }
-
-    // Ensure TS2021 transport is ready (will reconnect if needed)
-    if (!this->ensure_ts2021_ready_()) {
-      ESP_LOGE(TAG, "Failed to reconnect control plane for keepalive");
-      return false;
-    }
-
-    ESP_LOGI(TAG, "   ✓ Control plane reconnected");
-  }
-
-  if (!this->upgrade_channel_) {
-    ESP_LOGE(TAG, "No upgrade channel available for keepalive");
+    ESP_LOGE(TAG, "❌ Control plane not ready for endpoint update!");
+    ESP_LOGE(TAG, "   This indicates the persistent connection was lost.");
+    ESP_LOGE(TAG, "   The watchdog should have triggered reconnection.");
     return false;
   }
 
-  // Ensure HTTP/2 session is ready - restart it if necessary
+  if (!this->upgrade_channel_) {
+    ESP_LOGE(TAG, "No upgrade channel available for endpoint update");
+    return false;
+  }
+
+  // HTTP/2 session should already be initialized from initial connection
+  // Don't restart it, as that would disrupt the persistent receiving stream
   if (!this->ts2021_transport_->start_http2_session()) {
-    ESP_LOGW(TAG, "Failed to start HTTP/2 session for keepalive");
+    ESP_LOGW(TAG, "Failed to initialize HTTP/2 session for endpoint update");
     return false;
   }
 
@@ -2850,6 +2867,65 @@ bool TailscaleComponent::send_map_keepalive_() {
   // }
 
   return true;
+}
+
+// Check for incoming server keepalive messages on persistent streaming connection
+// Server sends {"KeepAlive":true} every ~50 seconds to keep connection alive
+// Watchdog timer: reconnect if no message received within 120 seconds
+bool TailscaleComponent::check_server_keepalive_() {
+  if (!this->ts2021_transport_ || !this->ts2021_transport_->handshake_complete()) {
+    ESP_LOGD(TAG, "Transport not ready for receiving keepalives");
+    return false;
+  }
+
+  // Check if watchdog expired (no message from server in 120 seconds)
+  uint32_t current_time = millis();
+  if (this->last_server_message_time_ > 0) {
+    uint32_t time_since_last_message = current_time - this->last_server_message_time_;
+    if (time_since_last_message > SERVER_KEEPALIVE_WATCHDOG_MS) {
+      ESP_LOGW(TAG, "⚠️  Watchdog expired: no server message for %u seconds", time_since_last_message / 1000);
+      ESP_LOGW(TAG, "→ Forcing control plane reconnection");
+
+      // Reset transport to force reconnection
+      this->ts2021_transport_->reset();
+      if (this->upgrade_channel_) {
+        this->upgrade_channel_->close();
+        this->upgrade_channel_.reset();
+      }
+      this->last_server_message_time_ = 0;
+      return false;
+    }
+  }
+
+  // Try to read next message from persistent stream (non-blocking: 1 second timeout)
+  const char *response_ptr = nullptr;
+  size_t response_size = 0;
+
+  if (this->ts2021_transport_->http2_read_next_message(response_ptr, response_size, 1000)) {
+    // Received a message from server!
+    this->last_server_message_time_ = current_time;
+
+    ESP_LOGI(TAG, "✅ Received server message: %zu bytes", response_size);
+
+    // Log the message content for debugging
+    if (response_ptr && response_size > 0) {
+      std::string message(response_ptr, std::min(response_size, (size_t)200));
+      ESP_LOGI(TAG, "   Message: %s", message.c_str());
+
+      // Check if it's a keepalive message
+      if (message.find("\"KeepAlive\":true") != std::string::npos) {
+        ESP_LOGI(TAG, "   📡 Server keepalive received (connection alive)");
+      } else {
+        ESP_LOGI(TAG, "   📥 Server sent data update (may contain new peer info)");
+        // TODO: Parse and process server updates (peer changes, network map updates, etc.)
+      }
+    }
+
+    return true;
+  }
+
+  // No message available (timeout) - this is normal, server sends keepalives every ~50s
+  return false;
 }
 
 // DEPRECATED: This function sends a minimal endpoint update which doesn't work properly

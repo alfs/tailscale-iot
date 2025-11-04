@@ -221,9 +221,10 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   // Build DATA frame
   Frame data;
   data.type = kFrameTypeData;
-  // Only set END_STREAM if close_stream is true (for simple request-response)
-  // For streaming requests (like Tailscale map with Stream:true), we keep the stream open
-  data.flags = close_stream ? kFlagEndStream : 0;
+  // ALWAYS set END_STREAM on request DATA frame - client signals it's done sending
+  // This is required by HTTP/2 spec for POST requests - server won't process until it receives this
+  // The close_stream parameter controls whether we keep READING the response stream (for long-poll)
+  data.flags = kFlagEndStream;
   data.stream_id = stream_id;
   data.payload = std::vector<uint8_t>(payload.begin(), payload.end());
   data.length = data.payload.size();
@@ -456,10 +457,22 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         } else {
           // In full response mode, check if complete JSON has been detected
           if (this->json_complete_) {
-            ESP_LOGI(TAG, "✅ Full JSON response completed without END_STREAM (%zu bytes)",
-                     this->filtered_json_size_);
-            stream_open = false;
-            break;
+            if (close_stream) {
+              // Simple request-response: close after first complete JSON
+              ESP_LOGI(TAG, "✅ Full JSON response completed (%zu bytes) - closing stream",
+                       this->filtered_json_size_);
+              stream_open = false;
+              break;
+            } else {
+              // Long-polling mode: keep stream open for keepalive messages
+              ESP_LOGI(TAG, "✅ Received initial MapResponse (%zu bytes) - keeping stream open for server keepalives",
+                       this->filtered_json_size_);
+              // Return first response to caller, stream stays open for receiving server keepalives
+              // Caller should use read_next_message() to receive subsequent keepalives
+              response_ptr = this->filtered_json_buffer_;
+              response_size = this->filtered_json_size_;
+              return true;  // Success, but stream remains open
+            }
           }
         }
 
@@ -938,6 +951,151 @@ int16_t Http2Session::decode_status_header_(const std::vector<uint8_t> &block) {
     break;
   }
   return -1;
+}
+
+bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_ptr, size_t &response_size,
+                                     uint32_t timeout_ms) {
+  ESP_LOGD(TAG, "=== Reading next message from stream %u ===", stream_id);
+
+  // Reset JSON parsing state for new message
+  this->json_parser_.reset();
+  this->parsing_json_ = false;
+  this->json_complete_ = false;
+  this->filtered_json_size_ = 0;
+  this->json_bytes_processed_ = 0;
+  memset(this->filtered_json_buffer_, 0, sizeof(this->filtered_json_buffer_));
+
+  // We're reading full responses (server keepalives are small JSON messages)
+  this->filter_node_only_ = false;
+
+  uint32_t start_time = millis();
+  bool stream_open = true;
+
+  while (stream_open) {
+    // Check timeout
+    if (millis() - start_time > timeout_ms) {
+      ESP_LOGD(TAG, "Timeout waiting for message on stream %u", stream_id);
+      return false;
+    }
+
+    App.feed_wdt();  // Reset watchdog
+
+    Frame frame;
+    if (!this->read_frame_(frame, 1000)) {  // 1s timeout per frame
+      continue;  // Keep trying until overall timeout
+    }
+
+    ESP_LOGD(TAG, "Frame: type=%d, flags=0x%02x, stream_id=%u, length=%u",
+             frame.type, frame.flags, frame.stream_id, frame.length);
+
+    // Ignore frames not for our stream
+    if (frame.stream_id != stream_id && frame.stream_id != 0) {
+      ESP_LOGD(TAG, "Frame for different stream %u, ignoring", frame.stream_id);
+      continue;
+    }
+
+    switch (frame.type) {
+      case kFrameTypeHeaders: {
+        // Just acknowledge headers, don't close stream
+        ESP_LOGD(TAG, "Received HEADERS on stream %u", stream_id);
+        break;
+      }
+
+      case kFrameTypeData: {
+        size_t payload_size = frame.length;
+        const char *payload_ptr = reinterpret_cast<const char *>(this->recv_buffer_.data() + 9);
+
+        ESP_LOGD(TAG, "DATA frame: %zu bytes", payload_size);
+
+        // Handle Tailscale wire format: 4-byte length prefix + JSON
+        const char *json_data = payload_ptr;
+        size_t json_length = payload_size;
+
+        if (this->json_bytes_processed_ == 0 && payload_size >= 5) {
+          // Check for wire format
+          if (payload_ptr[0] != '{' && payload_ptr[4] == '{') {
+            ESP_LOGD(TAG, "Detected wire format, skipping 4-byte prefix");
+            json_data = payload_ptr + 4;
+            json_length = payload_size - 4;
+            this->parsing_json_ = true;
+          }
+        }
+
+        // Enable parsing even without wire format
+        if (!this->parsing_json_ && this->json_bytes_processed_ == 0) {
+          this->parsing_json_ = true;
+        }
+
+        // Buffer the JSON
+        if (this->parsing_json_) {
+          size_t space_left = kFilteredBufferSize - this->filtered_json_size_ - 1;
+          size_t bytes_to_copy = (json_length < space_left) ? json_length : space_left;
+
+          if (bytes_to_copy > 0) {
+            memcpy(this->filtered_json_buffer_ + this->filtered_json_size_, json_data, bytes_to_copy);
+            this->filtered_json_size_ += bytes_to_copy;
+            this->filtered_json_buffer_[this->filtered_json_size_] = '\0';
+
+            // Check for complete JSON
+            if (!this->json_complete_ &&
+                this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
+              this->json_complete_ = true;
+              ESP_LOGI(TAG, "✅ Received complete message: %zu bytes", this->filtered_json_size_);
+
+              // Return the message but keep stream open
+              response_ptr = this->filtered_json_buffer_;
+              response_size = this->filtered_json_size_;
+
+              // Clean up recv_buffer
+              size_t total = 9 + payload_size;
+              this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
+              this->recv_buffer_.shrink_to_fit();
+
+              return true;  // Success, stream remains open
+            }
+          }
+
+          this->json_bytes_processed_ += json_length;
+        }
+
+        // Clean up recv_buffer
+        size_t total = 9 + payload_size;
+        this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
+        this->recv_buffer_.shrink_to_fit();
+
+        // Check for END_STREAM flag
+        if ((frame.flags & kFlagEndStream) != 0) {
+          ESP_LOGD(TAG, "Stream %u closed by server", stream_id);
+          return false;  // Stream closed
+        }
+
+        break;
+      }
+
+      case kFrameTypeSettings: {
+        if (!this->handle_settings_(frame)) {
+          return false;
+        }
+        if ((frame.flags & kFlagAck) == 0) {
+          if (!this->send_settings_ack_()) {
+            return false;
+          }
+        }
+        break;
+      }
+
+      case kFrameTypeGoAway: {
+        ESP_LOGW(TAG, "Received GOAWAY on stream %u", stream_id);
+        return false;
+      }
+
+      default:
+        ESP_LOGD(TAG, "Ignoring frame type %d", frame.type);
+        break;
+    }
+  }
+
+  return false;
 }
 
 }  // namespace tailscale
