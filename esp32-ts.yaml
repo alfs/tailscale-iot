@@ -12,8 +12,30 @@ esp32:
       # This allows longer network operations during TS2021 handshake
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
       # Enable certificate bundle for TLS verification
+      # Use custom bundle with only Let's Encrypt certificates instead of full bundle
+      # This saves ~145KB flash and reduces RAM usage during TLS verification
       CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: y
-      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL: y
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL: n
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CUSTOM: y
+      CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH: "certs"
+
+      # mbedTLS Memory Optimizations (saves ~48KB total)
+      # Reduce TLS buffer size from 16KB to 4KB per buffer (saves 24KB)
+      # Most Tailscale control messages are <4KB, so this is sufficient
+      CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN: "4096"
+
+      # Enable dynamic buffer allocation (saves ~20KB)
+      # Buffers are allocated only when needed and freed after use
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT: y
+
+      # Disable peer certificate retention (saves 3.6KB)
+      # We don't need to inspect the peer certificate after validation
+      CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE: n
+
+      # Enable variable-length buffers (saves 1KB)
+      CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH: y
 
 # WiFi configuration
 wifi:
@@ -43,17 +65,18 @@ tailscale:
   device_name: "esp"
   time_id: sntp_time
   wireguard_id: wg_iface
-  update_interval: 5s
+  update_interval: 2s  # Reduced from 5s to 2s for faster reconnection checks
   allowed_peers: !secret allowed_peers
   preferred_derp: 28  # DERP region 28 (Helsinki)
 
 wireguard:
   id: wg_iface
   time_id: sntp_time
-  address: 100.64.0.254
+  address: 100.64.0.25  # Must match address assigned by Tailscale control plane
   private_key: !secret wg_template_private_key
   peer_public_key: !secret wg_template_peer_public_key
-  peer_endpoint: "0.0.0.0"
+  peer_endpoint: "192.168.0.172" # testing
+  peer_port: 41641
   peer_allowed_ips:
     - "100.64.0.0/10"
 
