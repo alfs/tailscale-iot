@@ -702,7 +702,8 @@ bool Http2Session::pull_bytes_(uint32_t timeout_ms) {
   // Safety limit: prevent buffer from growing too large and causing OOM
   // HTTP/2 requires 16KB max frame size, so buffer must be at least 16KB + header
   // With 8KB read chunks from transport layer, fragmentation is reduced
-  static constexpr size_t kMaxRecvBufferSize = 20 * 1024;  // 20KB max (16KB frame + overhead)
+  // Increased to 40KB to handle large map responses with 23+ peers
+  static constexpr size_t kMaxRecvBufferSize = 40 * 1024;  // 40KB max (handles large peer lists)
 
   if (this->recv_buffer_.size() > kMaxRecvBufferSize) {
     ESP_LOGE(TAG, "recv_buffer_ too large (%zu bytes), aborting to prevent OOM",
@@ -991,6 +992,16 @@ bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_p
     // Ignore frames not for our stream
     if (frame.stream_id != stream_id && frame.stream_id != 0) {
       ESP_LOGD(TAG, "Frame for different stream %u, ignoring", frame.stream_id);
+      // CRITICAL: For DATA frames, we must erase the payload from recv_buffer_
+      // read_frame_() leaves DATA payloads in buffer for caller to handle
+      if (frame.type == kFrameTypeData) {
+        size_t total = 9 + frame.length;  // 9-byte header + payload
+        if (this->recv_buffer_.size() >= total) {
+          this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
+          this->recv_buffer_.shrink_to_fit();
+          ESP_LOGD(TAG, "Erased unwanted DATA frame (%zu bytes) from buffer", total);
+        }
+      }
       continue;
     }
 

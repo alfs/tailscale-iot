@@ -3247,13 +3247,58 @@ bool TailscaleComponent::send_map_keepalive_() {
 // Server sends {"KeepAlive":true} every ~50 seconds to keep connection alive
 // Watchdog timer: reconnect if no message received within 120 seconds
 bool TailscaleComponent::check_server_keepalive_() {
+  uint32_t current_time = millis();
+
   if (!this->ts2021_transport_ || !this->ts2021_transport_->handshake_complete()) {
-    ESP_LOGD(TAG, "Transport not ready for receiving keepalives");
+    // Transport not ready - implement watchdog to trigger reconnection if this persists
+    static uint32_t transport_not_ready_since = 0;
+    static uint32_t last_log_time = 0;
+
+    if (transport_not_ready_since == 0) {
+      transport_not_ready_since = current_time;
+      ESP_LOGW(TAG, "⚠️  Transport not ready for receiving keepalives - starting watchdog");
+    }
+
+    // Log only once per minute to avoid spam
+    if (current_time - last_log_time >= 60000) {
+      ESP_LOGD(TAG, "Transport still not ready (%u seconds elapsed)",
+               (current_time - transport_not_ready_since) / 1000);
+      last_log_time = current_time;
+    }
+
+    // Watchdog: if transport isn't ready for 30 seconds, force reconnection
+    if (current_time - transport_not_ready_since >= 30000) {
+      ESP_LOGE(TAG, "❌ Transport watchdog expired: not ready for 30 seconds");
+      ESP_LOGE(TAG, "→ Forcing full reconnection by transitioning to REGISTERING");
+
+      // Reset state
+      transport_not_ready_since = 0;
+      last_log_time = 0;
+      this->last_server_message_time_ = 0;
+
+      // Reset transport objects
+      if (this->ts2021_transport_) {
+        this->ts2021_transport_->reset();
+      }
+      if (this->upgrade_channel_) {
+        this->upgrade_channel_->close();
+        this->upgrade_channel_.reset();
+      }
+
+      // Transition back to REGISTERING to re-establish connection
+      this->transition_to(TailscaleState::REGISTERING);
+    }
+
     return false;
   }
 
+  // Transport is ready - reset watchdog timers
+  static uint32_t transport_not_ready_since = 0;
+  static uint32_t last_log_time = 0;
+  transport_not_ready_since = 0;
+  last_log_time = 0;
+
   // Check if watchdog expired (no message from server in 120 seconds)
-  uint32_t current_time = millis();
   if (this->last_server_message_time_ > 0) {
     uint32_t time_since_last_message = current_time - this->last_server_message_time_;
     if (time_since_last_message > SERVER_KEEPALIVE_WATCHDOG_MS) {
