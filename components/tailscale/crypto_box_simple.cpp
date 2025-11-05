@@ -105,24 +105,40 @@ int crypto_box_easy_simple(
         return -1;
     }
 
-    // Step 2: Encrypt using XSalsa20 stream cipher (our custom implementation)
-    // XSalsa20 = HSalsa20(key, nonce[0:16]) + Salsa20(subkey, nonce[16:24])
-    // This matches the official Tailscale disco protocol
-    crypto_stream_xsalsa20_xor_impl(c + 16,  // Output: ciphertext (after MAC space)
-                                    m,       // Input: plaintext
-                                    mlen,    // Message length
-                                    n,       // 24-byte nonce
-                                    shared_secret);  // 32-byte key
+    // Step 2: Derive Poly1305 key from XSalsa20 keystream (NaCl spec requirement)
+    // The Poly1305 key MUST be the first 32 bytes of the XSalsa20 keystream
+    // This is critical for compatibility with standard NaCl crypto_box
+    unsigned char poly1305_key[32];
+    unsigned char zero[32] = {0};  // Zero message to get keystream
+    crypto_stream_xsalsa20_xor_impl(poly1305_key, zero, 32, n, shared_secret);
 
-    // Step 3: Compute Poly1305 MAC over ciphertext
-    // crypto_onetimeauth_poly1305 creates 16-byte MAC
+    // Step 3: Encrypt message using XSalsa20 keystream starting at byte 32
+    // We need to generate keystream with a modified counter to skip first 32 bytes
+    // For XSalsa20, we use Salsa20 with counter starting at 1 (not 0)
+    // Since we already used bytes 0-31 for Poly1305 key, start at byte 32
+    unsigned char subkey[32];
+    hsalsa20(subkey, n, shared_secret, zero);
+
+    // Generate keystream directly (not XOR with zeros - that was causing buffer overrun!)
+    unsigned char keystream[mlen + 32];
+    crypto_stream_salsa20(keystream, mlen + 32, n + 16, subkey);
+
+    // XOR message with keystream starting at byte 32
+    for (unsigned long long i = 0; i < mlen; i++) {
+        c[16 + i] = m[i] ^ keystream[32 + i];
+    }
+
+    // Step 4: Compute Poly1305 MAC over ciphertext using derived key
     crypto_onetimeauth_poly1305(c,           // Output: MAC (first 16 bytes)
                                 c + 16,      // Input: ciphertext to authenticate
                                 mlen,        // Ciphertext length
-                                shared_secret);  // 32-byte key
+                                poly1305_key);  // Derived Poly1305 key
 
     // Clear sensitive data
     sodium_memzero(shared_secret, sizeof(shared_secret));
+    sodium_memzero(poly1305_key, sizeof(poly1305_key));
+    sodium_memzero(subkey, sizeof(subkey));
+    sodium_memzero(keystream, sizeof(keystream));
 
     return 0;
 }
@@ -147,27 +163,43 @@ int crypto_box_open_easy_simple(
         return -1;
     }
 
-    // Step 2: Verify Poly1305 MAC
+    // Step 2: Derive Poly1305 key from XSalsa20 keystream (same as encryption)
+    // The Poly1305 key MUST be the first 32 bytes of the XSalsa20 keystream
+    unsigned char poly1305_key[32];
+    unsigned char zero[32] = {0};  // Zero message to get keystream
+    crypto_stream_xsalsa20_xor_impl(poly1305_key, zero, 32, n, shared_secret);
+
+    // Step 3: Verify Poly1305 MAC using derived key
     // MAC is in first 16 bytes, ciphertext starts at byte 16
     unsigned long long mlen = clen - 16;
     if (crypto_onetimeauth_poly1305_verify(c,           // MAC to verify (first 16 bytes)
                                            c + 16,      // Ciphertext to authenticate
                                            mlen,        // Ciphertext length
-                                           shared_secret) != 0) {
+                                           poly1305_key) != 0) {
         // MAC verification failed - message is corrupted or tampered
         sodium_memzero(shared_secret, sizeof(shared_secret));
+        sodium_memzero(poly1305_key, sizeof(poly1305_key));
         return -1;
     }
 
-    // Step 3: Decrypt using XSalsa20 stream cipher (must match encryption)
-    crypto_stream_xsalsa20_xor_impl(m,           // Output: plaintext
-                                    c + 16,      // Input: ciphertext (after MAC)
-                                    mlen,        // Message length
-                                    n,           // 24-byte nonce
-                                    shared_secret);  // 32-byte key
+    // Step 4: Decrypt using XSalsa20 keystream starting at byte 32
+    unsigned char subkey[32];
+    hsalsa20(subkey, n, shared_secret, zero);
+
+    // Generate keystream directly (not XOR with zeros - that was causing buffer overrun!)
+    unsigned char keystream[mlen + 32];
+    crypto_stream_salsa20(keystream, mlen + 32, n + 16, subkey);
+
+    // XOR ciphertext with keystream starting at byte 32
+    for (unsigned long long i = 0; i < mlen; i++) {
+        m[i] = c[16 + i] ^ keystream[32 + i];
+    }
 
     // Clear sensitive data
     sodium_memzero(shared_secret, sizeof(shared_secret));
+    sodium_memzero(poly1305_key, sizeof(poly1305_key));
+    sodium_memzero(subkey, sizeof(subkey));
+    sodium_memzero(keystream, sizeof(keystream));
 
     return 0;
 }

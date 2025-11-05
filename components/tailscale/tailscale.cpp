@@ -148,6 +148,12 @@ void TailscaleComponent::setup() {
 }
 
 void TailscaleComponent::loop() {
+  // CRITICAL: Check unified socket on EVERY loop iteration for low-latency packet reception
+  // This was moved here from handle_connected_state_() to restore frequent polling
+  // like the working commit (6dbe871) had with dedicated disco_socket checking.
+  // Without this, recvfrom() was only called once every ~5 seconds, missing all packets.
+  this->check_unified_socket_();
+
   // State machine processing
   switch (this->state_) {
     case TailscaleState::IDLE:
@@ -387,9 +393,8 @@ void TailscaleComponent::handle_configuring_wireguard_state_() {
   if (this->configure_wireguard_()) {
     ESP_LOGI(TAG, "✓ WireGuard configured");
 
-    // Unified socket should already be set up from FETCHING_MAP state
-    // But ensure it's ready for disco pings
-    this->setup_unified_socket_();
+    // Unified socket is already set up from FETCHING_MAP state
+    // No need to call setup_unified_socket_() again - it's idempotent
 
     // Send Disco pings to discovered peer endpoints from map response
     // This enables NAT hole punching for remote connectivity
@@ -549,40 +554,52 @@ void TailscaleComponent::handle_connected_state_() {
     // this->process_udp_relay_();  // DEPRECATED - handled by unified socket
   }
 
-  // Check for incoming packets on unified socket (Disco, STUN, WireGuard)
-  // This replaces the old check_disco_responses_() which only checked disco socket
-  if (this->unified_socket_ >= 0) {
-    uint8_t buffer[2048];  // Large enough for WireGuard packets
-    struct sockaddr_in sender_addr{};
-    socklen_t sender_len = sizeof(sender_addr);
+  // NOTE: Socket checking moved to check_unified_socket_() which is called from loop()
+  // This ensures frequent polling (thousands of times per second) instead of only during
+  // this state handler. See tailscale.cpp:2337 for the implementation.
 
-    ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                                 (struct sockaddr *)&sender_addr, &sender_len);
+  // NAT-PMP: Request port mapping ONCE at startup (before TTL discovery)
+  // This is simpler and faster than TTL-based discovery
+  static bool natpmp_requested = false;
+  static uint32_t natpmp_request_time = 0;
+  static bool natpmp_success = false;
 
-    if (received > 0) {
-      // Log every received UDP datagram for debugging
-      char src_ip[INET_ADDRSTRLEN];
-      inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
-      uint16_t src_port = ntohs(sender_addr.sin_port);
+  if (!natpmp_requested && this->unified_socket_ >= 0) {
+    // Request NAT-PMP mapping (sends UDP packet to gateway)
+    if (this->perform_natpmp_mapping_()) {
+      natpmp_requested = true;
+      natpmp_request_time = millis();
+      ESP_LOGI(TAG, "→ NAT-PMP request sent, waiting for response...");
+    }
+  }
 
-      ESP_LOGI(TAG, "📨 UDP RX: %zd bytes from %s:%u (first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x)",
-               received, src_ip, src_port,
-               buffer[0], buffer[1], buffer[2], buffer[3],
-               buffer[4], buffer[5], buffer[6], buffer[7]);
-
-      // Route packet to appropriate handler based on magic bytes
-      this->route_incoming_packet_(buffer, received, &sender_addr);
-    } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-      ESP_LOGW(TAG, "⚠️ Unified socket recvfrom error: errno %d (%s)", errno, strerror(errno));
+  // Check for NAT-PMP response (wait up to 5 seconds after request)
+  if (natpmp_requested && !natpmp_success && (millis() - natpmp_request_time < 5000)) {
+    if (this->check_natpmp_response_()) {
+      natpmp_success = true;
+      ESP_LOGI(TAG, "✅ NAT-PMP port mapping established - TTL discovery not needed");
     }
   }
 
   // Check for incoming ICMP messages (TTL-based NAT port discovery)
-  this->check_icmp_responses_();
+  // Only needed if NAT-PMP fails or times out
+  if (natpmp_requested && (natpmp_success || (millis() - natpmp_request_time >= 5000))) {
+    this->check_icmp_responses_();
+  }
+
+  // Log socket status periodically (every 30 seconds)
+  // UDP statistics are now logged in check_unified_socket_()
+  static uint32_t last_socket_status_log = 0;
+  uint32_t now = millis();
+  if (now - last_socket_status_log >= 30000) {
+    ESP_LOGI(TAG, "🔍 Socket status: unified_socket=%d (port %u), disco_socket=%d, icmp_socket=%d",
+             this->unified_socket_, this->unified_port_, this->disco_socket_, this->icmp_socket_);
+    last_socket_status_log = now;
+  }
 
   // Send TTL probes for active NAT discovery
   if (this->nat_discovery_state_.active) {
-    uint32_t now = millis();
+    now = millis();  // Reuse existing 'now' variable from above
     // Send probe every 200ms to avoid overwhelming network
     if (now - this->nat_discovery_state_.last_probe_time >= 200) {
       // Prepare destination address
@@ -617,7 +634,7 @@ void TailscaleComponent::handle_connected_state_() {
   // Send periodic disco pings to maintain peer connectivity (every 10 seconds)
   static uint32_t last_disco_ping_time = 0;
   static uint32_t last_nat_discovery_time = 0;
-  uint32_t now = millis();
+  // Reuse 'now' from earlier in function (declared at line 614)
   if (now - last_disco_ping_time >= 10000) {  // 10 second interval
     ESP_LOGD(TAG, "→ Sending periodic disco ping to peers...");
 
@@ -2171,6 +2188,18 @@ void TailscaleComponent::setup_unified_socket_() {
   int flags = fcntl(this->unified_socket_, F_GETFL, 0);
   fcntl(this->unified_socket_, F_SETFL, flags | O_NONBLOCK);
 
+  // ESP32/LWIP socket options - critical for receiving UDP packets
+  int opt = 1;
+  if (setsockopt(this->unified_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    ESP_LOGW(TAG, "⚠️ Failed to set SO_REUSEADDR: errno %d", errno);
+  }
+
+  // Increase receive buffer size for ESP32/LWIP
+  int rcvbuf = 8192;  // 8KB receive buffer
+  if (setsockopt(this->unified_socket_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+    ESP_LOGW(TAG, "⚠️ Failed to set SO_RCVBUF: errno %d", errno);
+  }
+
   // Bind to unified port (41641 - standard Tailscale disco port)
   // CRITICAL: On ESP32/LWIP, binding to port 0 causes the send port to differ from receive port!
   // We must bind to a specific port to ensure sendto() uses the same port.
@@ -2198,6 +2227,119 @@ void TailscaleComponent::setup_unified_socket_() {
   } else {
     ESP_LOGW(TAG, "✓ Unified UDP socket ready (couldn't determine port, fd=%d)",
              this->unified_socket_);
+  }
+}
+
+// Check unified socket for incoming packets (called from loop() on every iteration)
+// This was moved out of handle_connected_state_() to enable frequent polling
+void TailscaleComponent::check_unified_socket_() {
+  // Packet counters for statistics (shared across receive and stats logging)
+  static uint32_t total_udp_rx = 0;
+  static uint32_t wireguard_rx = 0;
+  static uint32_t disco_rx = 0;
+  static uint32_t stun_rx = 0;
+  static uint32_t other_rx = 0;
+  static uint32_t last_rx_time = 0;
+
+  // Log UDP statistics periodically (every 30 seconds)
+  static uint32_t last_stats_log = 0;
+  uint32_t now = millis();
+  if (now - last_stats_log >= 30000) {
+    ESP_LOGI(TAG, "📊 UDP RX Statistics: Total=%u, WireGuard=%u, Disco=%u, STUN=%u, Other=%u",
+             total_udp_rx, wireguard_rx, disco_rx, stun_rx, other_rx);
+    if (last_rx_time > 0) {
+      uint32_t time_since_last_rx = now - last_rx_time;
+      ESP_LOGI(TAG, "  UDP Last RX: %u seconds ago", time_since_last_rx / 1000);
+    } else {
+      ESP_LOGI(TAG, "  UDP Last RX: NEVER");
+    }
+    last_stats_log = now;
+  }
+
+  // Validate unified socket before use (prevents EBADF errors after state transitions)
+  if (this->unified_socket_ >= 0) {
+    // Check if socket fd is actually valid in the kernel
+    if (fcntl(this->unified_socket_, F_GETFD) == -1 && errno == EBADF) {
+      ESP_LOGE(TAG, "❌ Socket fd %d is invalid (EBADF) - recreating unified socket", this->unified_socket_);
+      // Close stale fd and recreate socket
+      close(this->unified_socket_);
+      this->unified_socket_ = -1;
+      this->setup_unified_socket_();
+
+      if (this->unified_socket_ < 0) {
+        ESP_LOGE(TAG, "❌ Failed to recreate unified socket");
+      } else {
+        ESP_LOGI(TAG, "✅ Unified socket recreated successfully (fd=%d)", this->unified_socket_);
+      }
+    }
+  }
+
+  // Check for incoming packets on unified socket (Disco, STUN, WireGuard)
+  // This replaces the old check_disco_responses_() which only checked disco socket
+  if (this->unified_socket_ >= 0) {
+    // DEBUG: Log that we're about to call recvfrom
+    static uint32_t recvfrom_call_count = 0;
+    static uint32_t last_debug_log = 0;
+    recvfrom_call_count++;
+    if (millis() - last_debug_log >= 30000) {
+      ESP_LOGI(TAG, "🔍 recvfrom() called %u times (socket fd=%d, port=%u)",
+               recvfrom_call_count, this->unified_socket_, this->unified_port_);
+      last_debug_log = millis();
+    }
+
+    uint8_t buffer[2048];  // Large enough for WireGuard packets
+    struct sockaddr_in sender_addr{};
+    socklen_t sender_len = sizeof(sender_addr);
+
+    ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
+                                 (struct sockaddr *)&sender_addr, &sender_len);
+
+    if (received > 0) {
+      total_udp_rx++;
+      last_rx_time = millis();
+
+      // Log every received UDP datagram for debugging
+      char src_ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
+      uint16_t src_port = ntohs(sender_addr.sin_port);
+
+      // Identify packet type for counters
+      const char* pkt_type = "UNKNOWN";
+      if (received >= 1) {
+        if (buffer[0] >= 1 && buffer[0] <= 4) {
+          pkt_type = "WireGuard";
+          wireguard_rx++;
+        } else if (received >= 6 && buffer[0] == 'T' && buffer[1] == 'S' &&
+                   buffer[2] == 0xf0 && buffer[3] == 0x9f && buffer[4] == 0x92 && buffer[5] == 0xac) {
+          pkt_type = "Disco";
+          disco_rx++;
+        } else if (received >= 20 && (buffer[0] & 0xC0) == 0x00) {
+          pkt_type = "STUN";
+          stun_rx++;
+        } else {
+          other_rx++;
+        }
+      }
+
+      ESP_LOGI(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
+               total_udp_rx, received, src_ip, src_port, pkt_type,
+               buffer[0], buffer[1], buffer[2], buffer[3],
+               buffer[4], buffer[5], buffer[6], buffer[7]);
+
+      // Route packet to appropriate handler based on magic bytes
+      this->route_incoming_packet_(buffer, received, &sender_addr);
+    } else if (received < 0) {
+      // DEBUG: Log all errno values (including EAGAIN/EWOULDBLOCK) periodically
+      static uint32_t last_errno_log = 0;
+      static int last_logged_errno = 0;
+      if ((errno != EAGAIN && errno != EWOULDBLOCK) ||
+          (millis() - last_errno_log >= 60000 && errno != last_logged_errno)) {
+        ESP_LOGI(TAG, "🔍 recvfrom returned %zd, errno=%d (%s)",
+                 received, errno, strerror(errno));
+        last_errno_log = millis();
+        last_logged_errno = errno;
+      }
+    }
   }
 }
 
@@ -2266,8 +2408,50 @@ void TailscaleComponent::check_icmp_responses_() {
     const uint8_t* icmp_msg = buffer + ip_header_len;
     size_t icmp_len = received - ip_header_len;
 
-    ESP_LOGD(TAG, "📨 ICMP RX: %zd bytes from %s, IP header=%zu bytes, ICMP type=%u code=%u",
-             received, src_ip, ip_header_len, icmp_msg[0], icmp_msg[1]);
+    // ICMP packet statistics (shared with stats logging)
+    static uint32_t icmp_total_rx = 0;
+    static uint32_t icmp_echo_request = 0;  // Type 8 (ping from others)
+    static uint32_t icmp_echo_reply = 0;    // Type 0 (ping responses)
+    static uint32_t icmp_time_exceeded = 0; // Type 11 (TTL discovery)
+    static uint32_t icmp_other = 0;
+    static uint32_t last_icmp_rx_time = 0;
+
+    icmp_total_rx++;
+    last_icmp_rx_time = millis();
+
+    uint8_t icmp_type = icmp_msg[0];
+    uint8_t icmp_code = icmp_msg[1];
+    const char* icmp_type_name = "UNKNOWN";
+
+    // Classify ICMP type
+    if (icmp_type == 0) {
+      icmp_type_name = "Echo Reply";
+      icmp_echo_reply++;
+    } else if (icmp_type == 8) {
+      icmp_type_name = "Echo Request (PING)";
+      icmp_echo_request++;
+    } else if (icmp_type == 11) {
+      icmp_type_name = "Time Exceeded";
+      icmp_time_exceeded++;
+    } else {
+      icmp_other++;
+    }
+
+    // LOG ALL ICMP PACKETS AT INFO LEVEL FOR VISIBILITY
+    ESP_LOGI(TAG, "📨 ICMP RX #%u: %zd bytes from %s, type=%u (%s), code=%u",
+             icmp_total_rx, received, src_ip, icmp_type, icmp_type_name, icmp_code);
+
+    // Periodic ICMP statistics summary (every 30 seconds)
+    static uint32_t last_icmp_stats_log = 0;
+    uint32_t now = millis();
+    if (now - last_icmp_stats_log >= 30000) {
+      ESP_LOGI(TAG, "📊 ICMP RX Statistics: Total=%u, Echo-Req=%u, Echo-Reply=%u, Time-Exceeded=%u, Other=%u",
+               icmp_total_rx, icmp_echo_request, icmp_echo_reply, icmp_time_exceeded, icmp_other);
+      if (last_icmp_rx_time > 0) {
+        ESP_LOGI(TAG, "  ICMP Last RX: %u seconds ago", (now - last_icmp_rx_time) / 1000);
+      }
+      last_icmp_stats_log = now;
+    }
 
     // Parse ICMP Time Exceeded messages (type=11)
     uint16_t nat_port = 0;
@@ -2298,6 +2482,12 @@ void TailscaleComponent::check_icmp_responses_() {
         ESP_LOGI(TAG, "  NAT-assigned port: %u", nat_port);
         ESP_LOGI(TAG, "  Complete endpoint: %s:%u (STUN IP + TTL=1 port)",
                  stun_ip_str.c_str(), nat_port);
+
+        // Store the TTL-discovered endpoint for use in keepalive advertisements
+        char endpoint_str[64];
+        snprintf(endpoint_str, sizeof(endpoint_str), "%s:%u", stun_ip_str.c_str(), nat_port);
+        this->ttl_discovered_endpoint_ = std::string(endpoint_str);
+        ESP_LOGI(TAG, "✅ Stored TTL-discovered endpoint: %s", this->ttl_discovered_endpoint_.c_str());
 
         // Discovery complete! Send disco ping with discovered port knowledge
         this->nat_discovery_state_.discovered_port = nat_port;
@@ -2527,12 +2717,26 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
     return;
   }
 
+  ESP_LOGD(TAG, "  Attempting decrypt: enc_len=%zu, nonce[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+           encrypted_len, nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
+  ESP_LOGD(TAG, "  Sender disco pubkey[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+           sender_disco_pubkey[0], sender_disco_pubkey[1], sender_disco_pubkey[2], sender_disco_pubkey[3],
+           sender_disco_pubkey[4], sender_disco_pubkey[5], sender_disco_pubkey[6], sender_disco_pubkey[7]);
+  ESP_LOGD(TAG, "  Our disco private[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
+           (uint8_t)our_priv_raw[0], (uint8_t)our_priv_raw[1], (uint8_t)our_priv_raw[2], (uint8_t)our_priv_raw[3],
+           (uint8_t)our_priv_raw[4], (uint8_t)our_priv_raw[5], (uint8_t)our_priv_raw[6], (uint8_t)our_priv_raw[7]);
+
   // Decrypt the payload using NaCl box
   uint8_t plaintext[64];  // Should be enough for disco messages
   if (crypto_box_open_easy_simple(plaintext, encrypted_payload, encrypted_len,
                                    nonce, sender_disco_pubkey,
                                    (const uint8_t*)our_priv_raw.data()) != 0) {
     ESP_LOGW(TAG, "  Failed to decrypt disco packet (MAC verification failed)");
+    ESP_LOGD(TAG, "  Encrypted payload[0-15]=%02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+             encrypted_payload[0], encrypted_payload[1], encrypted_payload[2], encrypted_payload[3],
+             encrypted_payload[4], encrypted_payload[5], encrypted_payload[6], encrypted_payload[7],
+             encrypted_payload[8], encrypted_payload[9], encrypted_payload[10], encrypted_payload[11],
+             encrypted_payload[12], encrypted_payload[13], encrypted_payload[14], encrypted_payload[15]);
     return;
   }
 
@@ -2675,8 +2879,20 @@ void TailscaleComponent::handle_wireguard_packet_(uint8_t* buf, size_t len, stru
   inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
   uint16_t src_port = ntohs(src->sin_port);
 
-  ESP_LOGD(TAG, "← Received WireGuard packet (%zu bytes, type=%u) from %s:%u",
-           len, buf[0], src_ip, src_port);
+  // Decode WireGuard message type
+  const char* wg_type = "UNKNOWN";
+  if (len >= 1) {
+    switch (buf[0]) {
+      case 1: wg_type = "Handshake Init"; break;
+      case 2: wg_type = "Handshake Response"; break;
+      case 3: wg_type = "Cookie Reply"; break;
+      case 4: wg_type = "Transport Data"; break;
+      default: wg_type = "Invalid"; break;
+    }
+  }
+
+  ESP_LOGI(TAG, "← WireGuard packet: %zu bytes from %s:%u, type=%u (%s)",
+           len, src_ip, src_port, buf[0], wg_type);
 
   // Check if we have a valid peer and DERP client
   if (!this->wg_peer_node_key_valid_) {
@@ -2690,12 +2906,12 @@ void TailscaleComponent::handle_wireguard_packet_(uint8_t* buf, size_t len, stru
   }
 
   // Forward packet to DERP
-  ESP_LOGD(TAG, "  → Forwarding to DERP relay...");
+  ESP_LOGI(TAG, "  → Forwarding to DERP relay...");
 
   if (!this->derp_client_->send_packet(this->wg_peer_node_key_, buf, len)) {
     ESP_LOGE(TAG, "  ❌ Failed to send packet via DERP relay");
   } else {
-    ESP_LOGD(TAG, "  ✅ Packet forwarded to DERP");
+    ESP_LOGI(TAG, "  ✅ Packet forwarded to DERP");
   }
 #else
   ESP_LOGW(TAG, "← WireGuard packet received but WireGuard support not compiled");
@@ -2739,15 +2955,24 @@ void TailscaleComponent::discover_local_endpoints_() {
 
   ESP_LOGI(TAG, "✅ Discovered local endpoint: %s", local_endpoint.c_str());
 
-  // Add external endpoint if discovered via STUN
-  if (!this->discovered_endpoint_.empty()) {
-    // Check if it's different from local endpoint
-    if (this->discovered_endpoint_ != local_endpoint) {
-      this->discovered_endpoints_.push_back(this->discovered_endpoint_);
-      ESP_LOGI(TAG, "✅ Added external endpoint: %s", this->discovered_endpoint_.c_str());
-    } else {
-      ESP_LOGD(TAG, "External endpoint same as local, not duplicating");
-    }
+  // Add external endpoint - prefer NAT-PMP over TTL over STUN
+  std::string external_endpoint;
+  if (!this->natpmp_discovered_endpoint_.empty()) {
+    external_endpoint = this->natpmp_discovered_endpoint_;
+    ESP_LOGI(TAG, "✅ Using NAT-PMP-discovered endpoint: %s", external_endpoint.c_str());
+  } else if (!this->ttl_discovered_endpoint_.empty()) {
+    external_endpoint = this->ttl_discovered_endpoint_;
+    ESP_LOGI(TAG, "✅ Using TTL-discovered endpoint: %s", external_endpoint.c_str());
+  } else if (!this->discovered_endpoint_.empty()) {
+    external_endpoint = this->discovered_endpoint_;
+    ESP_LOGI(TAG, "✅ Using STUN-discovered endpoint (fallback): %s", external_endpoint.c_str());
+  }
+
+  if (!external_endpoint.empty() && external_endpoint != local_endpoint) {
+    this->discovered_endpoints_.push_back(external_endpoint);
+    ESP_LOGI(TAG, "✅ Added external endpoint to keepalive list");
+  } else if (!external_endpoint.empty()) {
+    ESP_LOGD(TAG, "External endpoint same as local, not duplicating");
   }
 
   ESP_LOGI(TAG, "→ Total endpoints: %zu", this->discovered_endpoints_.size());
@@ -3406,6 +3631,128 @@ bool TailscaleComponent::perform_stun_query_() {
   return found_endpoint;
 }
 
+// Request port mapping via NAT-PMP to automatically configure router
+// NAT-PMP is simpler than UPnP and widely supported
+bool TailscaleComponent::perform_natpmp_mapping_() {
+  ESP_LOGI(TAG, "→ Requesting NAT-PMP port mapping...");
+
+  // Get default gateway IP from WiFi config
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (!netif) {
+    ESP_LOGW(TAG, "Could not get WiFi interface for gateway discovery");
+    return false;
+  }
+
+  esp_netif_ip_info_t ip_info;
+  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+    ESP_LOGW(TAG, "Could not get IP info");
+    return false;
+  }
+
+  // NAT-PMP uses UDP port 5351 on gateway
+  struct sockaddr_in gateway_addr{};
+  gateway_addr.sin_family = AF_INET;
+  gateway_addr.sin_port = htons(5351);
+  gateway_addr.sin_addr.s_addr = ip_info.gw.addr;
+
+  char gw_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &ip_info.gw.addr, gw_ip, sizeof(gw_ip));
+  ESP_LOGI(TAG, "  Gateway: %s:5351", gw_ip);
+
+  // Build NAT-PMP mapping request (12 bytes)
+  // https://www.rfc-editor.org/rfc/rfc6886.html
+  uint8_t request[12];
+  request[0] = 0;  // Version
+  request[1] = 1;  // Opcode: UDP mapping
+  request[2] = 0;  // Reserved
+  request[3] = 0;  // Reserved
+
+  // Internal port (big-endian)
+  request[4] = (this->unified_port_ >> 8) & 0xFF;
+  request[5] = this->unified_port_ & 0xFF;
+
+  // Requested external port (big-endian, 0 = any)
+  request[6] = (this->unified_port_ >> 8) & 0xFF;
+  request[7] = this->unified_port_ & 0xFF;
+
+  // Lifetime in seconds (big-endian, 7200 = 2 hours)
+  request[8] = 0;
+  request[9] = 0;
+  request[10] = (7200 >> 8) & 0xFF;
+  request[11] = 7200 & 0xFF;
+
+  ssize_t sent = sendto(this->unified_socket_, request, sizeof(request), 0,
+                        (struct sockaddr *)&gateway_addr, sizeof(gateway_addr));
+
+  if (sent < 0) {
+    ESP_LOGW(TAG, "Failed to send NAT-PMP request: errno %d", errno);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "✓ Sent NAT-PMP request (%d bytes), waiting for response...", sent);
+  return true;
+}
+
+// Check for NAT-PMP response (non-blocking)
+bool TailscaleComponent::check_natpmp_response_() {
+  uint8_t response[16];
+  struct sockaddr_in src_addr;
+  socklen_t src_len = sizeof(src_addr);
+
+  ssize_t received = recvfrom(this->unified_socket_, response, sizeof(response), 0,
+                               (struct sockaddr *)&src_addr, &src_len);
+
+  if (received < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ESP_LOGW(TAG, "NAT-PMP recv error: errno %d", errno);
+    }
+    return false;
+  }
+
+  // NAT-PMP response is 16 bytes
+  if (received != 16) {
+    return false;  // Not a NAT-PMP response
+  }
+
+  // Parse NAT-PMP response
+  uint8_t version = response[0];
+  uint8_t opcode = response[1];
+  uint16_t result = (response[2] << 8) | response[3];
+
+  if (version != 0 || opcode != 129) {  // 129 = UDP mapping response (128 + 1)
+    return false;  // Not a NAT-PMP UDP mapping response
+  }
+
+  if (result != 0) {
+    ESP_LOGW(TAG, "NAT-PMP mapping failed, result code: %u", result);
+    return false;
+  }
+
+  // Extract mapped external port
+  uint16_t external_port = (response[10] << 8) | response[11];
+  uint32_t lifetime = (response[12] << 24) | (response[13] << 16) |
+                      (response[14] << 8) | response[15];
+
+  this->natpmp_external_port_ = external_port;
+
+  // Get external IP from STUN (NAT-PMP doesn't provide it)
+  if (!this->discovered_endpoint_.empty()) {
+    size_t colon = this->discovered_endpoint_.find(':');
+    if (colon != std::string::npos) {
+      std::string external_ip = this->discovered_endpoint_.substr(0, colon);
+      this->natpmp_discovered_endpoint_ = external_ip + ":" + std::to_string(external_port);
+
+      ESP_LOGI(TAG, "🎉 NAT-PMP mapping successful!");
+      ESP_LOGI(TAG, "  External port: %u (lifetime: %u seconds)", external_port, lifetime);
+      ESP_LOGI(TAG, "  Full endpoint: %s", this->natpmp_discovered_endpoint_.c_str());
+      return true;
+    }
+  }
+
+  ESP_LOGI(TAG, "✓ NAT-PMP assigned port %u, but need STUN for external IP", external_port);
+  return true;
+}
+
 // Send periodic keepalive map request with updated endpoints
 bool TailscaleComponent::send_map_keepalive_() {
   ESP_LOGD(TAG, "→ Sending endpoint update on separate stream...");
@@ -3440,6 +3787,9 @@ bool TailscaleComponent::send_map_keepalive_() {
   } else {
     ESP_LOGD(TAG, "STUN query failed - using previous endpoint");
   }
+
+  // Refresh endpoint list to pick up TTL-discovered endpoint (if available)
+  this->discover_local_endpoints_();
 
   // Build keepalive map request
   MapPayload map_payload;

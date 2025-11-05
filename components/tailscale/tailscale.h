@@ -136,8 +136,9 @@ class TailscaleComponent : public PollingComponent {
 
   // Unified socket for all UDP traffic (Disco, STUN, WireGuard)
   int unified_socket_{-1};                    // Single UDP socket for all traffic
-  uint16_t unified_port_{41641};              // Port for unified socket
+  uint16_t unified_port_{41642};              // Port for unified socket (TESTING: changed from 41641 to diagnose WireGuard conflict)
   void setup_unified_socket_();               // Initialize unified socket
+  void check_unified_socket_();               // Check for incoming packets (called from loop())
   void route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);  // Demultiplex packets
   void handle_disco_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);    // Handle Disco protocol
   void handle_stun_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);     // Handle STUN responses
@@ -183,12 +184,19 @@ class TailscaleComponent : public PollingComponent {
 
   // Endpoint discovery and advertisement
   std::string discovered_endpoint_;  // Our public IP:port (STUN-discovered)
+  std::string ttl_discovered_endpoint_;  // Endpoint discovered via TTL probe (correct for peer traffic)
+  std::string natpmp_discovered_endpoint_;  // Endpoint discovered via NAT-PMP/PCP
+  uint16_t natpmp_external_port_{0};  // External port from NAT-PMP/PCP
   std::vector<std::string> discovered_endpoints_;  // All discovered endpoints (local + external)
   bool initial_endpoint_sent_{false};  // Track if initial endpoint update was sent
   bool send_endpoint_update_();      // Send endpoint to control server
   bool perform_stun_query_();         // Query DERP server for our public IP
   void discover_local_endpoints_();   // Discover local network endpoints
   void handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len);
+
+  // NAT-PMP/PCP for automatic port mapping
+  bool perform_natpmp_mapping_();    // Request port mapping via NAT-PMP
+  bool check_natpmp_response_();     // Check for NAT-PMP response (non-blocking)
 
   // UDP Relay for WireGuard → DERP forwarding
   int udp_relay_socket_{-1};  // Socket listening on port 51821 for WireGuard packets
