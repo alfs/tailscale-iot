@@ -41,6 +41,25 @@ int crypto_box_open_easy_simple(
     const unsigned char *sk     // Our secret key (32 bytes)
 );
 
+/**
+ * HSalsa20 key derivation (exposed for testing)
+ */
+void hsalsa20(
+    unsigned char out[32],
+    const unsigned char in[16],
+    const unsigned char k[32],
+    const unsigned char c[16]);
+
+/**
+ * Custom Salsa20 stream cipher (replaces broken ESP32 libsodium version)
+ * Exposed for testing
+ */
+void crypto_stream_salsa20_custom(
+    unsigned char *c,
+    unsigned long long clen,
+    const unsigned char n[8],
+    const unsigned char k[32]);
+
 #ifdef __cplusplus
 }
 #endif

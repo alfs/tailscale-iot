@@ -1,6 +1,7 @@
 #include "tailscale.h"
 #include "derp_client.h"
 #include "crypto_box_simple.h"
+#include "crypto_test.h"
 #include "local_server_cert.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
@@ -111,7 +112,10 @@ void TailscaleComponent::setup() {
   ESP_LOGI(TAG, "Device name: %s", this->device_name_.c_str());
   ESP_LOGI(TAG, "Control URL: %s", this->control_url_.c_str());
   ESP_LOGD(TAG, "Auth key: %s", this->auth_key_.substr(0, 16).c_str());  // Show only first 16 chars
-  
+
+  // Run crypto test vectors to verify libsodium implementation
+  run_crypto_tests();
+
   // Initialize NVS for key persistence
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -2700,6 +2704,18 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
     return;
   }
 
+  // CRYPTO DEBUG: Dump full packet for Python verification
+  ESP_LOGI(TAG, "📦 Full disco packet hex dump (%zu bytes):", len);
+  for (size_t i = 0; i < len; i += 16) {
+    char hex[80];
+    int n = 0;
+    for (size_t j = 0; j < 16 && i+j < len; j++) {
+      n += sprintf(hex + n, "%02x", buf[i+j]);
+      if (j % 2 == 1) n += sprintf(hex + n, " ");
+    }
+    ESP_LOGI(TAG, "  [%3zu-%3zu]: %s", i, i+15 < len ? i+15 : len-1, hex);
+  }
+
   // Extract sender's disco public key (32 bytes at offset 6)
   const uint8_t* sender_disco_pubkey = &buf[6];
 
@@ -2717,14 +2733,58 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
     return;
   }
 
-  ESP_LOGD(TAG, "  Attempting decrypt: enc_len=%zu, nonce[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
-           encrypted_len, nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7]);
-  ESP_LOGD(TAG, "  Sender disco pubkey[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
-           sender_disco_pubkey[0], sender_disco_pubkey[1], sender_disco_pubkey[2], sender_disco_pubkey[3],
-           sender_disco_pubkey[4], sender_disco_pubkey[5], sender_disco_pubkey[6], sender_disco_pubkey[7]);
-  ESP_LOGD(TAG, "  Our disco private[0-7]=%02x%02x%02x%02x%02x%02x%02x%02x",
-           (uint8_t)our_priv_raw[0], (uint8_t)our_priv_raw[1], (uint8_t)our_priv_raw[2], (uint8_t)our_priv_raw[3],
-           (uint8_t)our_priv_raw[4], (uint8_t)our_priv_raw[5], (uint8_t)our_priv_raw[6], (uint8_t)our_priv_raw[7]);
+  // Decode our disco public key for loopback detection and logging
+  std::string our_pub_raw = this->base64_decode(this->disco_key_public_);
+  if (our_pub_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid our disco public key size: %zu", our_pub_raw.size());
+    return;
+  }
+
+  // LOOPBACK DETECTION: Check if this is our own packet
+  if (memcmp(sender_disco_pubkey, our_pub_raw.data(), 32) == 0) {
+    ESP_LOGD(TAG, "  → Skipping loopback disco packet (from ourselves)");
+    return;
+  }
+
+  // CRYPTO DEBUG: Log full keys for Python verification
+  ESP_LOGI(TAG, "🔑 Full our disco public key (32 bytes):");
+  for (int i = 0; i < 32; i += 16) {
+    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+             i, i+15,
+             (uint8_t)our_pub_raw[i+0], (uint8_t)our_pub_raw[i+1], (uint8_t)our_pub_raw[i+2], (uint8_t)our_pub_raw[i+3],
+             (uint8_t)our_pub_raw[i+4], (uint8_t)our_pub_raw[i+5], (uint8_t)our_pub_raw[i+6], (uint8_t)our_pub_raw[i+7],
+             (uint8_t)our_pub_raw[i+8], (uint8_t)our_pub_raw[i+9], (uint8_t)our_pub_raw[i+10], (uint8_t)our_pub_raw[i+11],
+             (uint8_t)our_pub_raw[i+12], (uint8_t)our_pub_raw[i+13], (uint8_t)our_pub_raw[i+14], (uint8_t)our_pub_raw[i+15]);
+  }
+
+  ESP_LOGI(TAG, "🔑 Full sender disco public key (32 bytes):");
+  for (int i = 0; i < 32; i += 16) {
+    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+             i, i+15,
+             sender_disco_pubkey[i+0], sender_disco_pubkey[i+1], sender_disco_pubkey[i+2], sender_disco_pubkey[i+3],
+             sender_disco_pubkey[i+4], sender_disco_pubkey[i+5], sender_disco_pubkey[i+6], sender_disco_pubkey[i+7],
+             sender_disco_pubkey[i+8], sender_disco_pubkey[i+9], sender_disco_pubkey[i+10], sender_disco_pubkey[i+11],
+             sender_disco_pubkey[i+12], sender_disco_pubkey[i+13], sender_disco_pubkey[i+14], sender_disco_pubkey[i+15]);
+  }
+
+  ESP_LOGI(TAG, "🔑 Full our disco private key (32 bytes):");
+  for (int i = 0; i < 32; i += 16) {
+    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+             i, i+15,
+             (uint8_t)our_priv_raw[i+0], (uint8_t)our_priv_raw[i+1], (uint8_t)our_priv_raw[i+2], (uint8_t)our_priv_raw[i+3],
+             (uint8_t)our_priv_raw[i+4], (uint8_t)our_priv_raw[i+5], (uint8_t)our_priv_raw[i+6], (uint8_t)our_priv_raw[i+7],
+             (uint8_t)our_priv_raw[i+8], (uint8_t)our_priv_raw[i+9], (uint8_t)our_priv_raw[i+10], (uint8_t)our_priv_raw[i+11],
+             (uint8_t)our_priv_raw[i+12], (uint8_t)our_priv_raw[i+13], (uint8_t)our_priv_raw[i+14], (uint8_t)our_priv_raw[i+15]);
+  }
+
+  ESP_LOGI(TAG, "🔑 Full nonce (24 bytes):");
+  ESP_LOGI(TAG, "  [ 0-15]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+           nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
+           nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15]);
+  ESP_LOGI(TAG, "  [16-23]: %02x%02x%02x%02x%02x%02x%02x%02x",
+           nonce[16], nonce[17], nonce[18], nonce[19], nonce[20], nonce[21], nonce[22], nonce[23]);
+
+  ESP_LOGD(TAG, "  Attempting decrypt: enc_len=%zu", encrypted_len);
 
   // Decrypt the payload using NaCl box
   uint8_t plaintext[64];  // Should be enough for disco messages
@@ -3053,14 +3113,28 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   uint8_t nonce[24];
   esp_fill_random(nonce, 24);
 
-  // Step 2: Prepare plaintext payload (msg_type + version + data)
-  // For ping: just msg_type(1) + version(1), no additional data needed
-  uint8_t plaintext[2];
+  // Step 2: Prepare complete plaintext payload per Tailscale disco protocol
+  // PING structure: msg_type(1) + version(1) + TxID(12) + NodeKey(32) = 46 bytes
+  uint8_t plaintext[46];
   plaintext[0] = DISCO_MSG_PING;  // Message type
   plaintext[1] = DISCO_VERSION;   // Version
 
+  // TxID: Random 12-byte transaction ID
+  esp_fill_random(&plaintext[2], 12);
+
+  // NodeKey: Our WireGuard node public key (32 bytes)
+  std::string node_pub_raw = this->base64_decode(this->node_key_public_);
+  if (node_pub_raw.size() != 32) {
+    ESP_LOGE(TAG, "Invalid node public key size: %zu (expected 32)", node_pub_raw.size());
+    return;
+  }
+  memcpy(&plaintext[14], node_pub_raw.data(), 32);
+
+  ESP_LOGD(TAG, "  Built complete PING: msg_type=%u, version=%u, TxID=<random>, NodeKey=<32 bytes>",
+           plaintext[0], plaintext[1]);
+
   // Step 3: Encrypt using NaCl box (crypto_box_easy)
-  // Output will be: ciphertext + 16-byte Poly1305 MAC
+  // Output will be: ciphertext + 16-byte Poly1305 MAC = 46 + 16 = 62 bytes
   uint8_t ciphertext[sizeof(plaintext) + CRYPTO_BOX_MACBYTES];
 
   if (crypto_box_easy_simple(ciphertext, plaintext, sizeof(plaintext),
@@ -3071,7 +3145,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     return;
   }
 
-  ESP_LOGD(TAG, "  Encrypted payload with NaCl box");
+  ESP_LOGD(TAG, "  Encrypted %zu bytes payload with NaCl box", sizeof(plaintext));
 
   // Step 4: Build final message
   std::vector<uint8_t> message;
@@ -3084,7 +3158,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
                  (const uint8_t*)our_pub_raw.data() + 32);
   // Nonce (24 bytes)
   message.insert(message.end(), nonce, nonce + 24);
-  // Encrypted payload (2 bytes plaintext + 16 bytes MAC = 18 bytes)
+  // Encrypted payload (46 bytes plaintext + 16 bytes MAC = 62 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
   
   ESP_LOGI(TAG, "  Built encrypted disco message: %d bytes total", message.size());

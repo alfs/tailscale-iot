@@ -1,6 +1,7 @@
 #include "crypto_box_simple.h"
 #include <string.h>
 #include <sodium.h>
+#include "esphome/core/log.h"
 
 // Salsa20 quarterround operation
 #define ROTL32(x, b) (((x) << (b)) | ((x) >> (32 - (b))))
@@ -10,9 +11,148 @@
     d ^= ROTL32(c + b, 13); \
     a ^= ROTL32(d + c, 18);
 
+// Helper to write uint32_t to byte array in little-endian format
+static inline void store32_le(unsigned char *out, uint32_t in) {
+    out[0] = in;
+    out[1] = in >> 8;
+    out[2] = in >> 16;
+    out[3] = in >> 24;
+}
+
+// Helper to read uint32_t from byte array in little-endian format
+static inline uint32_t load32_le(const unsigned char *in) {
+    return (uint32_t)in[0] |
+           ((uint32_t)in[1] << 8) |
+           ((uint32_t)in[2] << 16) |
+           ((uint32_t)in[3] << 24);
+}
+
+// Salsa20 core function - generates 64 bytes of keystream for a given block counter
+// This is the full Salsa20 with input addition (unlike HSalsa20)
+static void salsa20_block(
+    unsigned char out[64],
+    const unsigned char n[8],    // 8-byte nonce
+    const unsigned char k[32],   // 32-byte key
+    uint64_t counter)            // 64-bit block counter
+{
+    uint32_t x[16], input[16];
+
+    // Constants for Salsa20 ("expand 32-byte k")
+    const uint32_t sigma[4] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574};
+
+    // Setup initial state (Salsa20 matrix layout)
+    input[0] = sigma[0];
+    input[1] = load32_le(k + 0);
+    input[2] = load32_le(k + 4);
+    input[3] = load32_le(k + 8);
+    input[4] = load32_le(k + 12);
+    input[5] = sigma[1];
+    input[6] = load32_le(n + 0);
+    input[7] = load32_le(n + 4);
+    input[8] = (uint32_t)counter;           // Low 32 bits of counter
+    input[9] = (uint32_t)(counter >> 32);   // High 32 bits of counter
+    input[10] = sigma[2];
+    input[11] = load32_le(k + 16);
+    input[12] = load32_le(k + 20);
+    input[13] = load32_le(k + 24);
+    input[14] = load32_le(k + 28);
+    input[15] = sigma[3];
+
+    // Copy to working state
+    for (int i = 0; i < 16; i++) {
+        x[i] = input[i];
+    }
+
+    // DEBUG: Log initial state for block 0
+    static bool logged_initial = false;
+    if (counter == 0 && !logged_initial) {
+        ESP_LOGD("salsa20_block", "Initial state:");
+        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", input[0], input[1], input[2], input[3]);
+        ESP_LOGD("salsa20_block", "  [4-7]: %08x %08x %08x %08x", input[4], input[5], input[6], input[7]);
+        ESP_LOGD("salsa20_block", "  [8-11]: %08x %08x %08x %08x", input[8], input[9], input[10], input[11]);
+        ESP_LOGD("salsa20_block", "  [12-15]: %08x %08x %08x %08x", input[12], input[13], input[14], input[15]);
+        logged_initial = true;
+    }
+
+    // 20 rounds (10 double-rounds) of Salsa20
+    for (int i = 0; i < 10; i++) {
+        // Column rounds
+        QR(x[0], x[4], x[8], x[12]);
+        QR(x[5], x[9], x[13], x[1]);
+        QR(x[10], x[14], x[2], x[6]);
+        QR(x[15], x[3], x[7], x[11]);
+        // Row rounds
+        QR(x[0], x[1], x[2], x[3]);
+        QR(x[5], x[6], x[7], x[4]);
+        QR(x[10], x[11], x[8], x[9]);
+        QR(x[15], x[12], x[13], x[14]);
+    }
+
+    // DEBUG: Log state after rounds
+    if (counter == 0 && logged_initial) {
+        ESP_LOGD("salsa20_block", "After rounds (before addition):");
+        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
+        ESP_LOGD("salsa20_block", "  [8-11]: %08x %08x %08x %08x", x[8], x[9], x[10], x[11]);
+    }
+
+    // Add input state to output state (this is what makes it Salsa20, not HSalsa20)
+    for (int i = 0; i < 16; i++) {
+        x[i] += input[i];
+    }
+
+    // DEBUG: Log final state
+    if (counter == 0 && logged_initial) {
+        ESP_LOGD("salsa20_block", "After addition:");
+        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
+    }
+
+    // Serialize output in little-endian format
+    for (int i = 0; i < 16; i++) {
+        store32_le(out + 4 * i, x[i]);
+    }
+}
+
+// Custom Salsa20 stream cipher (replaces broken ESP32 libsodium version)
+void crypto_stream_salsa20_custom(
+    unsigned char *c,
+    unsigned long long clen,
+    const unsigned char n[8],
+    const unsigned char k[32])
+{
+    unsigned char block[64];
+    uint64_t counter = 0;
+
+    // DEBUG: Log that custom implementation is being called
+    ESP_LOGD("crypto_salsa20", "Custom Salsa20 called: clen=%llu", clen);
+
+    while (clen >= 64) {
+        salsa20_block(block, n, k, counter);
+
+        // DEBUG: Log first block output
+        if (counter == 0) {
+            ESP_LOGD("crypto_salsa20", "First block output: %02x %02x %02x %02x %02x %02x %02x %02x",
+                     block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7]);
+        }
+
+        memcpy(c, block, 64);
+        c += 64;
+        clen -= 64;
+        counter++;
+    }
+
+    if (clen > 0) {
+        salsa20_block(block, n, k, counter);
+        memcpy(c, block, clen);
+    }
+
+    // Clear sensitive data
+    sodium_memzero(block, sizeof(block));
+}
+
 // HSalsa20 core function (Salsa20 without final addition)
 // This is the key derivation function for XSalsa20
-static void hsalsa20(
+// Made non-static for testing
+void hsalsa20(
     unsigned char out[32],
     const unsigned char in[16],
     const unsigned char k[32],
@@ -25,20 +165,20 @@ static void hsalsa20(
 
     // Setup initial state
     x[0] = sigma[0];
-    x[1] = (k[0] | (k[1] << 8) | (k[2] << 16) | (k[3] << 24));
-    x[2] = (k[4] | (k[5] << 8) | (k[6] << 16) | (k[7] << 24));
-    x[3] = (k[8] | (k[9] << 8) | (k[10] << 16) | (k[11] << 24));
-    x[4] = (k[12] | (k[13] << 8) | (k[14] << 16) | (k[15] << 24));
+    x[1] = load32_le(k + 0);
+    x[2] = load32_le(k + 4);
+    x[3] = load32_le(k + 8);
+    x[4] = load32_le(k + 12);
     x[5] = sigma[1];
-    x[6] = (in[0] | (in[1] << 8) | (in[2] << 16) | (in[3] << 24));
-    x[7] = (in[4] | (in[5] << 8) | (in[6] << 16) | (in[7] << 24));
-    x[8] = (in[8] | (in[9] << 8) | (in[10] << 16) | (in[11] << 24));
-    x[9] = (in[12] | (in[13] << 8) | (in[14] << 16) | (in[15] << 24));
+    x[6] = load32_le(in + 0);
+    x[7] = load32_le(in + 4);
+    x[8] = load32_le(in + 8);
+    x[9] = load32_le(in + 12);
     x[10] = sigma[2];
-    x[11] = (k[16] | (k[17] << 8) | (k[18] << 16) | (k[19] << 24));
-    x[12] = (k[20] | (k[21] << 8) | (k[22] << 16) | (k[23] << 24));
-    x[13] = (k[24] | (k[25] << 8) | (k[26] << 16) | (k[27] << 24));
-    x[14] = (k[28] | (k[29] << 8) | (k[30] << 16) | (k[31] << 24));
+    x[11] = load32_le(k + 16);
+    x[12] = load32_le(k + 20);
+    x[13] = load32_le(k + 24);
+    x[14] = load32_le(k + 28);
     x[15] = sigma[3];
 
     // 20 rounds (10 double-rounds) of Salsa20
@@ -57,17 +197,17 @@ static void hsalsa20(
 
     // Output (HSalsa20: just output x[0], x[5], x[10], x[15], x[6-9], x[11-14])
     // This is different from Salsa20 which adds the input state
-    out[0] = x[0]; out[1] = x[0] >> 8; out[2] = x[0] >> 16; out[3] = x[0] >> 24;
-    out[4] = x[5]; out[5] = x[5] >> 8; out[6] = x[5] >> 16; out[7] = x[5] >> 24;
-    out[8] = x[10]; out[9] = x[10] >> 8; out[10] = x[10] >> 16; out[11] = x[10] >> 24;
-    out[12] = x[15]; out[13] = x[15] >> 8; out[14] = x[15] >> 16; out[15] = x[15] >> 24;
-    out[16] = x[6]; out[17] = x[6] >> 8; out[18] = x[6] >> 16; out[19] = x[6] >> 24;
-    out[20] = x[7]; out[21] = x[7] >> 8; out[22] = x[7] >> 16; out[23] = x[7] >> 24;
-    out[24] = x[8]; out[25] = x[8] >> 8; out[26] = x[8] >> 16; out[27] = x[8] >> 24;
-    out[28] = x[9]; out[29] = x[9] >> 8; out[30] = x[9] >> 16; out[31] = x[9] >> 24;
+    store32_le(out + 0, x[0]);
+    store32_le(out + 4, x[5]);
+    store32_le(out + 8, x[10]);
+    store32_le(out + 12, x[15]);
+    store32_le(out + 16, x[6]);
+    store32_le(out + 20, x[7]);
+    store32_le(out + 24, x[8]);
+    store32_le(out + 28, x[9]);
 }
 
-// XSalsa20 implementation using HSalsa20 + Salsa20
+// XSalsa20 XOR implementation using HSalsa20 + custom Salsa20
 // XSalsa20 extends Salsa20 to support 24-byte nonces (vs 8-byte)
 static void crypto_stream_xsalsa20_xor_impl(
     unsigned char *c,
@@ -81,12 +221,19 @@ static void crypto_stream_xsalsa20_xor_impl(
     unsigned char zero[16] = {0};
     hsalsa20(subkey, n, k, zero);  // Use first 16 bytes of nonce
 
-    // Step 2: Use Salsa20 with derived subkey and last 8 bytes of nonce
+    // Step 2: Use custom Salsa20 with derived subkey and last 8 bytes of nonce
     // Salsa20 expects 8-byte nonce, we use bytes 16-23 of the original 24-byte nonce
-    crypto_stream_salsa20_xor(c, m, mlen, n + 16, subkey);
+    unsigned char keystream[mlen];
+    crypto_stream_salsa20_custom(keystream, mlen, n + 16, subkey);
+
+    // XOR keystream with message
+    for (unsigned long long i = 0; i < mlen; i++) {
+        c[i] = m[i] ^ keystream[i];
+    }
 
     // Clear sensitive data
     sodium_memzero(subkey, sizeof(subkey));
+    sodium_memzero(keystream, sizeof(keystream));
 }
 
 // Implement crypto_box_easy using available libsodium primitives
@@ -119,9 +266,9 @@ int crypto_box_easy_simple(
     unsigned char subkey[32];
     hsalsa20(subkey, n, shared_secret, zero);
 
-    // Generate keystream directly (not XOR with zeros - that was causing buffer overrun!)
+    // Generate keystream directly using custom Salsa20 (not XOR with zeros - that was causing buffer overrun!)
     unsigned char keystream[mlen + 32];
-    crypto_stream_salsa20(keystream, mlen + 32, n + 16, subkey);
+    crypto_stream_salsa20_custom(keystream, mlen + 32, n + 16, subkey);
 
     // XOR message with keystream starting at byte 32
     for (unsigned long long i = 0; i < mlen; i++) {
@@ -186,9 +333,9 @@ int crypto_box_open_easy_simple(
     unsigned char subkey[32];
     hsalsa20(subkey, n, shared_secret, zero);
 
-    // Generate keystream directly (not XOR with zeros - that was causing buffer overrun!)
+    // Generate keystream directly using custom Salsa20 (not XOR with zeros - that was causing buffer overrun!)
     unsigned char keystream[mlen + 32];
-    crypto_stream_salsa20(keystream, mlen + 32, n + 16, subkey);
+    crypto_stream_salsa20_custom(keystream, mlen + 32, n + 16, subkey);
 
     // XOR ciphertext with keystream starting at byte 32
     for (unsigned long long i = 0; i < mlen; i++) {
