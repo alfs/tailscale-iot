@@ -6,6 +6,8 @@
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include "esphome/components/network/util.h"
+#include <algorithm>
+#include <cstdio>
 #include <mbedtls/base64.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
@@ -45,6 +47,26 @@ static const uint16_t STUN_BINDING_REQUEST = 0x0001;
 static const uint16_t STUN_BINDING_RESPONSE = 0x0101;
 static const uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
 static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
+
+static void log_hex_dump(const char *tag, const char *label, const uint8_t *data, size_t len) {
+  ESP_LOGI(tag, "%s (%zu bytes):", label, len);
+  if (len == 0 || data == nullptr) {
+    ESP_LOGI(tag, "  (empty)");
+    return;
+  }
+
+  for (size_t offset = 0; offset < len; offset += 16) {
+    size_t chunk = std::min<size_t>(16, len - offset);
+    char line[16 * 3 + 1];
+    size_t pos = 0;
+    for (size_t i = 0; i < chunk && pos + 3 < sizeof(line); i++) {
+      pos += snprintf(line + pos, sizeof(line) - pos, "%02x%s",
+                      data[offset + i], (i + 1 == chunk) ? "" : " ");
+    }
+    line[sizeof(line) - 1] = '\0';
+    ESP_LOGI(tag, "  [%03zu] %s", offset, line);
+  }
+}
 
 // Convert base64 to hex (for Tailscale wire format keys)
 static std::string base64_to_hex(const std::string &base64_input) {
@@ -3210,6 +3232,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   }
 
   ESP_LOGI(TAG, "→ Sending Disco PONG to %s:%u", sender_ip.c_str(), sender_port);
+  static const char *const PONG_LOG_TAG = "tailscale.disco.pong";
 
   // Disco protocol constants
   const uint8_t DISCO_MAGIC[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};  // "TS💬" (correct magic)
@@ -3222,6 +3245,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
     ESP_LOGE(TAG, "Invalid our disco private key size: %d (expected 32)", our_priv_raw.size());
     return;
   }
+  log_hex_dump(PONG_LOG_TAG, "Our disco private key", reinterpret_cast<const uint8_t*>(our_priv_raw.data()), our_priv_raw.size());
 
   // Decode our disco public key for packet header
   std::string our_pub_raw = this->base64_decode(this->disco_key_public_);
@@ -3229,6 +3253,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
     ESP_LOGE(TAG, "Invalid our disco public key size: %d (expected 32)", our_pub_raw.size());
     return;
   }
+  log_hex_dump(PONG_LOG_TAG, "Our disco public key", reinterpret_cast<const uint8_t*>(our_pub_raw.data()), our_pub_raw.size());
 
   // Decode peer's disco public key
   std::string peer_pub_raw;
@@ -3255,6 +3280,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
     ESP_LOGE(TAG, "Invalid peer disco key size: %d (expected 32)", peer_pub_raw.size());
     return;
   }
+  log_hex_dump(PONG_LOG_TAG, "Peer disco public key", reinterpret_cast<const uint8_t*>(peer_pub_raw.data()), peer_pub_raw.size());
 
   // Build disco pong message per Tailscale spec
   // Format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version)
@@ -3262,11 +3288,13 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   // Generate nonce (24 bytes for NaCl box)
   uint8_t nonce[24];
   esp_fill_random(nonce, 24);
+  log_hex_dump(PONG_LOG_TAG, "Nonce", nonce, sizeof(nonce));
 
   // Prepare plaintext payload (msg_type + version)
   uint8_t plaintext[2];
   plaintext[0] = DISCO_MSG_PONG;  // Message type
   plaintext[1] = DISCO_VERSION;   // Version
+  log_hex_dump(PONG_LOG_TAG, "Plaintext payload", plaintext, sizeof(plaintext));
 
   // Encrypt using NaCl box (crypto_box_easy)
   uint8_t ciphertext[sizeof(plaintext) + CRYPTO_BOX_MACBYTES];
@@ -3280,6 +3308,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   }
 
   ESP_LOGD(TAG, "  Encrypted PONG payload with NaCl box");
+  log_hex_dump(PONG_LOG_TAG, "Ciphertext (MAC + payload)", ciphertext, sizeof(ciphertext));
 
   // Build final PONG message
   std::vector<uint8_t> message;
@@ -3294,6 +3323,8 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   message.insert(message.end(), nonce, nonce + 24);
   // Encrypted payload (2 bytes plaintext + 16 bytes MAC = 18 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
+
+  log_hex_dump(PONG_LOG_TAG, "Final Disco PONG packet", message.data(), message.size());
 
   // Send UDP packet back to sender
   struct sockaddr_in dest_addr{};
