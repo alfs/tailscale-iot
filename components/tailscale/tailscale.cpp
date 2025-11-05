@@ -269,6 +269,9 @@ void TailscaleComponent::handle_fetching_map_state_() {
   // CRITICAL: STUN must use the unified socket to get the correct NAT mapping!
   this->setup_unified_socket_();
 
+  // Set up ICMP socket for NAT port discovery (TTL-based technique)
+  this->setup_icmp_socket_();
+
   // Discover local network endpoints (WiFi IP + port)
   ESP_LOGI(TAG, "→ Discovering local endpoints...");
   this->discover_local_endpoints_();
@@ -557,6 +560,16 @@ void TailscaleComponent::handle_connected_state_() {
                                  (struct sockaddr *)&sender_addr, &sender_len);
 
     if (received > 0) {
+      // Log every received UDP datagram for debugging
+      char src_ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
+      uint16_t src_port = ntohs(sender_addr.sin_port);
+
+      ESP_LOGI(TAG, "📨 UDP RX: %zd bytes from %s:%u (first 8 bytes: %02x %02x %02x %02x %02x %02x %02x %02x)",
+               received, src_ip, src_port,
+               buffer[0], buffer[1], buffer[2], buffer[3],
+               buffer[4], buffer[5], buffer[6], buffer[7]);
+
       // Route packet to appropriate handler based on magic bytes
       this->route_incoming_packet_(buffer, received, &sender_addr);
     } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -564,8 +577,46 @@ void TailscaleComponent::handle_connected_state_() {
     }
   }
 
+  // Check for incoming ICMP messages (TTL-based NAT port discovery)
+  this->check_icmp_responses_();
+
+  // Send TTL probes for active NAT discovery
+  if (this->nat_discovery_state_.active) {
+    uint32_t now = millis();
+    // Send probe every 200ms to avoid overwhelming network
+    if (now - this->nat_discovery_state_.last_probe_time >= 200) {
+      // Prepare destination address
+      struct sockaddr_in dest_addr{};
+      dest_addr.sin_family = AF_INET;
+      dest_addr.sin_port = htons(this->nat_discovery_state_.peer_port);
+
+      if (inet_pton(AF_INET, this->nat_discovery_state_.peer_ip.c_str(), &dest_addr.sin_addr) > 0) {
+        uint8_t probe_data[] = "NAT probe";
+
+        // Set TTL for this probe
+        int ttl = this->nat_discovery_state_.current_ttl;
+        if (setsockopt(this->unified_socket_, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) == 0) {
+          ssize_t sent = sendto(this->unified_socket_, probe_data, sizeof(probe_data), 0,
+                                (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+          if (sent > 0) {
+            ESP_LOGI(TAG, "→ Sent TTL=%d probe to %s:%u", ttl,
+                     this->nat_discovery_state_.peer_ip.c_str(),
+                     this->nat_discovery_state_.peer_port);
+            this->nat_discovery_state_.last_probe_time = now;
+          }
+
+          // Restore default TTL
+          ttl = 64;
+          setsockopt(this->unified_socket_, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+        }
+      }
+    }
+  }
+
   // Send periodic disco pings to maintain peer connectivity (every 10 seconds)
   static uint32_t last_disco_ping_time = 0;
+  static uint32_t last_nat_discovery_time = 0;
   uint32_t now = millis();
   if (now - last_disco_ping_time >= 10000) {  // 10 second interval
     ESP_LOGD(TAG, "→ Sending periodic disco ping to peers...");
@@ -575,7 +626,23 @@ void TailscaleComponent::handle_connected_state_() {
       if (!peer.disco_key.empty() && !peer.endpoint.empty() && peer.port > 0) {
         ESP_LOGD(TAG, "   → Disco PING to %s at %s:%u",
                  peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
-        this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
+
+        // Trigger NAT port discovery once per minute (every 6 disco pings)
+        // This discovers what external port the NAT assigns for traffic to this peer
+        if (now - last_nat_discovery_time >= 60000) {  // 60 second interval
+          ESP_LOGI(TAG, "🔍 Triggering NAT port discovery for peer %s...", peer.hostname.c_str());
+          // Store disco key for later use when discovery completes
+          this->nat_discovery_state_.peer_disco_key = peer.disco_key;
+          this->discover_nat_port_for_peer_(peer.endpoint, peer.port);
+          last_nat_discovery_time = now;
+          // Skip regular disco ping - will be sent after NAT discovery
+          break;
+        }
+
+        // Send regular disco ping if not doing NAT discovery
+        if (!this->nat_discovery_state_.active) {
+          this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
+        }
         break;  // Only send to first peer
       }
     }
@@ -2132,6 +2199,253 @@ void TailscaleComponent::setup_unified_socket_() {
     ESP_LOGW(TAG, "✓ Unified UDP socket ready (couldn't determine port, fd=%d)",
              this->unified_socket_);
   }
+}
+
+// ========================================
+// TTL-BASED NAT PORT DISCOVERY
+// ========================================
+// For symmetric NAT, discover the external port assigned for traffic to a specific peer
+// by sending a TTL-limited UDP probe and capturing the ICMP Time Exceeded response
+
+void TailscaleComponent::setup_icmp_socket_() {
+  if (this->icmp_socket_ != -1) {
+    return;  // Already set up
+  }
+
+  ESP_LOGI(TAG, "→ Setting up RAW ICMP socket for NAT port discovery...");
+
+  // Create RAW socket for ICMP (requires LWIP_RAW enabled)
+  this->icmp_socket_ = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+  if (this->icmp_socket_ < 0) {
+    ESP_LOGW(TAG, "⚠️  Failed to create ICMP socket: errno %d (%s)", errno, strerror(errno));
+    ESP_LOGW(TAG, "  NAT port discovery will not be available");
+    ESP_LOGW(TAG, "  This may be due to LWIP_RAW not being enabled in sdkconfig");
+    return;
+  }
+
+  // Set socket to non-blocking
+  int flags = fcntl(this->icmp_socket_, F_GETFL, 0);
+  fcntl(this->icmp_socket_, F_SETFL, flags | O_NONBLOCK);
+
+  ESP_LOGI(TAG, "✅ ICMP socket ready (fd=%d, non-blocking=YES)", this->icmp_socket_);
+}
+
+void TailscaleComponent::check_icmp_responses_() {
+  if (this->icmp_socket_ < 0) {
+    return;  // ICMP socket not available
+  }
+
+  uint8_t buffer[576];  // Min MTU for IPv4 is 576 bytes
+  struct sockaddr_in sender_addr{};
+  socklen_t sender_len = sizeof(sender_addr);
+
+  ssize_t received = recvfrom(this->icmp_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
+                               (struct sockaddr *)&sender_addr, &sender_len);
+
+  if (received > 0) {
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
+
+    // RAW ICMP socket receives full IP packet, skip IP header
+    // IP header: version(4 bits) + IHL(4 bits) in first byte
+    // IHL is in 32-bit words, so header length = IHL * 4
+    if (received < 20) {
+      ESP_LOGD(TAG, "ICMP packet too short: %zd bytes", received);
+      return;
+    }
+
+    uint8_t ip_ihl = buffer[0] & 0x0F;
+    size_t ip_header_len = ip_ihl * 4;
+
+    if (received < ip_header_len + 8) {  // Need IP header + min ICMP (8 bytes)
+      ESP_LOGD(TAG, "Packet too short for ICMP: %zd bytes (IP header: %zu)", received, ip_header_len);
+      return;
+    }
+
+    // Skip IP header to get to ICMP message
+    const uint8_t* icmp_msg = buffer + ip_header_len;
+    size_t icmp_len = received - ip_header_len;
+
+    ESP_LOGD(TAG, "📨 ICMP RX: %zd bytes from %s, IP header=%zu bytes, ICMP type=%u code=%u",
+             received, src_ip, ip_header_len, icmp_msg[0], icmp_msg[1]);
+
+    // Parse ICMP Time Exceeded messages (type=11)
+    uint16_t nat_port = 0;
+    uint32_t dummy_ip = 0;
+    if (parse_icmp_time_exceeded_(icmp_msg, icmp_len, &nat_port, &dummy_ip)) {
+      // Check if this is part of an active NAT discovery process
+      if (!this->nat_discovery_state_.active) {
+        ESP_LOGD(TAG, "Received ICMP Time Exceeded but no active NAT discovery");
+        return;
+      }
+
+      // Get STUN-discovered external IP for comparison
+      std::string stun_ip_str = this->discovered_endpoint_;
+      size_t colon_pos = stun_ip_str.find(':');
+      if (colon_pos != std::string::npos) {
+        stun_ip_str = stun_ip_str.substr(0, colon_pos);  // Strip port
+      }
+
+      // The router IP is the ICMP response source (already in src_ip from recvfrom)
+      ESP_LOGI(TAG, "🔍 TTL=%u probe: ICMP from %s, NAT port=%u",
+               this->nat_discovery_state_.current_ttl, src_ip, nat_port);
+
+      // For TTL=1, we get ICMP from the NAT router's INTERNAL interface
+      // But STUN gives us the EXTERNAL IP. They won't match!
+      // Strategy: Use TTL=1 port + STUN external IP
+      if (this->nat_discovery_state_.current_ttl == 1) {
+        ESP_LOGI(TAG, "✅ Got NAT port from first hop (NAT router internal: %s)", src_ip);
+        ESP_LOGI(TAG, "  NAT-assigned port: %u", nat_port);
+        ESP_LOGI(TAG, "  Complete endpoint: %s:%u (STUN IP + TTL=1 port)",
+                 stun_ip_str.c_str(), nat_port);
+
+        // Discovery complete! Send disco ping with discovered port knowledge
+        this->nat_discovery_state_.discovered_port = nat_port;
+        this->nat_discovery_state_.active = false;
+
+        // Now send the actual disco ping with normal TTL
+        ESP_LOGI(TAG, "→ Sending disco PING to %s:%u (NAT will use %s:%u)",
+                 this->nat_discovery_state_.peer_ip.c_str(),
+                 this->nat_discovery_state_.peer_port,
+                 stun_ip_str.c_str(), nat_port);
+        this->send_disco_ping_(this->nat_discovery_state_.peer_ip,
+                               this->nat_discovery_state_.peer_port,
+                               this->nat_discovery_state_.peer_disco_key);
+      } else {
+        ESP_LOGD(TAG, "  Skipping TTL=%u (using TTL=1 for NAT port)", this->nat_discovery_state_.current_ttl);
+        this->nat_discovery_state_.active = false;  // Stop after TTL=1
+      }
+    }
+  } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    ESP_LOGD(TAG, "ICMP socket recvfrom error: errno %d (%s)", errno, strerror(errno));
+  }
+}
+
+bool TailscaleComponent::parse_icmp_time_exceeded_(const uint8_t* icmp_packet, size_t len,
+                                                     uint16_t* nat_port, uint32_t* router_ip) {
+  // ICMP Time Exceeded format:
+  // [0]      Type = 11 (Time Exceeded)
+  // [1]      Code = 0 (TTL exceeded in transit) or 1 (Fragment reassembly time exceeded)
+  // [2-3]    Checksum
+  // [4-7]    Unused (must be zero)
+  // [8+]     IP header + first 8 bytes of original datagram
+
+  const size_t ICMP_HEADER_SIZE = 8;
+  const size_t IP_HEADER_MIN_SIZE = 20;
+  const size_t UDP_HEADER_SIZE = 8;
+
+  // Check minimum length for ICMP + IP header + UDP header
+  if (len < ICMP_HEADER_SIZE + IP_HEADER_MIN_SIZE + UDP_HEADER_SIZE) {
+    ESP_LOGD(TAG, "ICMP packet too short: %zu bytes", len);
+    return false;
+  }
+
+  // Check ICMP type (11 = Time Exceeded)
+  uint8_t icmp_type = icmp_packet[0];
+  uint8_t icmp_code = icmp_packet[1];
+  if (icmp_type != 11) {
+    ESP_LOGD(TAG, "Not a Time Exceeded message (type=%u)", icmp_type);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "⏱️  Received ICMP Time Exceeded (code=%u)", icmp_code);
+
+  // Extract embedded IP header (starts at offset 8)
+  const uint8_t* ip_header = icmp_packet + ICMP_HEADER_SIZE;
+
+  // IP header format:
+  // [0]      Version (4 bits) + IHL (4 bits)
+  // [1]      TOS
+  // [2-3]    Total length
+  // [4-5]    Identification
+  // [6-7]    Flags + Fragment offset
+  // [8]      TTL
+  // [9]      Protocol
+  // [10-11]  Header checksum
+  // [12-15]  Source IP
+  // [16-19]  Destination IP
+
+  uint8_t ip_version = (ip_header[0] >> 4) & 0x0F;
+  uint8_t ip_ihl = ip_header[0] & 0x0F;  // IHL in 32-bit words
+  uint8_t ip_protocol = ip_header[9];
+
+  if (ip_version != 4) {
+    ESP_LOGW(TAG, "Embedded packet is not IPv4 (version=%u)", ip_version);
+    return false;
+  }
+
+  if (ip_protocol != 17) {  // 17 = UDP
+    ESP_LOGD(TAG, "Embedded packet is not UDP (protocol=%u)", ip_protocol);
+    return false;
+  }
+
+  // Extract source IP (our external NAT IP) - not really needed but useful for logging
+  uint32_t src_ip = (ip_header[12] << 24) | (ip_header[13] << 16) |
+                    (ip_header[14] << 8) | ip_header[15];
+
+  // Extract destination IP (the peer we were trying to reach)
+  *router_ip = (ip_header[16] << 24) | (ip_header[17] << 16) |
+                (ip_header[18] << 8) | ip_header[19];
+
+  char src_ip_str[INET_ADDRSTRLEN];
+  char dst_ip_str[INET_ADDRSTRLEN];
+  struct in_addr addr;
+  addr.s_addr = htonl(src_ip);
+  inet_ntop(AF_INET, &addr, src_ip_str, sizeof(src_ip_str));
+  addr.s_addr = htonl(*router_ip);
+  inet_ntop(AF_INET, &addr, dst_ip_str, sizeof(dst_ip_str));
+
+  ESP_LOGI(TAG, "  Embedded IP: %s → %s (proto=%u, ihl=%u)", src_ip_str, dst_ip_str, ip_protocol, ip_ihl);
+
+  // Extract embedded UDP header (after IP header)
+  size_t ip_header_len = ip_ihl * 4;  // IHL is in 32-bit words
+  const uint8_t* udp_header = ip_header + ip_header_len;
+
+  // Check we have enough data
+  if (len < ICMP_HEADER_SIZE + ip_header_len + 4) {  // Need at least source port + dest port
+    ESP_LOGW(TAG, "ICMP payload too short for UDP header");
+    return false;
+  }
+
+  // UDP header format:
+  // [0-1]    Source port
+  // [2-3]    Destination port
+  // [4-5]    Length
+  // [6-7]    Checksum
+
+  uint16_t src_port = (udp_header[0] << 8) | udp_header[1];
+  uint16_t dst_port = (udp_header[2] << 8) | udp_header[3];
+
+  ESP_LOGI(TAG, "  Embedded UDP: port %u → %u", src_port, dst_port);
+
+  // The source port is the NAT-assigned external port!
+  *nat_port = src_port;
+
+  return true;
+}
+
+void TailscaleComponent::discover_nat_port_for_peer_(const std::string& peer_ip, uint16_t peer_port) {
+  if (this->unified_socket_ < 0) {
+    ESP_LOGW(TAG, "Unified socket not ready for NAT port discovery");
+    return;
+  }
+
+  if (this->icmp_socket_ < 0) {
+    ESP_LOGD(TAG, "ICMP socket not available - skipping NAT port discovery");
+    return;
+  }
+
+  ESP_LOGI(TAG, "🔍 Starting iterative TTL scan to find NAT boundary...");
+  ESP_LOGI(TAG, "  Target: %s:%u", peer_ip.c_str(), peer_port);
+  ESP_LOGI(TAG, "  STUN external IP: %s", this->discovered_endpoint_.c_str());
+
+  // Initialize NAT discovery state
+  this->nat_discovery_state_.active = true;
+  this->nat_discovery_state_.peer_ip = peer_ip;
+  this->nat_discovery_state_.peer_port = peer_port;
+  this->nat_discovery_state_.current_ttl = 1;
+  this->nat_discovery_state_.last_probe_time = 0;
+  this->nat_discovery_state_.discovered_port = 0;
 }
 
 // ========================================

@@ -148,6 +148,25 @@ class TailscaleComponent : public PollingComponent {
   std::vector<std::string> disco_ping_targets_;  // Hostnames to send Disco pings to (configured by user)
   void setup_disco_socket_();
   void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
+
+  // TTL-based NAT port discovery for symmetric NAT environments
+  int icmp_socket_{-1};                       // RAW ICMP socket for receiving Time Exceeded messages
+  void setup_icmp_socket_();                  // Initialize ICMP socket
+  void check_icmp_responses_();               // Check for incoming ICMP messages (non-blocking)
+  void discover_nat_port_for_peer_(const std::string& peer_ip, uint16_t peer_port);  // Discover NAT port via TTL probe
+  bool parse_icmp_time_exceeded_(const uint8_t* icmp_packet, size_t len, uint16_t* nat_port, uint32_t* router_ip);  // Parse ICMP response
+
+  // NAT discovery state tracking
+  struct NatDiscoveryState {
+    bool active{false};
+    std::string peer_ip;
+    uint16_t peer_port{0};
+    uint8_t current_ttl{1};
+    uint32_t last_probe_time{0};
+    uint16_t discovered_port{0};
+    std::string peer_disco_key;
+  };
+  NatDiscoveryState nat_discovery_state_;
   void send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
                         const std::string& peer_disco_key);
   void check_disco_responses_();              // Check for incoming Disco messages
