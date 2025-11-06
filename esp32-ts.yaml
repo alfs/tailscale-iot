@@ -68,7 +68,7 @@ tailscale:
   # wireguard_id: wg_iface  # Removed - Tailscale now manages WireGuard directly
   update_interval: 2s  # Reduced from 5s to 2s for faster reconnection checks
   allowed_peers: !secret allowed_peers
-  preferred_derp: 999  # Custom DERP server on Headscale host
+  preferred_derp: 1  # Region 1: New York (Tailscale default)
 
 # WireGuard component removed - Tailscale manages WireGuard directly via esp_wireguard API
 # This avoids "netif already added" conflict
