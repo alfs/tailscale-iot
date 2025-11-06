@@ -127,8 +127,8 @@ bool NoiseSession::set_local_static(const std::vector<uint8_t> &private_key,
   }
   
   // DEBUG: Log the keys being set
-  ESP_LOGI(TAG, "Setting local static keypair:");
-  ESP_LOGI(TAG, "  Private key (%zu bytes):", private_key.size());
+  ESP_LOGV(TAG, "Setting local static keypair:");
+  ESP_LOGV(TAG, "  Private key (%zu bytes):", private_key.size());
   for (size_t i = 0; i < private_key.size() && i < 32; i += 16) {
     size_t chunk = std::min<size_t>(16, private_key.size() - i);
     std::string hex;
@@ -137,9 +137,9 @@ bool NoiseSession::set_local_static(const std::vector<uint8_t> &private_key,
       snprintf(buf, sizeof(buf), "%02x ", private_key[i + j]);
       hex += buf;
     }
-    ESP_LOGI(TAG, "    [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
+    ESP_LOGV(TAG, "    [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
   }
-  ESP_LOGI(TAG, "  Public key (%zu bytes):", public_key.size());
+  ESP_LOGV(TAG, "  Public key (%zu bytes):", public_key.size());
   for (size_t i = 0; i < public_key.size() && i < 32; i += 16) {
     size_t chunk = std::min<size_t>(16, public_key.size() - i);
     std::string hex;
@@ -148,7 +148,7 @@ bool NoiseSession::set_local_static(const std::vector<uint8_t> &private_key,
       snprintf(buf, sizeof(buf), "%02x ", public_key[i + j]);
       hex += buf;
     }
-    ESP_LOGI(TAG, "    [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
+    ESP_LOGV(TAG, "    [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
   }
   
   int err = noise_dhstate_set_keypair(dh, private_key.data(), private_key.size(),
@@ -157,7 +157,7 @@ bool NoiseSession::set_local_static(const std::vector<uint8_t> &private_key,
     ESP_LOGE(TAG, "Failed to set local keypair (%d)", err);
     return false;
   }
-  ESP_LOGI(TAG, "✓ Configured Noise local static keypair");
+  ESP_LOGV(TAG, "✓ Configured Noise local static keypair");
   return true;
 }
 
@@ -237,7 +237,7 @@ bool NoiseSession::split_transport() {
     return false;
   }
 
-  ESP_LOGI(TAG, "Split returned: temp_send=%p, temp_recv=%p", temp_send, temp_recv);
+  ESP_LOGV(TAG, "Split returned: temp_send=%p, temp_recv=%p", temp_send, temp_recv);
 
   // Per Noise spec (section 5.3):
   // - Initiator (us): send_cipher = c1 (first), recv_cipher = c2 (second)
@@ -246,35 +246,35 @@ bool NoiseSession::split_transport() {
   this->send_cipher_ = temp_send;  // c1 - for initiator sending
   this->recv_cipher_ = temp_recv;  // c2 - for initiator receiving
 
-  ESP_LOGI(TAG, "Cipher assignment (initiator role - per Noise spec):");
-  ESP_LOGI(TAG, "  send_cipher = %p (c1 - FIRST from split)", this->send_cipher_);
-  ESP_LOGI(TAG, "  recv_cipher = %p (c2 - SECOND from split)", this->recv_cipher_);
+  ESP_LOGV(TAG, "Cipher assignment (initiator role - per Noise spec):");
+  ESP_LOGV(TAG, "  send_cipher = %p (c1 - FIRST from split)", this->send_cipher_);
+  ESP_LOGV(TAG, "  recv_cipher = %p (c2 - SECOND from split)", this->recv_cipher_);
   
   // DEBUG: Dump cipher state internals
   if (this->send_cipher_) {
     size_t key_len = noise_cipherstate_get_key_length(this->send_cipher_);
     size_t mac_len = noise_cipherstate_get_mac_length(this->send_cipher_);
-    ESP_LOGI(TAG, "  send_cipher details: key_len=%zu, mac_len=%zu", key_len, mac_len);
+    ESP_LOGV(TAG, "  send_cipher details: key_len=%zu, mac_len=%zu", key_len, mac_len);
   }
   
   if (this->recv_cipher_) {
     size_t key_len = noise_cipherstate_get_key_length(this->recv_cipher_);
     size_t mac_len = noise_cipherstate_get_mac_length(this->recv_cipher_);
-    ESP_LOGI(TAG, "  recv_cipher details: key_len=%zu, mac_len=%zu", key_len, mac_len);
+    ESP_LOGV(TAG, "  recv_cipher details: key_len=%zu, mac_len=%zu", key_len, mac_len);
   }
   
   // CRITICAL DEBUG: Dump the full cipher state structures to extract keys
   // This exposes the raw key material - only for debugging!
-  ESP_LOGW(TAG, "");
-  ESP_LOGW(TAG, "⚠️  DUMPING CIPHER STATE MEMORY (contains secret keys!):");
+  ESP_LOGV(TAG, "");
+  ESP_LOGV(TAG, "⚠️  DUMPING CIPHER STATE MEMORY (contains secret keys!):");
   if (this->send_cipher_) {
     // Dump 128 bytes which should include the parent struct + chacha_ctx + keys
-    ESP_LOG_BUFFER_HEX_LEVEL("send_cipher_raw", this->send_cipher_, 128, ESP_LOG_WARN);
+    ESP_LOG_BUFFER_HEX_LEVEL("send_cipher_raw", this->send_cipher_, 128, ESP_LOG_VERBOSE);
   }
   if (this->recv_cipher_) {
-    ESP_LOG_BUFFER_HEX_LEVEL("recv_cipher_raw", this->recv_cipher_, 128, ESP_LOG_WARN);
+    ESP_LOG_BUFFER_HEX_LEVEL("recv_cipher_raw", this->recv_cipher_, 128, ESP_LOG_VERBOSE);
   }
-  ESP_LOGW(TAG, "");
+  ESP_LOGV(TAG, "");
   
   return true;
 }

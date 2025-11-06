@@ -530,14 +530,14 @@ bool Ts2021Upgrade::write_raw(const uint8_t *data, size_t len) {
   size_t send_len = len;
   
   if (this->upgrade_complete_) {
-    ESP_LOGD(TAG, "Encoding %zu bytes as WebSocket binary frame", len);
+    ESP_LOGV(TAG, "Encoding %zu bytes as WebSocket binary frame", len);
     to_send = encode_websocket_frame(data, len, true);
     send_ptr = to_send.data();
     send_len = to_send.size();
   }
 
   // Log what we're sending (first 64 bytes for debugging)
-  ESP_LOGD(TAG, "Sending %zu bytes to server:", send_len);
+  ESP_LOGV(TAG, "Sending %zu bytes to server:", send_len);
   size_t log_len = std::min(send_len, size_t(64));
   std::string hex_str;
   hex_str.reserve(log_len * 3);
@@ -549,7 +549,7 @@ bool Ts2021Upgrade::write_raw(const uint8_t *data, size_t len) {
   if (send_len > 64) {
     hex_str += "...";
   }
-  ESP_LOGD(TAG, "  Hex: %s", hex_str.c_str());
+  ESP_LOGV(TAG, "  Hex: %s", hex_str.c_str());
 
   // Try to show as ASCII if it looks like text (only for non-WebSocket frames)
   if (!this->upgrade_complete_) {
@@ -564,7 +564,7 @@ bool Ts2021Upgrade::write_raw(const uint8_t *data, size_t len) {
     }
     if (looks_printable) {
       std::string ascii(reinterpret_cast<const char*>(send_ptr), std::min(send_len, size_t(128)));
-      ESP_LOGD(TAG, "  ASCII: %s", ascii.c_str());
+      ESP_LOGV(TAG, "  ASCII: %s", ascii.c_str());
     }
   }
 
@@ -577,7 +577,7 @@ bool Ts2021Upgrade::write_raw(const uint8_t *data, size_t len) {
     }
     written += static_cast<size_t>(ret);
   }
-  ESP_LOGD(TAG, "Successfully sent %zu bytes", written);
+  ESP_LOGV(TAG, "Successfully sent %zu bytes", written);
   return true;
 }
 
@@ -658,7 +658,7 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
       if (received > 64) {
         hex_str += "...";
       }
-      ESP_LOGD(TAG, "  Hex: %s", hex_str.c_str());
+      ESP_LOGV(TAG, "  Hex: %s", hex_str.c_str());
 
       // Loop again to attempt decode/delivery from the buffer.
       continue;

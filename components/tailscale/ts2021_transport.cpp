@@ -164,7 +164,7 @@ bool Ts2021Transport::accept_handshake_message(const uint8_t *data, size_t len) 
   if (len > 128) {
     hex_dump += "... (truncated)";
   }
-  ESP_LOGI(TAG, "← RECV handshake message (%zu bytes): %s", len, hex_dump.c_str());
+  ESP_LOGV(TAG, "← RECV handshake message (%zu bytes): %s", len, hex_dump.c_str());
 
   if (msg_type == 0x03) {
     // Error message
@@ -253,7 +253,7 @@ bool Ts2021Transport::encrypt_payload(const std::vector<uint8_t> &plaintext, std
   ciphertext.resize(plaintext.size() + mac_len);
 
   // Log before encryption (before incrementing tx_count in the actual cipher)
-  ESP_LOGD(TAG, "About to encrypt message #%llu: %zu bytes plaintext (tx=%llu, rx=%llu)",
+  ESP_LOGV(TAG, "About to encrypt message #%llu: %zu bytes plaintext (tx=%llu, rx=%llu)",
            this->tx_count_ + 1, plaintext.size(), this->tx_count_, this->rx_count_);
 
   this->tx_count_++;
@@ -267,7 +267,7 @@ bool Ts2021Transport::encrypt_payload(const std::vector<uint8_t> &plaintext, std
     return false;
   }
   ciphertext.resize(buffer.size);
-  ESP_LOGD(TAG, "Encrypted message #%llu: %zu -> %zu bytes", this->tx_count_, plaintext.size(), ciphertext.size());
+  ESP_LOGV(TAG, "Encrypted message #%llu: %zu -> %zu bytes", this->tx_count_, plaintext.size(), ciphertext.size());
   return true;
 }
 
@@ -340,7 +340,7 @@ bool Ts2021Transport::send_plaintext(const uint8_t *data, size_t len) {
   framed[2] = ciphertext.size() & 0xFF;          // length low byte
   std::copy(ciphertext.begin(), ciphertext.end(), framed.begin() + 3);
 
-  ESP_LOGD(TAG, "Sending encrypted message: %zu bytes", framed.size());
+  ESP_LOGV(TAG, "Sending encrypted message: %zu bytes", framed.size());
 
   return this->upgrade_->write_raw(framed.data(), framed.size());
 }
@@ -413,10 +413,10 @@ bool Ts2021Transport::start_http2_session() {
     return true;
   }
   
-  ESP_LOGI(TAG, "Starting HTTP/2 session");
+  ESP_LOGV(TAG, "Starting HTTP/2 session");
   
   static constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-  ESP_LOGD(TAG, "Sending HTTP/2 preface");
+  ESP_LOGV(TAG, "Sending HTTP/2 preface");
   if (!this->send_plaintext(reinterpret_cast<const uint8_t *>(kPreface), sizeof(kPreface) - 1)) {
     ESP_LOGE(TAG, "Failed to send HTTP/2 client preface");
     return false;

@@ -69,11 +69,11 @@ static void salsa20_block(
     // DEBUG: Log initial state for block 0
     static bool logged_initial = false;
     if (counter == 0 && !logged_initial) {
-        ESP_LOGD("salsa20_block", "Initial state:");
-        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", input[0], input[1], input[2], input[3]);
-        ESP_LOGD("salsa20_block", "  [4-7]: %08x %08x %08x %08x", input[4], input[5], input[6], input[7]);
-        ESP_LOGD("salsa20_block", "  [8-11]: %08x %08x %08x %08x", input[8], input[9], input[10], input[11]);
-        ESP_LOGD("salsa20_block", "  [12-15]: %08x %08x %08x %08x", input[12], input[13], input[14], input[15]);
+        ESP_LOGV("salsa20_block", "Initial state:");
+        ESP_LOGV("salsa20_block", "  [0-3]: %08x %08x %08x %08x", input[0], input[1], input[2], input[3]);
+        ESP_LOGV("salsa20_block", "  [4-7]: %08x %08x %08x %08x", input[4], input[5], input[6], input[7]);
+        ESP_LOGV("salsa20_block", "  [8-11]: %08x %08x %08x %08x", input[8], input[9], input[10], input[11]);
+        ESP_LOGV("salsa20_block", "  [12-15]: %08x %08x %08x %08x", input[12], input[13], input[14], input[15]);
         logged_initial = true;
     }
 
@@ -93,9 +93,9 @@ static void salsa20_block(
 
     // DEBUG: Log state after rounds
     if (counter == 0 && logged_initial) {
-        ESP_LOGD("salsa20_block", "After rounds (before addition):");
-        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
-        ESP_LOGD("salsa20_block", "  [8-11]: %08x %08x %08x %08x", x[8], x[9], x[10], x[11]);
+        ESP_LOGV("salsa20_block", "After rounds (before addition):");
+        ESP_LOGV("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
+        ESP_LOGV("salsa20_block", "  [8-11]: %08x %08x %08x %08x", x[8], x[9], x[10], x[11]);
     }
 
     // Add input state to output state (this is what makes it Salsa20, not HSalsa20)
@@ -105,8 +105,8 @@ static void salsa20_block(
 
     // DEBUG: Log final state
     if (counter == 0 && logged_initial) {
-        ESP_LOGD("salsa20_block", "After addition:");
-        ESP_LOGD("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
+        ESP_LOGV("salsa20_block", "After addition:");
+        ESP_LOGV("salsa20_block", "  [0-3]: %08x %08x %08x %08x", x[0], x[1], x[2], x[3]);
     }
 
     // Serialize output in little-endian format
@@ -135,7 +135,7 @@ static void crypto_stream_salsa20_custom_offset(
         salsa20_block(c, n, k, counter);
 
         if (counter == 0 && counter_start == 0) {
-            ESP_LOGD("crypto_salsa20", "First block output: %02x %02x %02x %02x %02x %02x %02x %02x",
+            ESP_LOGV("crypto_salsa20", "First block output: %02x %02x %02x %02x %02x %02x %02x %02x",
                      c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
         }
 
