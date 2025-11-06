@@ -19,12 +19,14 @@ int __wrap_sodium_init(void) {
         ESP_LOGD(TAG, "sodium already initialized");
         return 0;
     }
-    
+
     ESP_LOGI(TAG, "ESP32-C3 safe sodium_init() - bypassing libsodium CPU detection");
-    
-    // Skip all the problematic CPU detection code
+
+    // DO NOT call __real_sodium_init() - it causes abort() during CPU detection
+    // Even with weak symbol overrides, libsodium's internal initialization fails on ESP32-C3
+    // Instead, just set the flag - crypto primitives will use our overrides
     sodium_initialized = 1;
-    
+
     ESP_LOGI(TAG, "sodium_init complete (no CPU detection performed)");
     return 0;
 }

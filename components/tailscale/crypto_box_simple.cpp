@@ -389,13 +389,24 @@ int crypto_box_easy_simple(
     const unsigned char *pk,
     const unsigned char *sk)
 {
+    ESP_LOGI("crypto_box_simple", "▶ Custom crypto_box_easy_simple called (mlen=%llu)",
+             static_cast<unsigned long long>(mlen));
+
     unsigned char beforenm_key[CRYPTO_BOX_BEFORENMBYTES];
     if (crypto_box_beforenm_simple(beforenm_key, pk, sk) != 0) {
+        ESP_LOGE("crypto_box_simple", "✗ crypto_box_beforenm_simple failed");
         return -1;
     }
+    ESP_LOGD("crypto_box_simple", "✓ Shared secret computed successfully");
 
     int result = crypto_box_easy_afternm_simple(c, m, mlen, n, beforenm_key);
     sodium_memzero(beforenm_key, sizeof(beforenm_key));
+
+    if (result == 0) {
+        ESP_LOGI("crypto_box_simple", "✓ Custom crypto_box_easy_simple completed successfully");
+    } else {
+        ESP_LOGE("crypto_box_simple", "✗ crypto_box_easy_afternm_simple failed");
+    }
 
     return result;
 }
@@ -409,12 +420,23 @@ int crypto_box_open_easy_simple(
     const unsigned char *pk,
     const unsigned char *sk)
 {
+    ESP_LOGI("crypto_box_simple", "▶ Custom crypto_box_open_easy_simple called (clen=%llu)",
+             static_cast<unsigned long long>(clen));
+
     unsigned char beforenm_key[CRYPTO_BOX_BEFORENMBYTES];
     if (crypto_box_beforenm_simple(beforenm_key, pk, sk) != 0) {
+        ESP_LOGE("crypto_box_simple", "✗ crypto_box_beforenm_simple failed (decrypt)");
         return -1;
     }
 
     int result = crypto_box_open_easy_afternm_simple(m, c, clen, n, beforenm_key);
     sodium_memzero(beforenm_key, sizeof(beforenm_key));
+
+    if (result == 0) {
+        ESP_LOGI("crypto_box_simple", "✓ Custom crypto_box_open_easy_simple completed successfully");
+    } else {
+        ESP_LOGE("crypto_box_simple", "✗ crypto_box_open_easy_simple verification failed");
+    }
+
     return result;
 }

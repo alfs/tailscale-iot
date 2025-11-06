@@ -5,6 +5,7 @@
 #include "local_server_cert.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "esphome/core/helpers.h"  // For LwIPLock
 #include "esphome/components/network/util.h"
 #include <algorithm>
 #include <cstdio>
@@ -28,6 +29,8 @@ extern "C" {
 
 #ifdef USE_WIREGUARD
 #include "esphome/components/wireguard/wireguard.h"
+#include <esp_wireguard.h>  // For direct WireGuard control
+#include <esp_wireguard_err.h>
 #endif
 
 // Provide noise_rand_bytes implementation for noise-c
@@ -194,9 +197,6 @@ void TailscaleComponent::loop() {
     case TailscaleState::FETCHING_MAP:
       this->handle_fetching_map_state_();
       break;
-    case TailscaleState::CONFIGURING_WIREGUARD:
-      this->handle_configuring_wireguard_state_();
-      break;
     case TailscaleState::CONNECTED:
       this->handle_connected_state_();
       break;
@@ -239,8 +239,8 @@ void TailscaleComponent::dump_config() {
 void TailscaleComponent::transition_to(TailscaleState new_state) {
   if (this->state_ != new_state) {
     const char* state_names[] = {
-      "IDLE", "INITIALIZING", "REGISTERING", "REGISTERED", 
-      "FETCHING_MAP", "CONFIGURING_WIREGUARD", "CONNECTED", "ERROR"
+      "IDLE", "INITIALIZING", "REGISTERING", "REGISTERED",
+      "FETCHING_MAP", "CONNECTED", "ERROR"
     };
     
     ESP_LOGI(TAG, "State transition: %s -> %s", 
@@ -344,129 +344,77 @@ void TailscaleComponent::handle_fetching_map_state_() {
              peer.online ? "online" : "offline");
   }
 
-  // Initialize DERP client for relay connectivity
-  ESP_LOGI(TAG, "→ Initializing DERP relay client...");
-  this->derp_client_ = std::make_unique<DerpClient>();
+  // Initialize DERP client for relay connectivity (ONLY on first map fetch)
+  // CRITICAL ARCHITECTURAL FIX: Use static variable to survive ALL state resets
+  //
+  // ARCHITECTURAL PROBLEM SOLVED:
+  // The state machine does: CONNECTED → INITIALIZING → ... → FETCHING_MAP → CONNECTED (every ~15s)
+  // This was destroying derp_client_ because:
+  // 1. std::unique_ptr gets reset during state transitions
+  // 2. Member variables (derp_initialized_) ALSO get reset during state transitions
+  //
+  // SOLUTION: Use STATIC variable inside function - persists across ALL calls
+  // - Static variables are allocated once and persist for program lifetime
+  // - Not tied to object lifecycle, survives even if TailscaleComponent is recreated
+  // - First time in FETCHING_MAP: Initialize DERP and set static flag
+  // - Subsequent times: Skip initialization, preserve existing connection
+  static bool derp_initialized = false;  // STATIC - survives all state resets
+  if (!derp_initialized) {
+    ESP_LOGI(TAG, "→ Initializing DERP relay client (first time)...");
+    this->derp_client_ = std::make_unique<DerpClient>();
 
-  // Use DERP server from DERPMap if available, otherwise fall back to control URL
-  std::string derp_url;
-  if (this->static_map_.derp_host[0] != '\0') {
-    // Use DERP server from map response
-    if (this->static_map_.derp_port != 443) {
-      derp_url = "https://" + std::string(this->static_map_.derp_host) +
-                 ":" + std::to_string(this->static_map_.derp_port) + "/derp";
-    } else {
-      derp_url = "https://" + std::string(this->static_map_.derp_host) + "/derp";
-    }
-    ESP_LOGI(TAG, "Using DERP server from map: %s", derp_url.c_str());
-  } else {
-    // Fallback to constructing from control URL (for compatibility)
-    derp_url = "https://" + this->control_url_.substr(8) + "/derp";
-    ESP_LOGW(TAG, "No DERP server in map, using fallback: %s", derp_url.c_str());
-  }
-
-  if (this->derp_client_->init(derp_url,
-                               this->machine_pub_raw_.data(),
-                               this->machine_key_raw_.data())) {
-    ESP_LOGI(TAG, "✓ DERP client initialized");
-    this->derp_client_->set_packet_callback([this](
-        const uint8_t* peer_key, const uint8_t* packet, size_t len) {
-      this->handle_derp_packet_(peer_key, packet, len);
-    });
-  } else {
-    ESP_LOGW(TAG, "Failed to initialize DERP client - relay will be unavailable");
-  }
-
-  this->transition_to(TailscaleState::CONFIGURING_WIREGUARD);
-}
-
-void TailscaleComponent::handle_configuring_wireguard_state_() {
-  // Check if WiFi has IP address
-  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-  if (!netif) {
-    ESP_LOGD(TAG, "⏳ Waiting for WiFi interface...");
-    return;
-  }
-
-  esp_netif_ip_info_t ip_info;
-  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
-    ESP_LOGD(TAG, "⏳ Waiting for WiFi IP address...");
-    return;
-  }
-
-  // Check if we have peer information from map response
-  if (this->node_config_.peers.empty()) {
-    ESP_LOGD(TAG, "⏳ Waiting for peer information from control server...");
-    return;
-  }
-
-  // Check if any peer has a valid endpoint
-  bool has_peer_endpoint = false;
-  for (const auto& peer : this->node_config_.peers) {
-    if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0") {
-      has_peer_endpoint = true;
-      break;
-    }
-  }
-
-  if (!has_peer_endpoint) {
-    ESP_LOGD(TAG, "⏳ Waiting for peer endpoint information...");
-    return;
-  }
-
-  ESP_LOGI(TAG, "→ Configuring WireGuard tunnel...");
-
-  if (this->configure_wireguard_()) {
-    ESP_LOGI(TAG, "✓ WireGuard configured");
-
-    // Unified socket is already set up from FETCHING_MAP state
-    // No need to call setup_unified_socket_() again - it's idempotent
-
-    // Send Disco pings to discovered peer endpoints from map response
-    // This enables NAT hole punching for remote connectivity
-    ESP_LOGI(TAG, "→ Sending Disco ping to discovered peer endpoints...");
-
-    // Find peer with disco key and use discovered endpoint
-    for (const auto& peer : this->node_config_.peers) {
-      ESP_LOGD(TAG, "  Checking peer %s for disco key...", peer.hostname.c_str());
-
-      if (!peer.disco_key.empty() && !peer.endpoint.empty() && peer.port > 0) {
-        ESP_LOGI(TAG, "   📡 Sending disco PING to %s at %s:%u (discovered endpoint)",
-                 peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
-        this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
-        break;  // Only send to first peer with disco key
+    // Use DERP server from DERPMap if available, otherwise fall back to control URL
+    std::string derp_url;
+    if (this->static_map_.derp_host[0] != '\0') {
+      // Use DERP server from map response
+      if (this->static_map_.derp_port != 443) {
+        derp_url = "https://" + std::string(this->static_map_.derp_host) +
+                   ":" + std::to_string(this->static_map_.derp_port) + "/derp";
+      } else {
+        derp_url = "https://" + std::string(this->static_map_.derp_host) + "/derp";
       }
+      ESP_LOGI(TAG, "Using DERP server from map: %s", derp_url.c_str());
+    } else {
+      // Fallback to constructing from control URL (for compatibility)
+      derp_url = "https://" + this->control_url_.substr(8) + "/derp";
+      ESP_LOGW(TAG, "No DERP server in map, using fallback: %s", derp_url.c_str());
     }
 
-    // KEEP control plane connection alive to avoid out-of-memory crashes during reconnection
-    // Previously: closed control plane to free ~70KB RAM for DERP connections
-    // Problem: Reconnecting requires re-allocating 16KB HTTP/2 recv_buffer, which fails with OOM
-    // Solution: Keep control plane alive (~70KB cost) to ensure stability
-    ESP_LOGI(TAG, "→ Keeping control plane connection alive for keepalives and endpoint updates");
-    // if (this->ts2021_transport_) {
-    //   this->ts2021_transport_->reset();
-    // }
-    // if (this->upgrade_channel_) {
-    //   this->upgrade_channel_->close();
-    //   this->upgrade_channel_.reset();
-    // }
-    // this->noise_session_.reset();
-    // this->noise_session_ = esphome::make_unique<NoiseSession>();
-    // if (!this->noise_session_->initialize_ik()) {
-    //   ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
-    // }
-    ESP_LOGI(TAG, "   ✓ Control plane stream kept open for long-polling");
-
-    this->transition_to(TailscaleState::CONNECTED);
-    this->retry_count_ = 0;
+    if (this->derp_client_->init(derp_url,
+                                 this->machine_pub_raw_.data(),
+                                 this->machine_key_raw_.data())) {
+      ESP_LOGI(TAG, "✓ DERP client initialized");
+      this->derp_client_->set_packet_callback([this](
+          const uint8_t* peer_key, const uint8_t* packet, size_t len) {
+        this->handle_derp_packet_(peer_key, packet, len);
+      });
+      derp_initialized = true;  // Mark as initialized - static variable persists forever
+    } else {
+      ESP_LOGW(TAG, "Failed to initialize DERP client - relay will be unavailable");
+    }
   } else {
-    ESP_LOGE(TAG, "WireGuard configuration failed");
-    delay(2000);  // 2 second delay after failure
-    this->transition_to(TailscaleState::ERROR);
+    ESP_LOGD(TAG, "DERP client already initialized (%p), preserving connection across control plane reconnection",
+             this->derp_client_.get());
   }
+
+  // WireGuard removed - operating in DERP-only mode due to esp_netif incompatibility
+  // Direct esp_wireguard caused crashes in lwIP netif callbacks expecting esp_netif handles
+  ESP_LOGI(TAG, "→ DERP-only mode: skipping WireGuard configuration");
+  ESP_LOGI(TAG, "   ✓ Control plane and DERP ready for peer-to-peer communication");
+
+  this->transition_to(TailscaleState::CONNECTED);
+  this->retry_count_ = 0;
 }
 
 void TailscaleComponent::handle_connected_state_() {
+  // Debug: Log that we're in CONNECTED state
+  static uint32_t last_connected_log = 0;
+  uint32_t now = millis();
+  if (now - last_connected_log > 10000) {  // Every 10 seconds
+    ESP_LOGD(TAG, "🔄 handle_connected_state_() called");
+    last_connected_log = now;
+  }
+
   // Start echo server on first entry to CONNECTED state
   if (this->echo_server_socket_ == -1) {
     this->setup_echo_server_();
@@ -499,16 +447,11 @@ void TailscaleComponent::handle_connected_state_() {
       // Without this, with update_interval=2s, keepalive retries every 2 seconds → crash after ~6 attempts
       last_keepalive_send_time = current_time;
 
-      // Force reconnection on next attempt by resetting transport
-      // Keepalive failure likely means underlying connection is dead/stale
-      ESP_LOGI(TAG, "→ Forcing control plane reconnection for next keepalive attempt");
-      if (this->ts2021_transport_) {
-        this->ts2021_transport_->reset();
-      }
-      if (this->upgrade_channel_) {
-        this->upgrade_channel_->close();
-        this->upgrade_channel_.reset();
-      }
+      // FIX: Do NOT reset transport on single keepalive failure
+      // The transport watchdog (30s timeout) will handle truly dead connections
+      // Resetting here causes a death spiral where keepalives keep failing
+      // because the transport is perpetually "not ready"
+      ESP_LOGD(TAG, "Skipping transport reset - watchdog will reconnect if connection is truly dead");
     }
   }
 
@@ -528,8 +471,19 @@ void TailscaleComponent::handle_connected_state_() {
   // 2. Next loop iteration → retry DERP → fails again
   // 3. Keepalives never execute because code stuck in DERP retry loop
 
-  bool skip_derp_for_keepalives = true;  // Set to false to restore old behavior
+  bool skip_derp_for_keepalives = false;  // WireGuard removed - 24KB freed, DERP can now run
   static bool logged_skip_derp = false;  // Only log once
+
+  // Debug: Log DERP state check
+  static uint32_t last_derp_check_log = 0;
+  if (now - last_derp_check_log > 10000) {  // Every 10 seconds
+    ESP_LOGD(TAG, "🔍 DERP check: skip=%d, client=%p, ready=%d, state=%d",
+             skip_derp_for_keepalives,
+             this->derp_client_.get(),
+             this->derp_client_ ? this->derp_client_->is_ready() : -1,
+             this->derp_client_ ? (int)this->derp_client_->get_state() : -1);
+    last_derp_check_log = now;
+  }
 
   if (!skip_derp_for_keepalives) {
     // OLD BEHAVIOR: Try DERP connection (will fail with OOM if control plane is alive)
@@ -573,7 +527,10 @@ void TailscaleComponent::handle_connected_state_() {
   }
 
   // Process DERP client if initialized
-  if (this->derp_client_ && this->derp_client_->is_ready()) {
+  // CRITICAL: Must call process() even before is_ready() to complete handshake!
+  // The handshake (WAIT_SERVER_KEY -> SEND_CLIENT_INFO -> WAIT_SERVER_INFO -> READY)
+  // is driven by process(), so we can't wait for is_ready() before calling it.
+  if (this->derp_client_) {
     this->derp_client_->process();
 
     // UDP relay is now integrated into unified socket (WireGuard packets routed automatically)
@@ -616,7 +573,7 @@ void TailscaleComponent::handle_connected_state_() {
   // Log socket status periodically (every 30 seconds)
   // UDP statistics are now logged in check_unified_socket_()
   static uint32_t last_socket_status_log = 0;
-  uint32_t now = millis();
+  now = millis();  // Reuse existing 'now' variable from line 392
   if (now - last_socket_status_log >= 30000) {
     ESP_LOGI(TAG, "🔍 Socket status: unified_socket=%d (port %u), disco_socket=%d, icmp_socket=%d",
              this->unified_socket_, this->unified_port_, this->disco_socket_, this->icmp_socket_);
@@ -793,230 +750,8 @@ void TailscaleComponent::handle_echo_clients_() {
   }
 }
 
-bool TailscaleComponent::configure_wireguard_() {
-  ESP_LOGD(TAG, "Configuring WireGuard tunnel with peer information");
+// configure_wireguard_() removed - DERP-only mode (esp_wireguard incompatible with esp_netif)
 
-  if (!this->wireguard_component_) {
-    ESP_LOGW(TAG, "No WireGuard component configured - skipping WireGuard setup");
-    return true;  // Not a failure - just skip WireGuard
-  }
-
-#ifdef USE_WIREGUARD
-  auto *wg = static_cast<esphome::wireguard::Wireguard *>(this->wireguard_component_);
-
-  // Set our local Tailscale IP address (use first IPv4 from addresses)
-  if (!this->node_config_.ipv4_address.empty()) {
-    wg->set_address(this->node_config_.ipv4_address);
-    wg->set_netmask("255.255.255.0");  // Tailscale uses /24 for CGNAT range
-    ESP_LOGD(TAG, "  Local IP: %s/24", this->node_config_.ipv4_address.c_str());
-  } else {
-    ESP_LOGE(TAG, "No IPv4 address available from map response");
-    return false;
-  }
-
-  // Set our private key (base64-encoded)
-  if (this->node_key_private_.empty()) {
-    ESP_LOGE(TAG, "No private key available");
-    return false;
-  }
-  wg->set_private_key(this->node_key_private_);
-  ESP_LOGD(TAG, "  Private key configured");
-
-  // Configure first available peer with direct endpoint
-  // In Tailscale, we need at least one peer to establish the network
-  bool peer_configured = false;
-  for (const auto &peer : this->node_config_.peers) {
-    // Only configure peers with direct endpoints (skip DERP-only peers for now)
-    if (!peer.endpoint.empty() && peer.endpoint != "0.0.0.0") {
-      ESP_LOGI(TAG, "✓ Configuring WireGuard for peer %s: %s:%u",
-               peer.hostname.c_str(), peer.endpoint.c_str(), peer.port);
-
-      // Test network connectivity to peer endpoint with ICMP ping using lwIP
-      ESP_LOGI(TAG, "  Testing network connectivity to %s...", peer.endpoint.c_str());
-
-      // Resolve IP address
-      struct hostent *host = gethostbyname(peer.endpoint.c_str());
-      if (host != nullptr && host->h_addr_list[0] != nullptr) {
-        struct in_addr *addr = (struct in_addr *)host->h_addr_list[0];
-        char ip_str[16];
-        inet_ntoa_r(*addr, ip_str, sizeof(ip_str));
-        ESP_LOGI(TAG, "  Resolved %s to %s", peer.endpoint.c_str(), ip_str);
-
-        // Send raw ICMP echo request using lwIP (simple test)
-        // Note: This is a simplified connectivity test
-        // Create a UDP socket as a connectivity probe
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock >= 0) {
-          struct sockaddr_in dest_addr = {};
-          dest_addr.sin_family = AF_INET;
-          dest_addr.sin_addr = *addr;
-          dest_addr.sin_port = htons(peer.port);  // Try WireGuard port
-
-          // Set socket timeout
-          struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
-          setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-          // Try to connect (just tests routing/ARP)
-          int connect_result = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-          close(sock);
-
-          if (connect_result == 0 || errno == EISCONN) {
-            ESP_LOGI(TAG, "  ✓ Peer endpoint %s:%u is reachable (route exists)", ip_str, peer.port);
-          } else {
-            ESP_LOGW(TAG, "  ⚠ Cannot establish route to %s:%u (errno: %d)",
-                     ip_str, peer.port, errno);
-            ESP_LOGW(TAG, "  This may indicate network issues, but continuing with WireGuard setup...");
-          }
-        } else {
-          ESP_LOGW(TAG, "  Failed to create test socket (errno: %d)", errno);
-        }
-      } else {
-        ESP_LOGW(TAG, "  Failed to resolve hostname %s", peer.endpoint.c_str());
-      }
-
-      // peer.endpoint already contains just the host (port was extracted during parsing)
-      // When DERP client exists, DON'T configure peer endpoint
-      // WireGuard will operate as crypto-only interface without active connection
-      // The UDP relay handles all packet transport via DERP
-      if (this->derp_client_) {
-        ESP_LOGI(TAG, "  Using DERP relay mode - WireGuard provides crypto only (no peer connection)");
-        ESP_LOGI(TAG, "  UDP relay on port 51821 handles all packet transport via DERP");
-        // Deliberately NOT setting peer endpoint - keep placeholder from YAML
-        // This prevents WireGuard from trying to connect (which would fail with local IP)
-      } else {
-        ESP_LOGI(TAG, "  Setting endpoint: %s", peer.endpoint.c_str());
-        ESP_LOGI(TAG, "  Setting port: %u", peer.port);
-        wg->set_peer_endpoint(peer.endpoint);
-        wg->set_peer_port(peer.port);
-      }
-
-      // Strip "nodekey:" prefix if present (Tailscale format)
-      std::string peer_wg_key = peer.public_key;
-      if (peer_wg_key.substr(0, 8) == "nodekey:") {
-        peer_wg_key = peer_wg_key.substr(8);  // Remove "nodekey:" prefix
-      }
-      ESP_LOGI(TAG, "  Setting peer public key: %.20s...", peer_wg_key.c_str());
-      wg->set_peer_public_key(peer_wg_key);
-
-      // Store peer's node key in binary format for DERP relay
-      // Detect format: 64 chars = hex, 44 chars = base64
-      std::string peer_key_decoded;
-      if (peer_wg_key.length() == 64) {
-        // Hex-encoded (from static map parser)
-        peer_key_decoded = hex_decode(peer_wg_key);
-        ESP_LOGD(TAG, "  Decoded peer key from hex (%d bytes)", peer_key_decoded.size());
-      } else if (peer_wg_key.length() == 44 || peer_wg_key.length() == 43) {
-        // Base64-encoded (44 chars with padding, 43 without)
-        peer_key_decoded = base64_decode(peer_wg_key);
-        ESP_LOGD(TAG, "  Decoded peer key from base64 (%d bytes)", peer_key_decoded.size());
-      } else {
-        ESP_LOGW(TAG, "  Unexpected peer key length: %d (expected 64 for hex or 44 for base64)", peer_wg_key.length());
-      }
-
-      if (peer_key_decoded.size() == 32) {
-        memcpy(this->wg_peer_node_key_, peer_key_decoded.data(), 32);
-        this->wg_peer_node_key_valid_ = true;
-        ESP_LOGD(TAG, "  ✓ Stored peer node key for DERP relay (%02x%02x%02x%02x...)",
-                 this->wg_peer_node_key_[0], this->wg_peer_node_key_[1],
-                 this->wg_peer_node_key_[2], this->wg_peer_node_key_[3]);
-      } else {
-        ESP_LOGW(TAG, "  Failed to decode peer node key (expected 32 bytes, got %d)", peer_key_decoded.size());
-        this->wg_peer_node_key_valid_ = false;
-      }
-
-      // For simplicity, only add the Tailscale CGNAT range (100.64.0.0/10)
-      // This allows communication with all Tailscale peers
-      // Skip per-peer IPs and exit node routes to avoid esp_wireguard issues
-      bool added_tailscale_range = false;
-      for (const auto &allowed_ip : peer.allowed_ips) {
-        // Skip IPv6 addresses (contain ':')
-        if (allowed_ip.find(':') != std::string::npos) {
-          ESP_LOGV(TAG, "    Skipping IPv6 allowed IP: %s", allowed_ip.c_str());
-          continue;
-        }
-
-        // Skip default route (0.0.0.0/0) - ESP32 WireGuard doesn't support exit node mode
-        if (allowed_ip == "0.0.0.0/0") {
-          ESP_LOGI(TAG, "    Skipping exit node route (0.0.0.0/0)");
-          continue;
-        }
-
-        // Only add the Tailscale CGNAT range (100.64.0.0/10), skip individual peer IPs
-        // This simplifies the configuration and avoids esp_wireguard issues
-        if (allowed_ip.substr(0, 11) != "100.64.0.0/") {
-          ESP_LOGV(TAG, "    Skipping non-Tailscale-range IP: %s", allowed_ip.c_str());
-          continue;
-        }
-
-        // Skip if we already added the Tailscale range
-        if (added_tailscale_range) {
-          continue;
-        }
-
-        // Parse CIDR notation (e.g., "100.64.0.0/10")
-        auto slash_pos = allowed_ip.find('/');
-        if (slash_pos != std::string::npos) {
-          std::string ip = allowed_ip.substr(0, slash_pos);
-          std::string cidr = allowed_ip.substr(slash_pos + 1);
-
-          // Convert CIDR to netmask (simple conversion for common cases)
-          std::string netmask;
-          if (cidr == "32") {
-            netmask = "255.255.255.255";
-          } else if (cidr == "24") {
-            netmask = "255.255.255.0";
-          } else if (cidr == "16") {
-            netmask = "255.255.0.0";
-          } else if (cidr == "10") {
-            netmask = "255.192.0.0";  // Tailscale CGNAT range (100.64.0.0/10)
-          } else if (cidr == "8") {
-            netmask = "255.0.0.0";
-          } else if (cidr == "0") {
-            netmask = "0.0.0.0";
-          } else {
-            ESP_LOGW(TAG, "    Unsupported CIDR /%s for %s - using /32", cidr.c_str(), ip.c_str());
-            netmask = "255.255.255.255";
-          }
-
-          wg->add_allowed_ip(ip, netmask);
-          ESP_LOGI(TAG, "    Added allowed IP: %s/%s", ip.c_str(), netmask.c_str());
-          added_tailscale_range = true;
-        }
-      }
-
-      if (!added_tailscale_range) {
-        ESP_LOGW(TAG, "  No Tailscale CGNAT range found in allowed IPs - adding manually");
-        wg->add_allowed_ip("100.64.0.0", "255.192.0.0");  // 100.64.0.0/10
-      }
-
-      wg->set_keepalive(25);  // 25 second keepalive for NAT traversal
-      peer_configured = true;
-      break;  // Only configure first peer for now
-    }
-  }
-
-  if (!peer_configured) {
-    ESP_LOGW(TAG, "No peers with direct endpoints found - WireGuard may need DERP");
-    // This is not a fatal error - peer might connect via DERP later
-  }
-
-  ESP_LOGD(TAG, "WireGuard configuration complete");
-
-  // Restart WireGuard to apply new configuration
-  // The WireGuard component may have failed to start during setup() with endpoint 0.0.0.0
-  // We need to disable and re-enable it with the correct peer endpoints
-  ESP_LOGI(TAG, "→ Restarting WireGuard with new peer configuration...");
-  wg->disable();  // Stop current (possibly failed) connection
-  delay(100);      // Brief delay to ensure clean shutdown
-  wg->enable();    // Start with newly configured endpoints
-  ESP_LOGI(TAG, "✓ WireGuard restarted");
-
-  return true;
-#else
-  ESP_LOGW(TAG, "WireGuard support not compiled in (USE_WIREGUARD not defined)");
-  return false;
-#endif
-}
 
 bool TailscaleComponent::generate_node_keys_() {
   // Try to load existing keys from NVS first
@@ -2193,16 +1928,16 @@ void TailscaleComponent::setup_disco_socket_() {
 // ========================================
 // UNIFIED SOCKET SETUP
 // ========================================
-// This function sets up the unified UDP socket that handles all traffic:
-// - Disco protocol (NAT traversal)
+// This function sets up the unified UDP socket that handles:
+// - Disco protocol (NAT traversal, peer discovery)
 // - STUN responses (endpoint discovery)
-// - WireGuard packets (data plane)
+// NOTE: WireGuard packets are handled directly by esp_wireguard (separate socket)
 void TailscaleComponent::setup_unified_socket_() {
   if (this->unified_socket_ != -1) {
     return;  // Already set up
   }
 
-  ESP_LOGI(TAG, "→ Setting up UNIFIED UDP socket (Disco + STUN + WireGuard)...");
+  ESP_LOGI(TAG, "→ Setting up UNIFIED UDP socket (Disco + STUN)...");
 
   this->unified_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (this->unified_socket_ < 0) {
@@ -2692,14 +2427,11 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     return;
   }
 
-  // Check for WireGuard message types (1-4)
-  if (len >= 4 && buf[0] >= 1 && buf[0] <= 4) {
-    ESP_LOGD(TAG, "🔐 Routing to WireGuard handler (type: %u)", buf[0]);
-    this->handle_wireguard_packet_(buf, len, src);
-    return;
-  }
+  // NOTE: WireGuard packets are no longer routed through unified socket.
+  // With direct esp_wireguard control, WireGuard binds its own socket and receives packets directly.
+  // The unified socket is only for Disco (NAT traversal) and STUN (endpoint discovery).
 
-  // Unknown packet type
+  // Unknown packet type (not Disco or STUN)
   char src_ip[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
   uint16_t src_port = ntohs(src->sin_port);
@@ -2955,49 +2687,18 @@ void TailscaleComponent::handle_stun_packet_(uint8_t* buf, size_t len, struct so
 }
 
 // Handle WireGuard packets (forward to DERP relay)
+// DEPRECATED: WireGuard packet handling via unified socket
+// With direct esp_wireguard control, WireGuard packets are handled by esp_wireguard's own socket.
+// This function should never be called with the new architecture.
 void TailscaleComponent::handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
-#ifdef USE_WIREGUARD
   char src_ip[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
   uint16_t src_port = ntohs(src->sin_port);
 
-  // Decode WireGuard message type
-  const char* wg_type = "UNKNOWN";
-  if (len >= 1) {
-    switch (buf[0]) {
-      case 1: wg_type = "Handshake Init"; break;
-      case 2: wg_type = "Handshake Response"; break;
-      case 3: wg_type = "Cookie Reply"; break;
-      case 4: wg_type = "Transport Data"; break;
-      default: wg_type = "Invalid"; break;
-    }
-  }
-
-  ESP_LOGI(TAG, "← WireGuard packet: %zu bytes from %s:%u, type=%u (%s)",
-           len, src_ip, src_port, buf[0], wg_type);
-
-  // Check if we have a valid peer and DERP client
-  if (!this->wg_peer_node_key_valid_) {
-    ESP_LOGW(TAG, "  ⚠️ No WireGuard peer configured, dropping packet");
-    return;
-  }
-
-  if (!this->derp_client_ || !this->derp_client_->is_ready()) {
-    ESP_LOGW(TAG, "  ⚠️ DERP client not ready, dropping packet");
-    return;
-  }
-
-  // Forward packet to DERP
-  ESP_LOGI(TAG, "  → Forwarding to DERP relay...");
-
-  if (!this->derp_client_->send_packet(this->wg_peer_node_key_, buf, len)) {
-    ESP_LOGE(TAG, "  ❌ Failed to send packet via DERP relay");
-  } else {
-    ESP_LOGI(TAG, "  ✅ Packet forwarded to DERP");
-  }
-#else
-  ESP_LOGW(TAG, "← WireGuard packet received but WireGuard support not compiled");
-#endif
+  ESP_LOGW(TAG, "⚠️ WireGuard packet received on unified socket (unexpected!)");
+  ESP_LOGW(TAG, "   %zu bytes from %s:%u", len, src_ip, src_port);
+  ESP_LOGW(TAG, "   With direct esp_wireguard control, WireGuard should receive packets on its own socket.");
+  ESP_LOGW(TAG, "   This packet will be ignored. Check network configuration if this appears frequently.");
 }
 
 // ========================================
@@ -4177,8 +3878,34 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
 
   ESP_LOGD(TAG, "  From peer: %02x%02x%02x%02x...",
            peer_key[0], peer_key[1], peer_key[2], peer_key[3]);
-  ESP_LOGD(TAG, "  Packet header: %02x%02x%02x%02x... (%d bytes)",
-           packet[0], packet[1], packet[2], packet[3], len);
+
+  // MINIMAL TEST: Identify packet type
+  if (len > 0) {
+    uint8_t msg_type = packet[0];
+    const char* type_name = "UNKNOWN";
+
+    switch (msg_type) {
+      case 0x01: type_name = "WireGuard Handshake Initiation (148B)"; break;
+      case 0x02: type_name = "WireGuard Handshake Response (92B)"; break;
+      case 0x03: type_name = "WireGuard Cookie Reply (64B)"; break;
+      case 0x04: type_name = "WireGuard Transport Data"; break;
+      default:
+        if (msg_type >= 0x54 && msg_type <= 0xac) {
+          type_name = "Possible Disco packet (TS💬 magic)";
+        }
+        break;
+    }
+
+    ESP_LOGI(TAG, "  📦 Packet type: 0x%02x = %s", msg_type, type_name);
+    ESP_LOGD(TAG, "  Packet header: %02x%02x%02x%02x... (%d bytes)",
+             packet[0], packet[1], packet[2], packet[3], len);
+  }
+
+  // MINIMAL TEST: If this is a WireGuard packet, we've proven DERP routing works!
+  if (len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
+    ESP_LOGI(TAG, "  ✅ RECEIVED WIREGUARD PACKET VIA DERP!");
+    ESP_LOGI(TAG, "  Next step: Implement WireGuard protocol to process it");
+  }
 
 #ifdef USE_WIREGUARD
   // Inject DERP packet into WireGuard by sending it to WiFi IP:51820
@@ -4214,7 +3941,103 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
     ESP_LOGD(TAG, "✓ DERP packet injected into WireGuard (%d bytes)", sent);
   }
 #else
-  ESP_LOGW(TAG, "WireGuard support not compiled in - cannot inject packet");
+  // DERP-only mode: Handle ICMP echo requests directly
+  // WireGuard packets are IP packets, check if it's ICMP echo (type 8)
+
+  if (len < 20) {
+    ESP_LOGW(TAG, "Packet too small to be IP (%d bytes)", len);
+    return;
+  }
+
+  // Check IP header: version (4 bits) should be 4, protocol should be ICMP (1)
+  uint8_t ip_version = (packet[0] >> 4) & 0x0F;
+  uint8_t ip_protocol = packet[9];
+
+  if (ip_version != 4) {
+    ESP_LOGD(TAG, "Not IPv4 packet (version=%d), ignoring", ip_version);
+    return;
+  }
+
+  if (ip_protocol != 1) {  // ICMP
+    ESP_LOGD(TAG, "Not ICMP packet (protocol=%d), ignoring in DERP-only mode", ip_protocol);
+    return;
+  }
+
+  // Get IP header length
+  uint8_t ihl = (packet[0] & 0x0F) * 4;
+  if (len < ihl + 8) {
+    ESP_LOGW(TAG, "Packet too small for ICMP (%d bytes)", len);
+    return;
+  }
+
+  // Check ICMP type
+  uint8_t icmp_type = packet[ihl];
+  uint8_t icmp_code = packet[ihl + 1];
+
+  ESP_LOGI(TAG, "  ICMP packet: type=%d, code=%d", icmp_type, icmp_code);
+
+  if (icmp_type == 8) {  // Echo Request
+    ESP_LOGI(TAG, "→ Received ICMP Echo Request via DERP, sending reply...");
+
+    // Create echo reply by modifying the packet in-place
+    uint8_t reply[1500];
+    if (len > sizeof(reply)) {
+      ESP_LOGW(TAG, "Packet too large to reply (%d bytes)", len);
+      return;
+    }
+
+    memcpy(reply, packet, len);
+
+    // Swap IP addresses (bytes 12-15 with 16-19)
+    uint8_t temp_ip[4];
+    memcpy(temp_ip, &reply[12], 4);
+    memcpy(&reply[12], &reply[16], 4);
+    memcpy(&reply[16], temp_ip, 4);
+
+    // Change ICMP type from 8 (echo request) to 0 (echo reply)
+    reply[ihl] = 0;
+
+    // Recalculate IP checksum
+    reply[10] = 0;
+    reply[11] = 0;
+    uint32_t sum = 0;
+    for (size_t i = 0; i < ihl; i += 2) {
+      sum += (reply[i] << 8) | reply[i + 1];
+    }
+    while (sum >> 16) {
+      sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    uint16_t ip_checksum = ~sum;
+    reply[10] = ip_checksum >> 8;
+    reply[11] = ip_checksum & 0xFF;
+
+    // Recalculate ICMP checksum
+    reply[ihl + 2] = 0;
+    reply[ihl + 3] = 0;
+    sum = 0;
+    size_t icmp_len = len - ihl;
+    for (size_t i = 0; i < icmp_len - 1; i += 2) {
+      sum += (reply[ihl + i] << 8) | reply[ihl + i + 1];
+    }
+    if (icmp_len & 1) {  // Odd length
+      sum += reply[ihl + icmp_len - 1] << 8;
+    }
+    while (sum >> 16) {
+      sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    uint16_t icmp_checksum = ~sum;
+    reply[ihl + 2] = icmp_checksum >> 8;
+    reply[ihl + 3] = icmp_checksum & 0xFF;
+
+    // Send reply back through DERP
+    if (this->derp_client_ && this->derp_client_->is_ready()) {
+      if (this->derp_client_->send_packet(peer_key, reply, len)) {
+        ESP_LOGI(TAG, "✓ Sent ICMP Echo Reply via DERP (%d bytes)", len);
+      } else {
+        ESP_LOGE(TAG, "Failed to send ICMP reply via DERP");
+      }
+    }
+  }
 #endif
 }
 

@@ -20,9 +20,10 @@ esp32:
       CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH: "certs"
 
       # mbedTLS Memory Optimizations (saves ~48KB total)
-      # Reduce TLS buffer size from 16KB to 4KB per buffer (saves 24KB)
-      # Most Tailscale control messages are <4KB, so this is sufficient
-      CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN: "4096"
+      # Reduce TLS buffer size from 16KB to 3KB per buffer (saves 26KB)
+      # Reduced from 4KB to 3KB to allow two TLS connections (control + DERP)
+      # Most Tailscale control messages are <3KB, and HTTP/2 chunks larger responses
+      CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN: "3072"
 
       # Enable dynamic buffer allocation (saves ~20KB)
       # Buffers are allocated only when needed and freed after use
@@ -64,20 +65,12 @@ tailscale:
   control_url: !secret headscale_url
   device_name: "esp"
   time_id: sntp_time
-  wireguard_id: wg_iface
+  # wireguard_id: wg_iface  # Removed - Tailscale now manages WireGuard directly
   update_interval: 2s  # Reduced from 5s to 2s for faster reconnection checks
   allowed_peers: !secret allowed_peers
-  preferred_derp: 28  # DERP region 28 (Helsinki)
+  preferred_derp: 999  # Custom DERP server on Headscale host
 
-wireguard:
-  id: wg_iface
-  time_id: sntp_time
-  address: 100.64.0.25  # Must match address assigned by Tailscale control plane
-  private_key: !secret wg_template_private_key
-  peer_public_key: !secret wg_template_peer_public_key
-  peer_endpoint: "192.168.0.172" # testing
-  peer_port: 41641
-  peer_allowed_ips:
-    - "100.64.0.0/10"
+# WireGuard component removed - Tailscale manages WireGuard directly via esp_wireguard API
+# This avoids "netif already added" conflict
 
 

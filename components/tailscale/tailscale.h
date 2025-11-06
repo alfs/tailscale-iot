@@ -19,6 +19,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+// WireGuard removed - using DERP-only mode due to esp_netif incompatibility
+// Direct esp_wireguard usage causes NULL pointer crashes in lwIP callbacks
+
 namespace esphome {
 namespace tailscale {
 
@@ -28,8 +31,7 @@ enum class TailscaleState {
   REGISTERING,
   REGISTERED,
   FETCHING_MAP,
-  CONFIGURING_WIREGUARD,
-  CONNECTED,
+  CONNECTED,  // DERP-only mode (no WireGuard)
   ERROR
 };
 
@@ -69,7 +71,6 @@ class TailscaleComponent : public PollingComponent {
   void set_control_public_key(const std::string &key) { this->control_public_key_ = key; }
   void set_device_name(const std::string &name) { this->device_name_ = name; }
   void set_time_source(time::RealTimeClock *time) { this->time_source_ = time; }
-  void set_wireguard_component(Component *wg) { this->wireguard_component_ = wg; }
   void add_disco_ping_target(const std::string &hostname) { this->disco_ping_targets_.push_back(hostname); }
   void set_preferred_derp(uint32_t region) { this->preferred_derp_ = region; }
 
@@ -85,12 +86,10 @@ class TailscaleComponent : public PollingComponent {
   void handle_initializing_state_();
   void handle_registering_state_();
   void handle_fetching_map_state_();
-  void handle_configuring_wireguard_state_();
   void handle_connected_state_();
   void handle_error_state_();
 
   // Protocol operations
-  bool configure_wireguard_();
   bool ensure_ts2021_ready_();
   bool fetch_control_key_();
   bool set_remote_key_(const std::string &key_b64);
@@ -114,6 +113,8 @@ class TailscaleComponent : public PollingComponent {
   uint32_t preferred_derp_{28};  // Preferred DERP region (default 28)
   time::RealTimeClock *time_source_{nullptr};
   Component *wireguard_component_{nullptr};
+
+  // WireGuard removed - DERP-only mode (esp_wireguard has esp_netif incompatibility)
 
   // Runtime state
   TailscaleState state_{TailscaleState::IDLE};
@@ -181,6 +182,7 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<Ts2021Transport> ts2021_transport_;
   std::unique_ptr<Ts2021Upgrade> upgrade_channel_;
   std::unique_ptr<DerpClient> derp_client_;
+  // derp_initialized_ removed - now using static variable in handle_fetching_map_state_() for true persistence
 
   // Endpoint discovery and advertisement
   std::string discovered_endpoint_;  // Our public IP:port (STUN-discovered)
