@@ -91,7 +91,7 @@ bool Ts2021Transport::build_handshake_message(std::vector<uint8_t> &out_cipherte
     return false;
   }
   noise_payload.resize(message.size);
-  ESP_LOGD(TAG, "Generated raw Noise handshake payload: %zu bytes", noise_payload.size());
+  ESP_LOGV(TAG, "Generated raw Noise handshake payload: %zu bytes", noise_payload.size());
   
   // Wrap in Tailscale controlbase protocol framing
   // Format: [version(2)] [type(1)] [length(2)] [payload(96)]
@@ -190,7 +190,7 @@ bool Ts2021Transport::accept_handshake_message(const uint8_t *data, size_t len) 
   const uint8_t *noise_payload = data + 3;
   size_t noise_payload_len = payload_len;
   
-  ESP_LOGD(TAG, "Extracted Noise payload: %zu bytes", noise_payload_len);
+  ESP_LOGV(TAG, "Extracted Noise payload: %zu bytes", noise_payload_len);
   
   NoiseHandshakeState *hs = this->session_->handshake_state();
   if (hs == nullptr) {
@@ -444,7 +444,7 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
                                       const char *&response_ptr, size_t &response_size,
                                       uint16_t &status_code, uint32_t timeout_ms, bool close_stream,
                                       bool filter_node_only) {
-  ESP_LOGD(TAG, "http2_post_json called: path=%s, payload_size=%zu", path.c_str(), payload.size());
+  ESP_LOGV(TAG, "http2_post_json called: path=%s, payload_size=%zu", path.c_str(), payload.size());
 
   if (!this->http2_session_) {
     ESP_LOGW(TAG, "HTTP/2 session not ready (null pointer)");

@@ -776,7 +776,7 @@ bool DerpClient::send_client_info_() {
   memcpy(buffer + offset, ciphertext, encrypted_len);
   offset += encrypted_len;
 
-  ESP_LOGI(TAG, "→ Sending encrypted FrameClientInfo (%d bytes total, %d bytes encrypted)",
+  ESP_LOGV(TAG, "→ Sending encrypted FrameClientInfo (%d bytes total, %d bytes encrypted)",
            offset, encrypted_len);
 
   if (!this->send_frame_(DerpFrameType::CLIENT_INFO, buffer, offset)) {

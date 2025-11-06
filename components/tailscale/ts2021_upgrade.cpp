@@ -612,7 +612,7 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
           ESP_LOGW(TAG, "WebSocket decode returned empty payload (close frame?)");
           return false;
         }
-        ESP_LOGD(TAG, "Decoded WebSocket frame from buffer: payload=%zu bytes, consumed=%zu", payload.size(), consumed);
+        ESP_LOGV(TAG, "Decoded WebSocket frame from buffer: payload=%zu bytes, consumed=%zu", payload.size(), consumed);
         out = std::move(payload);
         return true;
       }
@@ -646,7 +646,7 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
       this->recv_buffer_.insert(this->recv_buffer_.end(), temp.begin(), temp.begin() + received);
 
       // Log the newly received chunk for debugging (first 64 bytes).
-      ESP_LOGD(TAG, "Received %zu raw bytes from server (buffered total: %zu)", received, this->recv_buffer_.size());
+      ESP_LOGV(TAG, "Received %zu raw bytes from server (buffered total: %zu)", received, this->recv_buffer_.size());
       size_t log_len = std::min<size_t>(received, 64);
       std::string hex_str;
       hex_str.reserve(log_len * 3);

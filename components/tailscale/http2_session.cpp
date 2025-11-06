@@ -551,7 +551,7 @@ bool Http2Session::send_frame_(const Frame &frame) {
     return false;
   }
   
-  ESP_LOGD(TAG, "send_frame_: type=%u, flags=0x%02x, stream_id=%u, length=%u, payload_size=%zu",
+  ESP_LOGV(TAG, "send_frame_: type=%u, flags=0x%02x, stream_id=%u, length=%u, payload_size=%zu",
            frame.type, frame.flags, frame.stream_id, frame.length, frame.payload.size());
   
   std::vector<uint8_t> out;
@@ -563,7 +563,7 @@ bool Http2Session::send_frame_(const Frame &frame) {
   out.insert(out.end(), frame.payload.begin(), frame.payload.end());
   
   // Log first 32 bytes of the complete frame
-  ESP_LOGD(TAG, "send_frame_: sending %zu bytes total, first bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x ...",
+  ESP_LOGV(TAG, "send_frame_: sending %zu bytes total, first bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x ...",
            out.size(),
            out.size() > 0 ? out[0] : 0,
            out.size() > 1 ? out[1] : 0,
@@ -633,7 +633,7 @@ bool Http2Session::read_frame_(Frame &frame, uint32_t timeout_ms) {
                        static_cast<uint32_t>(this->recv_buffer_[8]);
   stream_id &= 0x7FFFFFFF;
   
-  ESP_LOGD(TAG, "HTTP/2 frame header: length=%u, type=%u, flags=0x%02x, stream=%u", 
+  ESP_LOGV(TAG, "HTTP/2 frame header: length=%u, type=%u, flags=0x%02x, stream=%u", 
            length, type, flags, stream_id);
   
   // Check frame size against ESP32 memory limitations
@@ -1016,7 +1016,7 @@ bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_p
         size_t payload_size = frame.length;
         const char *payload_ptr = reinterpret_cast<const char *>(this->recv_buffer_.data() + 9);
 
-        ESP_LOGD(TAG, "DATA frame: %zu bytes", payload_size);
+        ESP_LOGV(TAG, "DATA frame: %zu bytes", payload_size);
 
         // Handle Tailscale wire format: 4-byte length prefix + JSON
         const char *json_data = payload_ptr;

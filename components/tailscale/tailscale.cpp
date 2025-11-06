@@ -52,9 +52,9 @@ static const uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
 static const uint16_t STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
 
 static void log_hex_dump(const char *tag, const char *label, const uint8_t *data, size_t len) {
-  ESP_LOGI(tag, "%s (%zu bytes):", label, len);
+  ESP_LOGV(tag, "%s (%zu bytes):", label, len);
   if (len == 0 || data == nullptr) {
-    ESP_LOGI(tag, "  (empty)");
+    ESP_LOGV(tag, "  (empty)");
     return;
   }
 
@@ -67,7 +67,7 @@ static void log_hex_dump(const char *tag, const char *label, const uint8_t *data
                       data[offset + i], (i + 1 == chunk) ? "" : " ");
     }
     line[sizeof(line) - 1] = '\0';
-    ESP_LOGI(tag, "  [%03zu] %s", offset, line);
+    ESP_LOGV(tag, "  [%03zu] %s", offset, line);
   }
 }
 
@@ -2459,7 +2459,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
   }
 
   // CRYPTO DEBUG: Dump full packet for Python verification
-  ESP_LOGI(TAG, "📦 Full disco packet hex dump (%zu bytes):", len);
+  ESP_LOGV(TAG, "📦 Full disco packet hex dump (%zu bytes):", len);
   for (size_t i = 0; i < len; i += 16) {
     char hex[80];
     int n = 0;
@@ -2501,7 +2501,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
   }
 
   // CRYPTO DEBUG: Log full keys for Python verification
-  ESP_LOGI(TAG, "🔑 Full our disco public key (32 bytes):");
+  ESP_LOGV(TAG, "🔑 Full our disco public key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
     ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
@@ -2511,7 +2511,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
              (uint8_t)our_pub_raw[i+12], (uint8_t)our_pub_raw[i+13], (uint8_t)our_pub_raw[i+14], (uint8_t)our_pub_raw[i+15]);
   }
 
-  ESP_LOGI(TAG, "🔑 Full sender disco public key (32 bytes):");
+  ESP_LOGV(TAG, "🔑 Full sender disco public key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
     ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
@@ -2521,7 +2521,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
              sender_disco_pubkey[i+12], sender_disco_pubkey[i+13], sender_disco_pubkey[i+14], sender_disco_pubkey[i+15]);
   }
 
-  ESP_LOGI(TAG, "🔑 Full our disco private key (32 bytes):");
+  ESP_LOGV(TAG, "🔑 Full our disco private key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
     ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
@@ -2531,7 +2531,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
              (uint8_t)our_priv_raw[i+12], (uint8_t)our_priv_raw[i+13], (uint8_t)our_priv_raw[i+14], (uint8_t)our_priv_raw[i+15]);
   }
 
-  ESP_LOGI(TAG, "🔑 Full nonce (24 bytes):");
+  ESP_LOGV(TAG, "🔑 Full nonce (24 bytes):");
   ESP_LOGI(TAG, "  [ 0-15]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
            nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
            nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15]);
