@@ -21,6 +21,9 @@
 #include <esp_crt_bundle.h>
 #endif
 
+// For ESP32 hardware random number generator
+#include <esp_random.h>
+
 namespace esphome {
 namespace tailscale {
 
@@ -36,6 +39,14 @@ DerpClient::~DerpClient() {
 bool DerpClient::init(const std::string& server_url,
                       const uint8_t* our_node_key,
                       const uint8_t* our_node_key_priv) {
+  // CRITICAL: Initialize libsodium before using any crypto functions
+  // Without this, crypto_box_easy_simple() will call abort() and crash the ESP32
+  if (sodium_init() < 0) {
+    ESP_LOGE(TAG, "libsodium initialization failed");
+    return false;
+  }
+  ESP_LOGD(TAG, "libsodium initialized for DERP crypto operations");
+
   this->server_url_ = server_url;
 
   // Copy keys
@@ -206,20 +217,58 @@ bool DerpClient::do_http_upgrade_() {
   ESP_LOGD(TAG, "Feeding watchdog before HTTP Upgrade response read...");
   App.feed_wdt();
 
-  // Read HTTP response
+  // CRITICAL: Read HTTP response headers ONLY, stopping at "\r\n\r\n"
+  // We must NOT consume DERP frames (FrameServerKey) that follow immediately after headers!
+  // Official Tailscale client uses buffered I/O to handle this properly.
   char response[512];
-  ESP_LOGD(TAG, "Reading HTTP Upgrade response (blocking)...");
+  size_t response_len = 0;
+  ESP_LOGD(TAG, "Reading HTTP Upgrade response byte-by-byte (non-blocking with timeout)...");
   uint32_t start_ms = esphome::millis();
-  ssize_t received = this->sock_read_(response, sizeof(response) - 1);
-  uint32_t elapsed_ms = esphome::millis() - start_ms;
-  ESP_LOGD(TAG, "HTTP response read completed in %d ms", elapsed_ms);
+  const uint32_t RESPONSE_TIMEOUT_MS = 5000;  // 5 second timeout
 
-  if (received <= 0) {
-    ESP_LOGE(TAG, "Failed to receive HTTP response");
-    return false;
+  // Read one byte at a time until we find "\r\n\r\n" (end of headers)
+  while (response_len < sizeof(response) - 4) {
+    ssize_t received = this->sock_read_(&response[response_len], 1);
+
+    if (received < 0) {
+      // Check if it's EAGAIN/EWOULDBLOCK (no data available) vs real error
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Non-blocking socket: no data ready yet, check timeout and retry
+        if (esphome::millis() - start_ms > RESPONSE_TIMEOUT_MS) {
+          ESP_LOGE(TAG, "Timeout waiting for HTTP response byte at offset %d", response_len);
+          return false;
+        }
+        delay(1);  // Small delay before retry
+        continue;
+      } else {
+        // Real error (not EAGAIN)
+        ESP_LOGE(TAG, "Socket error at offset %d: errno=%d", response_len, errno);
+        return false;
+      }
+    }
+
+    if (received == 0) {
+      ESP_LOGE(TAG, "Connection closed while reading HTTP response at offset %d", response_len);
+      return false;
+    }
+
+    response_len++;
+
+    // Check if we've reached end of headers: "\r\n\r\n"
+    if (response_len >= 4 &&
+        response[response_len - 4] == '\r' &&
+        response[response_len - 3] == '\n' &&
+        response[response_len - 2] == '\r' &&
+        response[response_len - 1] == '\n') {
+      ESP_LOGD(TAG, "Found end of HTTP headers at byte %d", response_len);
+      break;
+    }
   }
 
-  response[received] = '\0';
+  uint32_t elapsed_ms = esphome::millis() - start_ms;
+  ESP_LOGD(TAG, "HTTP response headers read completed in %d ms (%d bytes)", elapsed_ms, response_len);
+
+  response[response_len] = '\0';
 
   // Check for "101 Switching Protocols"
   if (strstr(response, "101") == nullptr ||
@@ -229,7 +278,7 @@ bool DerpClient::do_http_upgrade_() {
     return false;
   }
 
-  ESP_LOGI(TAG, "✓ HTTP Upgraded to DERP protocol");
+  ESP_LOGI(TAG, "✓ HTTP Upgraded to DERP protocol (consumed %d header bytes, DERP frames preserved)", response_len);
   return true;
 }
 
@@ -304,6 +353,16 @@ bool DerpClient::do_tls_handshake_() {
   int sockfd = -1;
   if (esp_tls_get_conn_sockfd(tls, &sockfd) == ESP_OK) {
     this->sock_ = sockfd;
+
+    // CRITICAL: Set socket to non-blocking mode to prevent watchdog timeouts
+    // Without this, esp_tls_conn_read() will block indefinitely waiting for data
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+      ESP_LOGD(TAG, "✓ Set TLS socket to non-blocking mode (fd=%d)", sockfd);
+    } else {
+      ESP_LOGW(TAG, "Failed to get socket flags for non-blocking mode (fd=%d, errno=%d)", sockfd, errno);
+    }
   }
 
   ESP_LOGI(TAG, "✓ TLS connection established to %s:%d",
@@ -358,24 +417,36 @@ bool DerpClient::send_packet(const uint8_t* peer_key, const uint8_t* packet, siz
 void DerpClient::process() {
   uint32_t now = esphome::millis();
 
-  // Handle handshake states
+  // Debug: Periodic heartbeat to confirm process() is being called
+  static uint32_t last_debug_log = 0;
+  if (now - last_debug_log > 10000) {  // Every 10 seconds
+    ESP_LOGD(TAG, "🔄 DERP process() called - state=%d, last_activity=%u ms ago",
+             (int)this->state_, now - this->last_activity_);
+    last_debug_log = now;
+  }
+
+  // Handle handshake states with fall-through to complete handshake in single call
+  // This mimics official Tailscale client behavior for faster handshake completion
   if (this->state_ == DerpState::WAIT_SERVER_KEY) {
     if (this->handle_server_key_()) {
       ESP_LOGI(TAG, "✓ Received server key");
       this->state_ = DerpState::SEND_CLIENT_INFO;
+      // Fall through to immediately send client info
+    } else {
+      return;  // No data available yet, try again next time
     }
-    return;
   }
 
   if (this->state_ == DerpState::SEND_CLIENT_INFO) {
     if (this->send_client_info_()) {
-      ESP_LOGD(TAG, "→ Sent FrameClientInfo");
+      ESP_LOGI(TAG, "→ Sent FrameClientInfo");
       this->state_ = DerpState::WAIT_SERVER_INFO;
+      // Fall through to immediately check for server info
     } else {
       ESP_LOGE(TAG, "Failed to send FrameClientInfo");
       this->state_ = DerpState::ERROR;
+      return;
     }
-    return;
   }
 
   if (this->state_ == DerpState::WAIT_SERVER_INFO) {
@@ -384,8 +455,10 @@ void DerpClient::process() {
       this->state_ = DerpState::READY;
       this->last_activity_ = now;
       this->last_keep_alive_ = now;
+      // Fall through to process any pending packets
+    } else {
+      return;  // No data available yet, try again next time
     }
-    return;
   }
 
   // Only process normal frames when READY
@@ -491,14 +564,32 @@ bool DerpClient::send_frame_(DerpFrameType type, const uint8_t* payload, uint32_
 bool DerpClient::read_frame_header_(DerpFrameType& type, uint32_t& len) {
   uint8_t header[FRAME_HEADER_LEN];
 
+  // Debug: Log every read attempt (throttled to avoid spam)
+  static uint32_t last_read_attempt_log = 0;
+  uint32_t now = esphome::millis();
+  if (now - last_read_attempt_log > 5000) {  // Every 5 seconds
+    ESP_LOGD(TAG, "→ Attempting to read DERP frame header...");
+    last_read_attempt_log = now;
+  }
+
   ssize_t received = this->sock_read_(header, FRAME_HEADER_LEN);
+
   if (received != FRAME_HEADER_LEN) {
     if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      return false; // No data available (non-blocking)
+      // No data available (non-blocking) - this is normal
+      static uint32_t last_no_data_log = 0;
+      if (now - last_no_data_log > 15000) {  // Every 15 seconds
+        ESP_LOGD(TAG, "  No DERP data available (EAGAIN) - normal for non-blocking socket");
+        last_no_data_log = now;
+      }
+      return false;
     }
     if (received == 0) {
       ESP_LOGW(TAG, "DERP server closed connection");
       this->disconnect();
+    } else {
+      ESP_LOGW(TAG, "  sock_read_() returned %d (expected %d), errno=%d",
+               received, FRAME_HEADER_LEN, errno);
     }
     return false;
   }
@@ -508,6 +599,8 @@ bool DerpClient::read_frame_header_(DerpFrameType& type, uint32_t& len) {
         ((uint32_t)header[2] << 16) |
         ((uint32_t)header[3] << 8) |
         (uint32_t)header[4];
+
+  ESP_LOGI(TAG, "✓ Read DERP frame header: type=0x%02x, len=%u", (uint8_t)type, len);
 
   return true;
 }
@@ -522,10 +615,38 @@ bool DerpClient::read_frame_payload_(uint8_t* buffer, uint32_t len) {
     return false;
   }
 
-  ssize_t received = this->sock_read_(buffer, len);
-  if (received != (ssize_t)len) {
-    ESP_LOGE(TAG, "Failed to read frame payload (expected %d, got %d)", len, received);
-    return false;
+  // CRITICAL: Non-blocking socket requires EAGAIN retry loop
+  // Read payload in chunks, handling EAGAIN properly
+  uint32_t total_received = 0;
+  uint32_t start_ms = esphome::millis();
+  const uint32_t PAYLOAD_TIMEOUT_MS = 5000;  // 5 second timeout
+
+  while (total_received < len) {
+    ssize_t received = this->sock_read_(buffer + total_received, len - total_received);
+
+    if (received < 0) {
+      // Check if it's EAGAIN/EWOULDBLOCK (no data available) vs real error
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Non-blocking socket: no data ready yet, check timeout and retry
+        if (esphome::millis() - start_ms > PAYLOAD_TIMEOUT_MS) {
+          ESP_LOGE(TAG, "Timeout reading frame payload at offset %d/%d", total_received, len);
+          return false;
+        }
+        delay(1);  // Small delay before retry
+        continue;
+      } else {
+        // Real error (not EAGAIN)
+        ESP_LOGE(TAG, "Socket error reading payload at offset %d/%d: errno=%d", total_received, len, errno);
+        return false;
+      }
+    }
+
+    if (received == 0) {
+      ESP_LOGE(TAG, "Connection closed while reading payload at offset %d/%d", total_received, len);
+      return false;
+    }
+
+    total_received += received;
   }
 
   return true;
@@ -600,23 +721,35 @@ bool DerpClient::handle_server_info_() {
 }
 
 bool DerpClient::send_client_info_() {
+  ESP_LOGI(TAG, "→ send_client_info_() START");
+
   // FrameClientInfo format: 32B our public key + 24B nonce + NaCl box(JSON)
 
   // Minimal client info JSON (protocol expects at least empty JSON object)
   const char* client_info_json = "{}";
+  ESP_LOGD(TAG, "  JSON payload: %s", client_info_json);
   size_t json_len = strlen(client_info_json);
+  ESP_LOGD(TAG, "  JSON length: %d", json_len);
 
   // Buffer: 32B public key + 24B nonce + encrypted payload (json + 16B MAC)
+  ESP_LOGD(TAG, "  Allocating buffer (%d bytes)...", KEY_LEN + NONCE_LEN + 256);
   uint8_t buffer[KEY_LEN + NONCE_LEN + 256];
   size_t offset = 0;
+  ESP_LOGD(TAG, "  ✓ Buffer allocated");
 
   // Our public key
+  ESP_LOGD(TAG, "  Copying our node key...");
   memcpy(buffer + offset, this->our_node_key_, KEY_LEN);
   offset += KEY_LEN;
+  ESP_LOGD(TAG, "  ✓ Node key copied");
 
   // Generate random nonce for NaCl crypto_box
+  ESP_LOGD(TAG, "  Generating random nonce...");
   uint8_t nonce[NONCE_LEN];
-  randombytes_buf(nonce, NONCE_LEN);
+  // CRITICAL: Use ESP32 hardware RNG directly instead of libsodium's randombytes_buf()
+  // libsodium's randombytes_buf() requires full initialization which crashes on ESP32-C3
+  esp_fill_random(nonce, NONCE_LEN);
+  ESP_LOGD(TAG, "  ✓ Nonce generated");
   memcpy(buffer + offset, nonce, NONCE_LEN);
   offset += NONCE_LEN;
 
