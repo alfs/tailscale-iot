@@ -380,15 +380,16 @@ void TailscaleComponent::handle_fetching_map_state_() {
       ESP_LOGW(TAG, "No DERP server in map, using fallback: %s", derp_url.c_str());
     }
 
-    // DERP uses disco keys, not machine keys, for routing
-    std::string disco_pub_raw = this->base64_decode(this->disco_key_public_);
-    std::string disco_priv_raw = this->base64_decode(this->disco_key_private_);
+    // DERP uses WireGuard node keys (NodeKey), not machine keys or disco keys
+    // NodeKey is used for DERP routing, while DiscoKey is used for DISCO protocol (NAT traversal)
+    std::string node_pub_raw = this->base64_decode(this->node_key_public_);
+    std::string node_priv_raw = this->base64_decode(this->node_key_private_);
 
-    if (disco_pub_raw.size() != 32 || disco_priv_raw.size() != 32) {
-      ESP_LOGE(TAG, "Invalid disco key sizes (pub=%zu, priv=%zu)", disco_pub_raw.size(), disco_priv_raw.size());
+    if (node_pub_raw.size() != 32 || node_priv_raw.size() != 32) {
+      ESP_LOGE(TAG, "Invalid node key sizes (pub=%zu, priv=%zu)", node_pub_raw.size(), node_priv_raw.size());
     } else if (this->derp_client_->init(derp_url,
-                                 (const uint8_t*)disco_pub_raw.data(),
-                                 (const uint8_t*)disco_priv_raw.data())) {
+                                 (const uint8_t*)node_pub_raw.data(),
+                                 (const uint8_t*)node_priv_raw.data())) {
       ESP_LOGI(TAG, "✓ DERP client initialized");
       this->derp_client_->set_packet_callback([this](
           const uint8_t* peer_key, const uint8_t* packet, size_t len) {
