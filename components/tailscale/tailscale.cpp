@@ -380,9 +380,15 @@ void TailscaleComponent::handle_fetching_map_state_() {
       ESP_LOGW(TAG, "No DERP server in map, using fallback: %s", derp_url.c_str());
     }
 
-    if (this->derp_client_->init(derp_url,
-                                 this->machine_pub_raw_.data(),
-                                 this->machine_key_raw_.data())) {
+    // DERP uses disco keys, not machine keys, for routing
+    std::string disco_pub_raw = this->base64_decode(this->disco_key_public_);
+    std::string disco_priv_raw = this->base64_decode(this->disco_key_private_);
+
+    if (disco_pub_raw.size() != 32 || disco_priv_raw.size() != 32) {
+      ESP_LOGE(TAG, "Invalid disco key sizes (pub=%zu, priv=%zu)", disco_pub_raw.size(), disco_priv_raw.size());
+    } else if (this->derp_client_->init(derp_url,
+                                 (const uint8_t*)disco_pub_raw.data(),
+                                 (const uint8_t*)disco_priv_raw.data())) {
       ESP_LOGI(TAG, "✓ DERP client initialized");
       this->derp_client_->set_packet_callback([this](
           const uint8_t* peer_key, const uint8_t* packet, size_t len) {
