@@ -184,12 +184,9 @@ static const char* extract_quoted_value(const char* start, const char* end, size
 
 // Helper: Extract number value after a key
 static bool extract_number(const char* start, const char* end, uint64_t* out) {
-  // Skip to colon
-  const char* colon = (const char*)memchr(start, ':', end - start);
-  if (!colon) return false;
-
-  // Skip whitespace after colon
-  const char* p = colon + 1;
+  // Start is already positioned after the colon by the caller
+  // Skip any whitespace
+  const char* p = start;
   while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
 
   // Parse number
@@ -706,14 +703,21 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
           // Extract STUNPort (optional, defaults to 3478)
           const char* stun_port_key = find_str(node_obj_start, node_obj_end, "\"STUNPort\":");
           if (stun_port_key) {
+            ESP_LOGD(TAG, "Found STUNPort key in JSON");
             uint64_t stun_port_num;
             if (extract_number(stun_port_key + 11, node_obj_end, &stun_port_num)) {
               out.stun_port = static_cast<uint16_t>(stun_port_num);
+              ESP_LOGD(TAG, "Extracted STUNPort value: %d", out.stun_port);
+            } else {
+              ESP_LOGW(TAG, "Failed to extract STUNPort number");
             }
+          } else {
+            ESP_LOGW(TAG, "STUNPort key not found in JSON");
           }
 
           // Default to 3478 if no STUN port specified
           if (out.stun_port == 0 && out.derp_host[0] != '\0') {
+            ESP_LOGD(TAG, "STUNPort was 0, defaulting to 3478");
             out.stun_port = 3478;
           }
 

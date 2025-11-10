@@ -492,7 +492,7 @@ void DerpClient::process() {
   // Handle frame based on type
   switch (type) {
     case DerpFrameType::RECV_PACKET:
-      this->handle_recv_packet_();
+      this->handle_recv_packet_(len);
       break;
 
     case DerpFrameType::KEEP_ALIVE:
@@ -500,15 +500,15 @@ void DerpClient::process() {
       break;
 
     case DerpFrameType::PING:
-      this->handle_ping_();
+      this->handle_ping_(len);
       break;
 
     case DerpFrameType::PEER_PRESENT:
-      this->handle_peer_present_();
+      this->handle_peer_present_(len);
       break;
 
     case DerpFrameType::PEER_GONE:
-      this->handle_peer_gone_();
+      this->handle_peer_gone_(len);
       break;
 
     case DerpFrameType::HEALTH:
@@ -523,9 +523,23 @@ void DerpClient::process() {
 
     default:
       ESP_LOGW(TAG, "Unknown frame type: 0x%02x (len=%d)", (uint8_t)type, len);
-      // Skip unknown frame payload
+      // Read and dump unknown frame payload for debugging
       if (len > 0 && len < RECV_BUFFER_SIZE) {
         this->read_frame_payload_(this->recv_buffer_, len);
+
+        // Dump first 64 bytes (or full frame if smaller) in hex
+        size_t dump_len = (len > 64) ? 64 : len;
+        ESP_LOGI(TAG, "Unknown frame 0x%02x payload (%d bytes, showing first %d):",
+                 (uint8_t)type, len, dump_len);
+        for (size_t i = 0; i < dump_len; i += 16) {
+          char hex_str[64];
+          int offset = 0;
+          for (size_t j = 0; j < 16 && (i + j) < dump_len; j++) {
+            offset += snprintf(hex_str + offset, sizeof(hex_str) - offset,
+                             "%02x ", this->recv_buffer_[i + j]);
+          }
+          ESP_LOGI(TAG, "  [%04d]: %s", i, hex_str);
+        }
       }
       break;
   }
@@ -725,8 +739,10 @@ bool DerpClient::send_client_info_() {
 
   // FrameClientInfo format: 32B our public key + 24B nonce + NaCl box(JSON)
 
-  // Minimal client info JSON (protocol expects at least empty JSON object)
-  const char* client_info_json = "{}";
+  // Client info JSON with protocol version
+  // Version 2 is the current DERP protocol version
+  // CanAckPings indicates support for ping acknowledgements
+  const char* client_info_json = "{\"Version\":2,\"CanAckPings\":true}";
   ESP_LOGD(TAG, "  JSON payload: %s", client_info_json);
   size_t json_len = strlen(client_info_json);
   ESP_LOGD(TAG, "  JSON length: %d", json_len);
@@ -788,11 +804,8 @@ bool DerpClient::send_client_info_() {
   return true;
 }
 
-bool DerpClient::handle_recv_packet_() {
+bool DerpClient::handle_recv_packet_(uint32_t len) {
   // FrameRecvPacket format (v2): 32B src key + packet data
-  DerpFrameType type;
-  uint32_t len;
-
   // Header already read by caller, len includes src key + packet
   if (len < KEY_LEN) {
     ESP_LOGE(TAG, "Invalid FrameRecvPacket length: %d", len);
@@ -816,23 +829,27 @@ bool DerpClient::handle_recv_packet_() {
   return true;
 }
 
-bool DerpClient::handle_peer_present_() {
+bool DerpClient::handle_peer_present_(uint32_t len) {
   // FramePeerPresent: at least 32B peer key
-  // Just log for now
+  // Read and discard payload for now
+  if (len > 0 && len < RECV_BUFFER_SIZE) {
+    this->read_frame_payload_(this->recv_buffer_, len);
+  }
   ESP_LOGD(TAG, "← Peer present notification");
   return true;
 }
 
-bool DerpClient::handle_peer_gone_() {
+bool DerpClient::handle_peer_gone_(uint32_t len) {
   // FramePeerGone: 32B peer key + 1 byte reason
+  // Read and discard payload for now
+  if (len > 0 && len < RECV_BUFFER_SIZE) {
+    this->read_frame_payload_(this->recv_buffer_, len);
+  }
   ESP_LOGD(TAG, "← Peer gone notification");
   return true;
 }
 
-bool DerpClient::handle_ping_() {
-  DerpFrameType type;
-  uint32_t len;
-
+bool DerpClient::handle_ping_(uint32_t len) {
   // Header already read, expect 8 byte ping data
   if (len != 8) {
     ESP_LOGW(TAG, "Invalid ping length: %d", len);

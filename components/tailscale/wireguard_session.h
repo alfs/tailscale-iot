@@ -128,24 +128,12 @@ class WireGuardSession {
   bool handle_handshake_response_(const uint8_t* msg, size_t len);
   bool handle_transport_data_(const uint8_t* msg, size_t len);
 
-  // Handshake message generation
-  bool build_handshake_initiation_(uint8_t* out_msg);
-  bool build_handshake_response_(uint8_t* out_msg);
-
-  // Transport encryption/decryption
-  bool encrypt_transport_data_(const uint8_t* plaintext, size_t plain_len,
-                               uint8_t* ciphertext, size_t* cipher_len);
-  bool decrypt_transport_data_(const uint8_t* ciphertext, size_t cipher_len,
-                               uint8_t* plaintext, size_t* plain_len);
-
-  // Noise protocol wrapper functions
-  bool perform_noise_handshake_();
-  bool derive_transport_keys_();
+  // WireGuard library structures (opaque pointers - definitions in cpp)
+  void* wg_device_{nullptr};
+  void* wg_peer_{nullptr};
 
   // Cryptographic state
   uint8_t our_private_[32];      // Our WireGuard private key
-  uint8_t our_public_[32];       // Our WireGuard public key (derived)
-  uint8_t peer_public_[32];      // Peer's WireGuard public key
   uint8_t preshared_key_[32];    // Pre-shared key (optional)
   bool has_preshared_key_{false};
 
@@ -153,18 +141,9 @@ class WireGuardSession {
   WgState state_{WgState::IDLE};
   bool we_are_initiator_{false}; // Track our role in handshake
 
-  // Transport encryption keys (derived from handshake)
-  uint8_t tx_key_[32];           // Key for encrypting outgoing packets
-  uint8_t rx_key_[32];           // Key for decrypting incoming packets
-  uint64_t tx_nonce_{0};         // Send counter (replay protection)
-  uint64_t rx_nonce_{0};         // Receive counter (replay protection)
-
-  // Handshake ephemeral state
-  uint32_t our_index_{0};        // Our sender index (random)
-  uint32_t peer_index_{0};       // Peer's sender index (from response)
-  uint8_t ephemeral_private_[32]; // Ephemeral DH private key
-  uint8_t ephemeral_public_[32];  // Ephemeral DH public key
-  uint8_t handshake_hash_[32];   // Running hash for handshake
+  // Transport encryption keys (managed by wg_peer_->curr_keypair)
+  uint8_t tx_key_[32];           // Backup/compatibility
+  uint8_t rx_key_[32];           // Backup/compatibility
 
   // Callbacks
   WgDecryptCallback decrypt_cb_;

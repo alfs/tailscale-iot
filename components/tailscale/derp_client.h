@@ -91,10 +91,10 @@ class DerpClient {
   // Protocol handlers
   bool handle_server_key_();
   bool handle_server_info_();
-  bool handle_recv_packet_();
-  bool handle_peer_present_();
-  bool handle_peer_gone_();
-  bool handle_ping_();
+  bool handle_recv_packet_(uint32_t len);
+  bool handle_peer_present_(uint32_t len);
+  bool handle_peer_gone_(uint32_t len);
+  bool handle_ping_(uint32_t len);
   bool handle_keep_alive_();
 
   // Send protocol messages

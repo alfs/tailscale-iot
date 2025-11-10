@@ -12,6 +12,7 @@
 #include "map_payload.h"
 #include "hostinfo_builder.h"
 #include "derp_client.h"
+#include "wireguard_session.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -19,8 +20,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-// WireGuard removed - using DERP-only mode due to esp_netif incompatibility
-// Direct esp_wireguard usage causes NULL pointer crashes in lwIP callbacks
+// WireGuardSession adapter: Uses esp_wireguard library WITHOUT creating netif
+// Avoids NULL pointer crashes by routing packets through unified socket/DERP
 
 namespace esphome {
 namespace tailscale {
@@ -182,6 +183,7 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<Ts2021Transport> ts2021_transport_;
   std::unique_ptr<Ts2021Upgrade> upgrade_channel_;
   std::unique_ptr<DerpClient> derp_client_;
+  std::unique_ptr<WireGuardSession> wg_session_;
   // derp_initialized_ removed - now using static variable in handle_fetching_map_state_() for true persistence
 
   // Endpoint discovery and advertisement
