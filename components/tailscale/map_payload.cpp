@@ -13,6 +13,7 @@ std::string render_map_request(const MapPayload &payload) {
   if (!payload.disco_key.empty()) {
     oss << "\"DiscoKey\":\"" << payload.disco_key << "\",";
   }
+  // Endpoints are included as a separate top-level field
   if (!payload.endpoints.empty()) {
     oss << "\"Endpoints\":[";
     for (size_t i = 0; i < payload.endpoints.size(); i++) {
@@ -22,19 +23,10 @@ std::string render_map_request(const MapPayload &payload) {
       }
     }
     oss << "],";
-
-    // Also send NetInfo which Headscale uses to store endpoints
-    oss << "\"NetInfo\":{";
-    oss << "\"MappingVariesByDestIP\":false,";
-    oss << "\"HairPinning\":false,";
-    oss << "\"WorkingIPv4\":true,";
-    oss << "\"WorkingIPv6\":false,";
-    // Report configured DERP region as our preferred relay
-    // This tells Headscale which DERP server we're connected to
-    oss << "\"PreferredDERP\":" << payload.preferred_derp << ",";
-    oss << "\"LinkType\":\"wired\"";
-    oss << "},";
   }
+
+  // Hostinfo now contains NetInfo nested inside (not as a separate top-level field)
+  // This is critical for Headscale to properly populate the Relay field
   oss << "\"Hostinfo\":" << payload.hostinfo_json << ',';
   oss << "\"Stream\":" << (payload.stream ? "true" : "false") << ',';
   if (payload.keep_alive) {

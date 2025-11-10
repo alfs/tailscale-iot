@@ -308,18 +308,7 @@ void TailscaleComponent::handle_fetching_map_state_() {
   ESP_LOGI(TAG, "→ Discovering local endpoints...");
   this->discover_local_endpoints_();
 
-  // Perform STUN discovery to get external endpoint
-  ESP_LOGI(TAG, "→ Discovering our public endpoint via STUN (before map request)...");
-  if (this->perform_stun_query_()) {
-    ESP_LOGI(TAG, "✓ Discovered external endpoint: %s", this->discovered_endpoint_.c_str());
-    // Update discovered_endpoints_ with new external endpoint
-    this->discover_local_endpoints_();  // Refresh with both local + external
-    ESP_LOGI(TAG, "  Endpoints will be included in initial map request");
-  } else {
-    ESP_LOGW(TAG, "STUN query failed - only local endpoint available");
-  }
-
-  // Now fetch map WITH endpoint included in the request
+  // Fetch map FIRST to get DERP server information (needed for STUN query)
   if (!this->fetch_map_response_()) {
     ESP_LOGE(TAG, "Failed to fetch map");
     delay(2000);  // 2 second delay after failure
@@ -404,10 +393,96 @@ void TailscaleComponent::handle_fetching_map_state_() {
              this->derp_client_.get());
   }
 
-  // WireGuard removed - operating in DERP-only mode due to esp_netif incompatibility
-  // Direct esp_wireguard caused crashes in lwIP netif callbacks expecting esp_netif handles
-  ESP_LOGI(TAG, "→ DERP-only mode: skipping WireGuard configuration");
-  ESP_LOGI(TAG, "   ✓ Control plane and DERP ready for peer-to-peer communication");
+  // Initialize WireGuard session for encrypted peer-to-peer communication
+  // Using WireGuardSession adapter to avoid esp_netif crashes - routes through unified socket/DERP
+  if (!this->node_config_.peers.empty()) {
+    ESP_LOGI(TAG, "→ Initializing WireGuard session with first peer...");
+
+    // Decode our node private key (WireGuard uses node_key, not machine_key)
+    ESP_LOGD(TAG, "  Our node private key length: %zu", this->node_key_private_.size());
+    std::string our_priv_raw = this->base64_decode(this->node_key_private_);
+    ESP_LOGD(TAG, "  Decoded our private key: %zu bytes", our_priv_raw.size());
+
+    // Get first peer's public key from map response
+    const auto& peer = this->node_config_.peers[0];
+    ESP_LOGD(TAG, "  Peer public key length: %zu", peer.public_key.size());
+    ESP_LOGD(TAG, "  Peer public key raw: %s", peer.public_key.c_str());
+
+    // Strip "nodekey:" prefix if present (Tailscale keys have prefixes)
+    std::string peer_pub_key = peer.public_key;
+    if (peer_pub_key.find("nodekey:") == 0) {
+      peer_pub_key = peer_pub_key.substr(8);  // Remove "nodekey:" prefix
+      ESP_LOGD(TAG, "  Stripped 'nodekey:' prefix, remaining: %s", peer_pub_key.c_str());
+    }
+
+    std::string peer_pub_raw = this->hex_decode(peer_pub_key);
+    ESP_LOGD(TAG, "  Decoded peer public key: %zu bytes", peer_pub_raw.size());
+
+    if (our_priv_raw.size() != 32 || peer_pub_raw.size() != 32) {
+      ESP_LOGE(TAG, "✗ Invalid key sizes (our_priv=%zu, peer_pub=%zu)",
+               our_priv_raw.size(), peer_pub_raw.size());
+    } else {
+      // Create WireGuard session
+      this->wg_session_ = std::make_unique<WireGuardSession>();
+
+      if (this->wg_session_->init((const uint8_t*)our_priv_raw.data(),
+                                   (const uint8_t*)peer_pub_raw.data(),
+                                   nullptr)) {  // No preshared key for Tailscale
+
+        // Set up send callback - route WireGuard packets via DERP
+        this->wg_session_->set_send_callback([this](const uint8_t* packet, size_t len) {
+          if (this->derp_client_ && !this->node_config_.peers.empty()) {
+            // Send via DERP to peer's node public key
+            const auto& peer = this->node_config_.peers[0];
+            std::string peer_pub_key = peer.public_key;
+            // Strip "nodekey:" prefix if present
+            if (peer_pub_key.find("nodekey:") == 0) {
+              peer_pub_key = peer_pub_key.substr(8);
+            }
+            std::string peer_key_raw = this->hex_decode(peer_pub_key);
+            if (peer_key_raw.size() == 32) {
+              this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
+              ESP_LOGD(TAG, "→ Sent WireGuard packet via DERP (%zu bytes)", len);
+            } else {
+              ESP_LOGE(TAG, "✗ Invalid peer key size for DERP send: %zu", peer_key_raw.size());
+            }
+          }
+        });
+
+        // Set up decrypt callback - handle decrypted IP packets
+        this->wg_session_->set_decrypt_callback([this](const uint8_t* ip_packet, size_t len) {
+          ESP_LOGI(TAG, "← Decrypted IP packet (%zu bytes)", len);
+          // Check if it's an ICMP packet (IP protocol 1)
+          if (len >= 20 && ip_packet[9] == 1) {
+            ESP_LOGI(TAG, "   ✓ ICMP packet received!");
+            // TODO: Send ICMP reply if it's a ping request
+          }
+        });
+
+        // Start WireGuard handshake
+        if (this->wg_session_->start_handshake()) {
+          ESP_LOGI(TAG, "✓ WireGuard session initialized, handshake initiated");
+        } else {
+          ESP_LOGW(TAG, "Failed to start WireGuard handshake");
+        }
+      } else {
+        ESP_LOGE(TAG, "Failed to initialize WireGuard session");
+        this->wg_session_.reset();
+      }
+    }
+  } else {
+    ESP_LOGW(TAG, "No peers available - skipping WireGuard initialization");
+  }
+
+  // Perform STUN discovery NOW that we have DERP server info from the map
+  ESP_LOGI(TAG, "→ Discovering our public endpoint via STUN (using DERP server)...");
+  if (this->perform_stun_query_()) {
+    ESP_LOGI(TAG, "✓ Discovered external endpoint: %s", this->discovered_endpoint_.c_str());
+    // Update discovered_endpoints_ with new external endpoint
+    this->discover_local_endpoints_();  // Refresh with both local + external
+  } else {
+    ESP_LOGW(TAG, "STUN query failed - using only local endpoints");
+  }
 
   this->transition_to(TailscaleState::CONNECTED);
   this->retry_count_ = 0;
@@ -1274,23 +1349,17 @@ bool TailscaleComponent::perform_registration_() {
   ESP_LOGD(TAG, "Machine key: %s...", reg_payload.machine_key.substr(0, 20).c_str());
   ESP_LOGD(TAG, "Node key: %s...", reg_payload.node_key.substr(0, 20).c_str());
 
-  // Build host info
+  // Build host info with NetInfo inside (not as a separate top-level field)
+  // This is critical for Headscale to properly populate the Relay field
   HostinfoConfig hostinfo;
   hostinfo.hostname = this->device_name_;
   hostinfo.os = "esphome";
   hostinfo.os_version = "2025.6.1";
   hostinfo.go_arch = "riscv32";  // ESP32-C3 is RISC-V
+  hostinfo.preferred_derp = this->preferred_derp_;  // Include DERP region inside Hostinfo
+  hostinfo.include_netinfo = true;                   // Enable NetInfo inside Hostinfo
 
   reg_payload.hostinfo_json = build_hostinfo_json(hostinfo);
-
-  // CRITICAL: Include DERP region preference in registration
-  // Normal Tailscale clients send this in MapRequest after registration,
-  // but ESP32 closes control plane immediately to save memory (~70KB for TLS+HTTP/2).
-  // We never send the follow-up MapRequest, so Headscale wouldn't know we're available via DERP.
-  // Workaround: Include Endpoints and PreferredDERP directly in RegisterRequest.
-  // Endpoints array can be empty (no direct connectivity), but PreferredDERP tells Headscale
-  // that we're reachable via DERP Region 28.
-  reg_payload.preferred_derp = this->preferred_derp_;
 
   std::string payload_json = render_register_request(reg_payload);
   print_chunked(TAG, "Registration request JSON", payload_json.c_str(), payload_json.length());
@@ -1392,12 +1461,14 @@ bool TailscaleComponent::fetch_map_response_() {
   }
   map_payload.disco_key = "discokey:" + disco_key_hex;
 
-  // Build host info
+  // Build host info with NetInfo inside (not as a separate top-level field)
   HostinfoConfig hostinfo;
   hostinfo.hostname = this->device_name_;
   hostinfo.os = "esphome";
   hostinfo.os_version = "2025.6.1";
   hostinfo.go_arch = "riscv32";
+  hostinfo.preferred_derp = this->preferred_derp_;  // Include DERP region inside Hostinfo
+  hostinfo.include_netinfo = true;                   // Enable NetInfo inside Hostinfo
 
   map_payload.hostinfo_json = build_hostinfo_json(hostinfo);
   map_payload.stream = true;        // Must be true to receive initial map response and updates
@@ -3259,19 +3330,29 @@ bool TailscaleComponent::perform_stun_query_() {
 
   // Socket is already non-blocking from setup_unified_socket_()
 
-  // TODO: The DERP server's STUN has issues, using Google's public STUN for now
-  // In the future, we should use the DERP server from DERPMap (this->static_map_.derp_host)
-  // with the STUNPort from the map (this->static_map_.stun_port, defaults to 3478)
-
   struct sockaddr_in stun_addr{};
   stun_addr.sin_family = AF_INET;
 
-  // Using Google's public STUN server temporarily
-  const char* stun_server = "stun.l.google.com";
-  uint16_t stun_port = 19302;  // Google's STUN port
-  stun_addr.sin_port = htons(stun_port);
+  // Use DERP server's STUN if available from DERPMap, otherwise fall back to Google
+  const char* stun_server = nullptr;
+  uint16_t stun_port = 0;
 
-  ESP_LOGD(TAG, "Using Google STUN server (temporary): %s:%d", stun_server, stun_port);
+  if (this->static_map_.derp_host[0] != '\0') {
+    // Use DERP server's STUN from DERPMap
+    stun_server = this->static_map_.derp_host;
+    stun_port = this->static_map_.stun_port;
+    if (stun_port == 0) {
+      stun_port = 3478;  // Default STUN port
+    }
+    ESP_LOGI(TAG, "Using DERP server STUN: %s:%d", stun_server, stun_port);
+  } else {
+    // Fall back to Google's public STUN server
+    stun_server = "stun.l.google.com";
+    stun_port = 19302;
+    ESP_LOGW(TAG, "No DERP server in map, using Google STUN (fallback): %s:%d", stun_server, stun_port);
+  }
+
+  stun_addr.sin_port = htons(stun_port);
 
   struct hostent *server = gethostbyname(stun_server);
   if (server == nullptr) {
@@ -3380,8 +3461,85 @@ bool TailscaleComponent::perform_stun_query_() {
   if (msg_type != STUN_BINDING_RESPONSE) {
     ESP_LOGE(TAG, "Unexpected STUN message type: 0x%04x (expected 0x%04x)",
              msg_type, STUN_BINDING_RESPONSE);
-    close(sock);
-    return false;
+
+    // If we tried DERP STUN and it failed, fall back to Google STUN
+    if (this->static_map_.derp_host[0] != '\0' && strcmp(stun_server, this->static_map_.derp_host) == 0) {
+      ESP_LOGW(TAG, "DERP STUN failed with invalid response, retrying with Google STUN...");
+
+      // Retry with Google STUN
+      stun_server = "stun.l.google.com";
+      stun_port = 19302;
+      stun_addr.sin_port = htons(stun_port);
+
+      server = gethostbyname(stun_server);
+      if (server == nullptr) {
+        ESP_LOGE(TAG, "Failed to resolve fallback STUN server %s", stun_server);
+        return false;
+      }
+
+      memcpy(&stun_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+      ESP_LOGI(TAG, "Fallback STUN request to %s:%d", stun_server, stun_port);
+
+      // Build new STUN request with new transaction ID
+      memset(stun_request, 0, sizeof(stun_request));
+      stun_request[0] = 0x00;
+      stun_request[1] = 0x01;
+      stun_request[2] = 0x00;
+      stun_request[3] = 0x00;
+      stun_request[4] = (STUN_MAGIC_COOKIE >> 24) & 0xFF;
+      stun_request[5] = (STUN_MAGIC_COOKIE >> 16) & 0xFF;
+      stun_request[6] = (STUN_MAGIC_COOKIE >> 8) & 0xFF;
+      stun_request[7] = STUN_MAGIC_COOKIE & 0xFF;
+      for (int i = 0; i < 12; i++) {
+        stun_request[8 + i] = esp_random() % 256;
+      }
+
+      // Send fallback request
+      sent = sendto(sock, stun_request, sizeof(stun_request), 0,
+                    (struct sockaddr *)&stun_addr, sizeof(stun_addr));
+      if (sent < 0) {
+        ESP_LOGE(TAG, "Failed to send fallback STUN request: %d", errno);
+        return false;
+      }
+
+      // Wait for fallback response
+      FD_ZERO(&readfds);
+      FD_SET(sock, &readfds);
+      timeout.tv_sec = 2;
+      timeout.tv_usec = 0;
+      ret = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+
+      if (ret <= 0) {
+        ESP_LOGW(TAG, "Fallback STUN query timeout");
+        return false;
+      }
+
+      // Read fallback response
+      received = recvfrom(sock, response, sizeof(response), 0,
+                         (struct sockaddr *)&response_addr, &addr_len);
+      if (received < 20) {
+        ESP_LOGE(TAG, "Invalid fallback STUN response (too short)");
+        return false;
+      }
+
+      ESP_LOGI(TAG, "✓ Fallback STUN response received (%d bytes from %s:%d):",
+               received, inet_ntoa(response_addr.sin_addr), ntohs(response_addr.sin_port));
+
+      // Re-parse the fallback response
+      msg_type = (response[0] << 8) | response[1];
+      msg_len = (response[2] << 8) | response[3];
+
+      ESP_LOGI(TAG, "  Fallback Type: 0x%04x, Length: %d bytes", msg_type, msg_len);
+
+      if (msg_type != STUN_BINDING_RESPONSE) {
+        ESP_LOGE(TAG, "Fallback STUN also failed: unexpected message type 0x%04x", msg_type);
+        return false;
+      }
+    } else {
+      // Already using Google STUN or no DERP available, no fallback possible
+      return false;
+    }
   }
 
   // Parse attributes to find XOR-MAPPED-ADDRESS
@@ -3624,12 +3782,16 @@ bool TailscaleComponent::send_map_keepalive_() {
   }
   map_payload.disco_key = "discokey:" + disco_key_hex;
 
-  // Build minimal hostinfo for keepalive
+  // Build hostinfo with NetInfo inside (not as a separate top-level field)
+  // This is critical for Headscale to properly populate the Relay field
   HostinfoConfig hostinfo;
   hostinfo.hostname = this->device_name_;
   hostinfo.os = "esphome";
   hostinfo.os_version = "2025.6.1";
   hostinfo.go_arch = "riscv32";
+  hostinfo.preferred_derp = this->preferred_derp_;  // Include DERP region inside Hostinfo
+  hostinfo.include_netinfo = true;                   // Enable NetInfo inside Hostinfo
+
   map_payload.hostinfo_json = build_hostinfo_json(hostinfo);
 
   // CRITICAL: Set KeepAlive to true for keepalive requests
@@ -3908,10 +4070,13 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
              packet[0], packet[1], packet[2], packet[3], len);
   }
 
-  // MINIMAL TEST: If this is a WireGuard packet, we've proven DERP routing works!
-  if (len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
-    ESP_LOGI(TAG, "  ✅ RECEIVED WIREGUARD PACKET VIA DERP!");
-    ESP_LOGI(TAG, "  Next step: Implement WireGuard protocol to process it");
+  // Route WireGuard packets to WireGuardSession
+  if (this->wg_session_ && len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
+    ESP_LOGI(TAG, "  ← Routing WireGuard packet to session");
+    if (!this->wg_session_->receive_wg_packet(packet, len)) {
+      ESP_LOGW(TAG, "  Failed to process WireGuard packet");
+    }
+    return;
   }
 
 #ifdef USE_WIREGUARD
