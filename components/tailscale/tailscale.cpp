@@ -459,12 +459,9 @@ void TailscaleComponent::handle_fetching_map_state_() {
           }
         });
 
-        // Start WireGuard handshake
-        if (this->wg_session_->start_handshake()) {
-          ESP_LOGI(TAG, "✓ WireGuard session initialized, handshake initiated");
-        } else {
-          ESP_LOGW(TAG, "Failed to start WireGuard handshake");
-        }
+        // NOTE: Handshake will be sent AFTER DERP connects (see handle_connected_state_)
+        // Starting handshake immediately here caused "Cannot send packet - not connected" errors
+        ESP_LOGI(TAG, "✓ WireGuard session initialized, waiting for DERP connection");
       } else {
         ESP_LOGE(TAG, "Failed to initialize WireGuard session");
         this->wg_session_.reset();
@@ -569,14 +566,33 @@ void TailscaleComponent::handle_connected_state_() {
 
   if (!skip_derp_for_keepalives) {
     // OLD BEHAVIOR: Try DERP connection (will fail with OOM if control plane is alive)
-    if (this->derp_client_ && !this->derp_client_->is_ready()) {
+    if (this->derp_client_) {
+      // Step 1: Initiate connection if disconnected
       if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
         ESP_LOGI(TAG, "Connecting to DERP relay...");
         if (this->derp_client_->connect()) {
-        ESP_LOGI(TAG, "✓ DERP relay connected");
+          ESP_LOGI(TAG, "✓ DERP connection initiated (handshake in progress)");
+        } else {
+          ESP_LOGW(TAG, "Failed to initiate DERP connection");
+        }
+      }
 
-        // Start UDP relay for WireGuard → DERP packet forwarding
-        this->start_udp_relay_();
+      // Step 2: Check if DERP is fully READY before sending WireGuard handshake
+      // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
+      // Must wait for DERP handshake to complete before sending WireGuard packets
+      if (this->derp_client_->is_ready() && !this->wg_handshake_sent_) {
+        // DERP is now fully authenticated and ready to send packets
+        if (this->wg_session_) {
+          if (this->wg_session_->start_handshake()) {
+            ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP");
+            this->wg_handshake_sent_ = true;
+
+            // Start UDP relay for WireGuard → DERP packet forwarding
+            this->start_udp_relay_();
+          } else {
+            ESP_LOGW(TAG, "Failed to start WireGuard handshake");
+          }
+        }
 
         // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
         // Server already knows ESP32 prefers DERP 28 from initial map request
@@ -596,9 +612,6 @@ void TailscaleComponent::handle_connected_state_() {
         //     ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
         //   }
         // }
-        } else {
-          ESP_LOGW(TAG, "Failed to connect to DERP relay");
-        }
       }
     }
   } else {

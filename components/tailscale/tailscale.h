@@ -206,6 +206,7 @@ class TailscaleComponent : public PollingComponent {
   int udp_relay_socket_{-1};  // Socket listening on port 51821 for WireGuard packets
   uint8_t wg_peer_node_key_[32]{};  // Binary node key of the WireGuard peer (for DERP send_packet)
   bool wg_peer_node_key_valid_{false};  // Whether we have a valid peer node key
+  bool wg_handshake_sent_{false};  // Track if WireGuard handshake has been sent (only send once per session)
   void start_udp_relay_();  // Initialize UDP relay socket
   void process_udp_relay_();  // Check for and forward packets (non-blocking)
   void stop_udp_relay_();  // Clean up UDP relay resources

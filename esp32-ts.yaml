@@ -47,6 +47,7 @@ wifi:
 logger:
   #level: INFO
   level: DEBUG
+  #level: VERBOSE
 
 # Time source (required)
 time:
@@ -66,9 +67,9 @@ tailscale:
   device_name: "esp"
   time_id: sntp_time
   # wireguard_id: wg_iface  # Removed - Tailscale now manages WireGuard directly
-  update_interval: 2s  # Reduced from 5s to 2s for faster reconnection checks
+  update_interval: 5s  # Reduced from 5s to 2s for faster reconnection checks
   allowed_peers: !secret allowed_peers
-  preferred_derp: 999
+  preferred_derp: 666
 
 # WireGuard component removed - Tailscale manages WireGuard directly via esp_wireguard API
 # This avoids "netif already added" conflict
