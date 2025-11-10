@@ -103,6 +103,17 @@ class WireGuardSession {
   bool send_ip_packet(const uint8_t* ip_packet, size_t len);
 
   /**
+   * @brief Send WireGuard keepalive packet
+   *
+   * Sends empty transport data packet to maintain session and signal readiness.
+   * According to WireGuard protocol, the initiator should send a keepalive
+   * after handshake completion to confirm session establishment.
+   *
+   * @return true if keepalive sent successfully
+   */
+  bool send_keepalive();
+
+  /**
    * @brief Set callback for decrypted IP packets
    */
   void set_decrypt_callback(WgDecryptCallback cb) { this->decrypt_cb_ = cb; }
