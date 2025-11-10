@@ -452,10 +452,106 @@ void TailscaleComponent::handle_fetching_map_state_() {
         // Set up decrypt callback - handle decrypted IP packets
         this->wg_session_->set_decrypt_callback([this](const uint8_t* ip_packet, size_t len) {
           ESP_LOGI(TAG, "← Decrypted IP packet (%zu bytes)", len);
-          // Check if it's an ICMP packet (IP protocol 1)
-          if (len >= 20 && ip_packet[9] == 1) {
-            ESP_LOGI(TAG, "   ✓ ICMP packet received!");
-            // TODO: Send ICMP reply if it's a ping request
+
+          // Validate minimum IP header size
+          if (len < 20) {
+            ESP_LOGW(TAG, "Packet too small for IP header");
+            return;
+          }
+
+          // Extract IP header fields
+          uint8_t ip_version = (ip_packet[0] >> 4) & 0x0F;
+          uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;  // IHL in bytes
+          uint8_t ip_protocol = ip_packet[9];
+
+          // Verify IPv4
+          if (ip_version != 4) {
+            ESP_LOGD(TAG, "Not IPv4 (version=%d), ignoring", ip_version);
+            return;
+          }
+
+          // Check if it's ICMP (protocol 1)
+          if (ip_protocol != 1) {
+            ESP_LOGD(TAG, "Not ICMP (protocol=%d), ignoring", ip_protocol);
+            return;
+          }
+
+          // Validate ICMP header size
+          if (len < ip_ihl + 8) {
+            ESP_LOGW(TAG, "Packet too small for ICMP header");
+            return;
+          }
+
+          // Extract ICMP header
+          const uint8_t* icmp_header = ip_packet + ip_ihl;
+          uint8_t icmp_type = icmp_header[0];
+          uint8_t icmp_code = icmp_header[1];
+
+          ESP_LOGI(TAG, "   ✓ ICMP packet: type=%d code=%d", icmp_type, icmp_code);
+
+          // Handle ICMP Echo Request (type 8)
+          if (icmp_type == 8 && icmp_code == 0) {
+            ESP_LOGI(TAG, "   → Received ICMP Echo Request, sending Echo Reply...");
+
+            // Build ICMP Echo Reply packet
+            uint8_t reply[1500];  // Max MTU
+            size_t reply_len = len;
+
+            if (reply_len > sizeof(reply)) {
+              ESP_LOGW(TAG, "Packet too large to reply (%zu > %zu)", reply_len, sizeof(reply));
+              return;
+            }
+
+            // Copy original packet
+            memcpy(reply, ip_packet, len);
+
+            // Swap IP addresses (source ← → destination)
+            uint32_t temp_ip;
+            memcpy(&temp_ip, &reply[12], 4);  // Save source IP
+            memcpy(&reply[12], &reply[16], 4);  // Dest → Source
+            memcpy(&reply[16], &temp_ip, 4);  // Source → Dest
+
+            // Update IP header checksum (zero it first for calculation)
+            reply[10] = 0;
+            reply[11] = 0;
+            uint16_t ip_checksum = 0;
+            for (size_t i = 0; i < ip_ihl; i += 2) {
+              uint16_t word = (reply[i] << 8) | reply[i + 1];
+              uint32_t sum = ip_checksum + word;
+              ip_checksum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            ip_checksum = ~ip_checksum;
+            reply[10] = ip_checksum >> 8;
+            reply[11] = ip_checksum & 0xFF;
+
+            // Change ICMP type to Echo Reply (0)
+            reply[ip_ihl] = 0;
+
+            // Recalculate ICMP checksum
+            reply[ip_ihl + 2] = 0;  // Zero checksum field
+            reply[ip_ihl + 3] = 0;
+            size_t icmp_len = len - ip_ihl;
+            uint16_t icmp_checksum = 0;
+            for (size_t i = 0; i < icmp_len; i += 2) {
+              uint16_t word;
+              if (i + 1 < icmp_len) {
+                word = (reply[ip_ihl + i] << 8) | reply[ip_ihl + i + 1];
+              } else {
+                word = reply[ip_ihl + i] << 8;  // Last odd byte
+              }
+              uint32_t sum = icmp_checksum + word;
+              icmp_checksum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            icmp_checksum = ~icmp_checksum;
+            reply[ip_ihl + 2] = icmp_checksum >> 8;
+            reply[ip_ihl + 3] = icmp_checksum & 0xFF;
+
+            // Send reply via WireGuard
+            if (this->wg_session_->send_ip_packet(reply, reply_len)) {
+              ESP_LOGI(TAG, "   ✓ Sent ICMP Echo Reply (%zu bytes)", reply_len);
+            } else {
+              ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply");
+            }
           }
         });
 
@@ -4128,6 +4224,21 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
 #else
   // DERP-only mode: Handle ICMP echo requests directly
   // WireGuard packets are IP packets, check if it's ICMP echo (type 8)
+
+  // CRITICAL FIX: Check for Disco packets BEFORE IPv4 check
+  // Disco packets start with "TS💬" magic (0x54 0x53 0xf0 0x9f)
+  // Without this check, they fail IPv4 validation: (0x54 >> 4) = 5 → "version 5"
+  if (len >= 6 && packet[0] == 0x54 && packet[1] == 0x53 &&
+      packet[2] == 0xf0 && packet[3] == 0x9f) {
+    ESP_LOGI(TAG, "  ← Routing Disco packet via DERP to Disco handler (%d bytes)", len);
+    // Create fake source address using peer's first 4 bytes as IP
+    struct sockaddr_in fake_src = {};
+    fake_src.sin_family = AF_INET;
+    memcpy(&fake_src.sin_addr.s_addr, peer_key, 4);
+    fake_src.sin_port = htons(41641);  // Typical Disco port
+    this->handle_disco_packet_(const_cast<uint8_t*>(packet), len, &fake_src);
+    return;
+  }
 
   if (len < 20) {
     ESP_LOGW(TAG, "Packet too small to be IP (%d bytes)", len);
