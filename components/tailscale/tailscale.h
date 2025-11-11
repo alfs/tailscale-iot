@@ -186,6 +186,16 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<WireGuardSession> wg_session_;
   // derp_initialized_ removed - now using static variable in handle_fetching_map_state_() for true persistence
 
+  // WireGuard packet buffer to handle race condition (packets arrive before session ready)
+  struct BufferedPacket {
+    uint8_t data[1500];  // Max Ethernet MTU
+    size_t len;
+    uint32_t timestamp;
+  };
+  std::vector<BufferedPacket> wg_packet_buffer_;
+  static const size_t MAX_BUFFERED_PACKETS = 5;
+  void process_buffered_wg_packets_();
+
   // Endpoint discovery and advertisement
   std::string discovered_endpoint_;  // Our public IP:port (STUN-discovered)
   std::string ttl_discovered_endpoint_;  // Endpoint discovered via TTL probe (correct for peer traffic)

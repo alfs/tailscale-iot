@@ -279,9 +279,45 @@ bool WireGuardSession::handle_handshake_initiation_(const uint8_t* msg, size_t l
     return false;
   }
 
-  // Tailscale typically has the peer initiate, so we'd be responder
-  // For now, log and return false - implement if needed
-  ESP_LOGW(TAG, "Handshake initiation from peer (responder mode not yet implemented)");
+  if (!this->wg_device_ || !this->wg_peer_) {
+    ESP_LOGE(TAG, "WireGuard not initialized");
+    return false;
+  }
+
+  ESP_LOGI(TAG, "← Received handshake initiation from peer");
+
+  // CRITICAL: esp_wireguard library (v0.4.2) does NOT support responder mode
+  // The library only has initiator-side functions:
+  //   - wireguard_create_handshake_initiation()
+  //   - wireguard_process_handshake_response()
+  // There is NO function to process incoming initiations as a responder.
+  //
+  // However, in Tailscale's design, both peers act as initiators simultaneously.
+  // This is called "racing initiators" - both try to establish the tunnel, and
+  // whichever completes first wins.
+  //
+  // When we receive a handshake initiation, it means the peer is also trying to
+  // establish the tunnel. The correct response is to ALSO send our own handshake
+  // initiation. The WireGuard protocol handles concurrent initiations gracefully.
+
+  // If we're not already initiating, start our own handshake
+  if (this->state_ == WgState::IDLE || this->state_ == WgState::ERROR) {
+    ESP_LOGI(TAG, "Responding with our own handshake initiation (racing initiators)");
+    return this->start_handshake();
+  }
+
+  // If we're already initiating, just log and wait for the response
+  if (this->state_ == WgState::INITIATING) {
+    ESP_LOGD(TAG, "Already initiating handshake, waiting for response");
+    return true;  // Not an error
+  }
+
+  // If session is already established, log but don't reset it
+  if (this->state_ == WgState::ESTABLISHED) {
+    ESP_LOGD(TAG, "Session already established, ignoring redundant initiation");
+    return true;
+  }
+
   return false;
 }
 

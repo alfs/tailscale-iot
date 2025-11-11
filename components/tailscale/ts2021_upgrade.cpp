@@ -31,7 +31,7 @@ static const char *const TAG = "tailscale.ts2021.upgrade";
 static uint8_t g_ws_payload_buffer[8192];
 
 namespace {
-constexpr uint32_t kDefaultTimeoutMs = 5000;
+constexpr uint32_t kDefaultTimeoutMs = 500;  // Reduced from 5000ms for faster packet processing
 
 bool parse_host_port(const std::string &authority, std::string &host_out, uint16_t &port_out) {
   auto colon = authority.find(':');

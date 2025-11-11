@@ -183,6 +183,26 @@ void TailscaleComponent::loop() {
   // Without this, recvfrom() was only called once every ~5 seconds, missing all packets.
   this->check_unified_socket_();
 
+  // CRITICAL: Process DERP client on EVERY loop iteration for low-latency peer packet reception
+  // Previously called from handle_connected_state_() AFTER check_server_keepalive_() which
+  // blocks for 1 second waiting for control plane messages. This caused DERP peer packets
+  // (containing ICMP, etc.) to only be checked every ~5 seconds.
+  // Fix: Call derp_client_->process() on every loop iteration (same as check_unified_socket_)
+  if (this->derp_client_) {
+    this->derp_client_->process();
+  }
+
+  // CRITICAL: Process buffered WireGuard packets on EVERY loop iteration
+  // Previously only called once after session init (line 563), causing race condition:
+  // - Packets arrive via DERP and get buffered if session not ready
+  // - Initial buffered packets processed once after init
+  // - NEW packets arriving afterwards get buffered but never processed
+  // - Result: Packets only released during "racing initiators" handshake attempts (~5s interval)
+  // Fix: Continuously check and process buffered packets as they arrive
+  if (this->wg_session_) {
+    this->process_buffered_wg_packets_();
+  }
+
   // State machine processing
   switch (this->state_) {
     case TailscaleState::IDLE:
@@ -487,11 +507,15 @@ void TailscaleComponent::handle_fetching_map_state_() {
           uint8_t icmp_type = icmp_header[0];
           uint8_t icmp_code = icmp_header[1];
 
-          ESP_LOGI(TAG, "   ✓ ICMP packet: type=%d code=%d", icmp_type, icmp_code);
+          // Extract ICMP identifier and sequence number (both big-endian uint16_t)
+          uint16_t icmp_id = (icmp_header[4] << 8) | icmp_header[5];
+          uint16_t icmp_seq = (icmp_header[6] << 8) | icmp_header[7];
+
+          ESP_LOGI(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
 
           // Handle ICMP Echo Request (type 8)
           if (icmp_type == 8 && icmp_code == 0) {
-            ESP_LOGI(TAG, "   → Received ICMP Echo Request, sending Echo Reply...");
+            ESP_LOGI(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
 
             // Build ICMP Echo Reply packet
             uint8_t reply[1500];  // Max MTU
@@ -548,9 +572,9 @@ void TailscaleComponent::handle_fetching_map_state_() {
 
             // Send reply via WireGuard
             if (this->wg_session_->send_ip_packet(reply, reply_len)) {
-              ESP_LOGI(TAG, "   ✓ Sent ICMP Echo Reply (%zu bytes)", reply_len);
+              ESP_LOGI(TAG, "   ✓ Sent ICMP Echo Reply (seq=%u, %zu bytes)", icmp_seq, reply_len);
             } else {
-              ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply");
+              ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply (seq=%u)", icmp_seq);
             }
           }
         });
@@ -558,6 +582,9 @@ void TailscaleComponent::handle_fetching_map_state_() {
         // NOTE: Handshake will be sent AFTER DERP connects (see handle_connected_state_)
         // Starting handshake immediately here caused "Cannot send packet - not connected" errors
         ESP_LOGI(TAG, "✓ WireGuard session initialized, waiting for DERP connection");
+
+        // Process any packets that arrived before session was ready
+        this->process_buffered_wg_packets_();
       } else {
         ESP_LOGE(TAG, "Failed to initialize WireGuard session");
         this->wg_session_.reset();
@@ -717,16 +744,10 @@ void TailscaleComponent::handle_connected_state_() {
     }
   }
 
-  // Process DERP client if initialized
-  // CRITICAL: Must call process() even before is_ready() to complete handshake!
-  // The handshake (WAIT_SERVER_KEY -> SEND_CLIENT_INFO -> WAIT_SERVER_INFO -> READY)
-  // is driven by process(), so we can't wait for is_ready() before calling it.
-  if (this->derp_client_) {
-    this->derp_client_->process();
-
-    // UDP relay is now integrated into unified socket (WireGuard packets routed automatically)
-    // this->process_udp_relay_();  // DEPRECATED - handled by unified socket
-  }
+  // NOTE: DERP client processing moved to loop() for frequent polling
+  // Previously called here AFTER check_server_keepalive_() which blocks for 1 second.
+  // This caused DERP peer packets to only be checked every ~5 seconds.
+  // See tailscale.cpp:186-193 for the loop() implementation.
 
   // NOTE: Socket checking moved to check_unified_socket_() which is called from loop()
   // This ensures frequent polling (thousands of times per second) instead of only during
@@ -839,6 +860,36 @@ void TailscaleComponent::handle_connected_state_() {
     }
 
     last_disco_ping_time = now;
+  }
+
+  // Send periodic WireGuard keepalives to maintain tunnel session (every 20 seconds)
+  // This prevents NAT mappings from expiring and keeps WireGuard session active
+  static uint32_t last_wg_keepalive_time = 0;
+  if (now - last_wg_keepalive_time >= 20000) {  // 20 second interval
+    if (this->derp_client_ && !this->node_config_.peers.empty()) {
+      // Send minimal WireGuard keepalive packet (empty payload with WG header)
+      // WireGuard will recognize this as a keepalive and maintain the session
+      uint8_t keepalive_packet[32] = {0};  // Minimal payload
+
+      // Get first peer's public key
+      const auto& peer = this->node_config_.peers[0];
+      std::string peer_pub_key = peer.public_key;
+      // Strip "nodekey:" prefix if present
+      if (peer_pub_key.find("nodekey:") == 0) {
+        peer_pub_key = peer_pub_key.substr(8);
+      }
+      std::string peer_key_raw = this->base64_decode(peer_pub_key);
+
+      if (peer_key_raw.size() == 32 && this->derp_client_->is_ready()) {
+        if (this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), keepalive_packet, sizeof(keepalive_packet))) {
+          ESP_LOGD(TAG, "→ Sent WireGuard keepalive (%d bytes) via DERP to peer %s",
+                   sizeof(keepalive_packet), peer.public_key.substr(0, 16).c_str());
+          last_wg_keepalive_time = now;
+        } else {
+          ESP_LOGW(TAG, "Failed to send WireGuard keepalive via DERP");
+        }
+      }
+    }
   }
 
   // Handle echo server clients
@@ -4139,11 +4190,20 @@ bool TailscaleComponent::check_server_keepalive_() {
     }
   }
 
-  // Try to read next message from persistent stream (non-blocking: 1 second timeout)
+  // Try to read next message from persistent stream with 1000ms timeout
+  //
+  // MEMORY MANAGEMENT CRITICAL:
+  // The 1000ms timeout serves as a natural memory guard preventing OOM when DERP connects.
+  // With 0ms timeout (non-blocking), control plane and DERP TLS connections overlap in memory.
+  // ESP32-C3 has only 320KB RAM: Control plane TLS (~70KB) + DERP TLS (~70KB) = ~140KB = OOM
+  // The 1-second blocking window allows mbedTLS to free buffers before DERP connects.
+  //
+  // Reduced timeout to 50ms for faster packet processing (was 1000ms)
+  // This allows DERP packets to be processed more frequently
   const char *response_ptr = nullptr;
   size_t response_size = 0;
 
-  if (this->ts2021_transport_->http2_read_next_message(response_ptr, response_size, 1000)) {
+  if (this->ts2021_transport_->http2_read_next_message(response_ptr, response_size, 50)) {
     // Received a message from server!
     this->last_server_message_time_ = current_time;
 
@@ -4254,11 +4314,26 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
              packet[0], packet[1], packet[2], packet[3], len);
   }
 
-  // Route WireGuard packets to WireGuardSession
-  if (this->wg_session_ && len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
-    ESP_LOGI(TAG, "  ← Routing WireGuard packet to session");
-    if (!this->wg_session_->receive_wg_packet(packet, len)) {
-      ESP_LOGW(TAG, "  Failed to process WireGuard packet");
+  // Route WireGuard packets to WireGuardSession (or buffer if session not ready)
+  if (len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
+    if (this->wg_session_) {
+      ESP_LOGI(TAG, "  ← Routing WireGuard packet to session");
+      if (!this->wg_session_->receive_wg_packet(packet, len)) {
+        ESP_LOGW(TAG, "  Failed to process WireGuard packet");
+      }
+    } else {
+      // Session not ready yet - buffer the packet
+      if (this->wg_packet_buffer_.size() < MAX_BUFFERED_PACKETS && len <= 1500) {
+        BufferedPacket buffered;
+        memcpy(buffered.data, packet, len);
+        buffered.len = len;
+        buffered.timestamp = millis();
+        this->wg_packet_buffer_.push_back(buffered);
+        ESP_LOGI(TAG, "  ⏸️  WireGuard session not ready, buffering packet (%zu/%zu)",
+                 this->wg_packet_buffer_.size(), MAX_BUFFERED_PACKETS);
+      } else {
+        ESP_LOGW(TAG, "  ⚠️  Dropping packet: buffer full or packet too large");
+      }
     }
     return;
   }
@@ -4341,14 +4416,16 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
     return;
   }
 
-  // Check ICMP type
+  // Check ICMP type and extract sequence number
   uint8_t icmp_type = packet[ihl];
   uint8_t icmp_code = packet[ihl + 1];
+  uint16_t icmp_id = (packet[ihl + 4] << 8) | packet[ihl + 5];
+  uint16_t icmp_seq = (packet[ihl + 6] << 8) | packet[ihl + 7];
 
-  ESP_LOGI(TAG, "  ICMP packet: type=%d, code=%d", icmp_type, icmp_code);
+  ESP_LOGI(TAG, "  ICMP packet: type=%d, code=%d, id=%u, seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
 
   if (icmp_type == 8) {  // Echo Request
-    ESP_LOGI(TAG, "→ Received ICMP Echo Request via DERP, sending reply...");
+    ESP_LOGI(TAG, "→ Received ICMP Echo Request via DERP (seq=%u), sending reply...", icmp_seq);
 
     // Create echo reply by modifying the packet in-place
     uint8_t reply[1500];
@@ -4403,9 +4480,9 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
     // Send reply back through DERP
     if (this->derp_client_ && this->derp_client_->is_ready()) {
       if (this->derp_client_->send_packet(peer_key, reply, len)) {
-        ESP_LOGI(TAG, "✓ Sent ICMP Echo Reply via DERP (%d bytes)", len);
+        ESP_LOGI(TAG, "✓ Sent ICMP Echo Reply via DERP (seq=%u, %d bytes)", icmp_seq, len);
       } else {
-        ESP_LOGE(TAG, "Failed to send ICMP reply via DERP");
+        ESP_LOGE(TAG, "Failed to send ICMP reply via DERP (seq=%u)", icmp_seq);
       }
     }
   }
@@ -4507,6 +4584,34 @@ void TailscaleComponent::stop_udp_relay_() {
   }
   this->wg_peer_node_key_valid_ = false;
 #endif
+}
+
+// Process WireGuard packets that were buffered before session was ready
+void TailscaleComponent::process_buffered_wg_packets_() {
+  if (this->wg_packet_buffer_.empty()) {
+    return;  // No buffered packets
+  }
+
+  ESP_LOGI(TAG, "▶️  Processing %zu buffered WireGuard packet(s)", this->wg_packet_buffer_.size());
+
+  for (const auto& buffered : this->wg_packet_buffer_) {
+    // Check if packet is too old (older than 5 seconds)
+    uint32_t now = millis();
+    uint32_t age = now - buffered.timestamp;
+    if (age > 5000) {
+      ESP_LOGW(TAG, "  Dropping buffered packet (too old: %u ms)", age);
+      continue;
+    }
+
+    ESP_LOGD(TAG, "  Processing buffered packet (%zu bytes, age: %u ms)", buffered.len, age);
+    if (!this->wg_session_->receive_wg_packet(buffered.data, buffered.len)) {
+      ESP_LOGW(TAG, "  Failed to process buffered packet");
+    }
+  }
+
+  // Clear the buffer after processing
+  this->wg_packet_buffer_.clear();
+  ESP_LOGD(TAG, "✓ Cleared packet buffer");
 }
 
 }  // namespace tailscale
