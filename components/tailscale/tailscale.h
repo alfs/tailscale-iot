@@ -236,6 +236,34 @@ class TailscaleComponent : public PollingComponent {
   // Keepalive
   bool send_map_keepalive_();  // Send periodic keepalive map request with endpoints
   bool check_server_keepalive_();  // Check for incoming server keepalive messages
+
+  // TCP Echo Service (port 7777)
+  enum class TcpState {
+    CLOSED,
+    SYN_RECEIVED,
+    ESTABLISHED,
+    FIN_WAIT
+  };
+
+  struct TcpConnection {
+    uint32_t src_ip{0};
+    uint16_t src_port{0};
+    uint32_t seq{0};          // Our sequence number
+    uint32_t ack{0};          // Expected next byte from peer
+    TcpState state{TcpState::CLOSED};
+    std::vector<uint8_t> rx_buffer;  // Receive buffer until newline
+    uint32_t last_activity{0};
+  };
+
+  static const uint16_t TCP_ECHO_PORT = 7777;
+  static const size_t MAX_TCP_CONNECTIONS = 4;
+  std::vector<TcpConnection> tcp_connections_;
+
+  void handle_tcp_packet_(const uint8_t* ip_packet, size_t len);
+  void send_tcp_packet_(const TcpConnection& conn, uint8_t flags, const uint8_t* payload, size_t payload_len);
+  TcpConnection* find_tcp_connection_(uint32_t src_ip, uint16_t src_port);
+  uint16_t calculate_tcp_checksum_(const uint8_t* ip_header, const uint8_t* tcp_header, size_t tcp_len);
+  uint16_t calculate_ip_checksum_(const uint8_t* ip_header, size_t header_len);
 };
 
 }  // namespace tailscale

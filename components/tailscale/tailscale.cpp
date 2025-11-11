@@ -490,9 +490,15 @@ void TailscaleComponent::handle_fetching_map_state_() {
             return;
           }
 
-          // Check if it's ICMP (protocol 1)
-          if (ip_protocol != 1) {
-            ESP_LOGD(TAG, "Not ICMP (protocol=%d), ignoring", ip_protocol);
+          // Handle ICMP (protocol 1) or TCP (protocol 6)
+          if (ip_protocol == 1) {
+            // ICMP handling (existing code below)
+          } else if (ip_protocol == 6) {
+            // TCP handling
+            this->handle_tcp_packet_(ip_packet, len);
+            return;
+          } else {
+            ESP_LOGD(TAG, "Unsupported protocol=%d, ignoring", ip_protocol);
             return;
           }
 
@@ -2479,14 +2485,20 @@ void TailscaleComponent::check_icmp_responses_() {
       if (this->nat_discovery_state_.current_ttl == 1) {
         ESP_LOGI(TAG, "✅ Got NAT port from first hop (NAT router internal: %s)", src_ip);
         ESP_LOGI(TAG, "  NAT-assigned port: %u", nat_port);
-        ESP_LOGI(TAG, "  Complete endpoint: %s:%u (STUN IP + TTL=1 port)",
-                 stun_ip_str.c_str(), nat_port);
 
-        // Store the TTL-discovered endpoint for use in keepalive advertisements
-        char endpoint_str[64];
-        snprintf(endpoint_str, sizeof(endpoint_str), "%s:%u", stun_ip_str.c_str(), nat_port);
-        this->ttl_discovered_endpoint_ = std::string(endpoint_str);
-        ESP_LOGI(TAG, "✅ Stored TTL-discovered endpoint: %s", this->ttl_discovered_endpoint_.c_str());
+        // Only create TTL-discovered endpoint if we have a valid STUN IP
+        if (!stun_ip_str.empty()) {
+          ESP_LOGI(TAG, "  Complete endpoint: %s:%u (STUN IP + TTL=1 port)",
+                   stun_ip_str.c_str(), nat_port);
+
+          // Store the TTL-discovered endpoint for use in keepalive advertisements
+          char endpoint_str[64];
+          snprintf(endpoint_str, sizeof(endpoint_str), "%s:%u", stun_ip_str.c_str(), nat_port);
+          this->ttl_discovered_endpoint_ = std::string(endpoint_str);
+          ESP_LOGI(TAG, "✅ Stored TTL-discovered endpoint: %s", this->ttl_discovered_endpoint_.c_str());
+        } else {
+          ESP_LOGW(TAG, "⚠️ Cannot create TTL endpoint - STUN IP not yet discovered");
+        }
 
         // Discovery complete! Send disco ping with discovered port knowledge
         this->nat_discovery_state_.discovered_port = nat_port;
@@ -4404,8 +4416,13 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
     return;
   }
 
-  if (ip_protocol != 1) {  // ICMP
-    ESP_LOGD(TAG, "Not ICMP packet (protocol=%d), ignoring in DERP-only mode", ip_protocol);
+  // Handle ICMP (protocol 1) or TCP (protocol 6)
+  if (ip_protocol == 6) {  // TCP
+    ESP_LOGI(TAG, "  ← Routing TCP packet to handler (%d bytes)", len);
+    this->handle_tcp_packet_(packet, len);
+    return;
+  } else if (ip_protocol != 1) {  // Not ICMP or TCP
+    ESP_LOGD(TAG, "Not ICMP/TCP packet (protocol=%d), ignoring in DERP-only mode", ip_protocol);
     return;
   }
 
@@ -4612,6 +4629,321 @@ void TailscaleComponent::process_buffered_wg_packets_() {
   // Clear the buffer after processing
   this->wg_packet_buffer_.clear();
   ESP_LOGD(TAG, "✓ Cleared packet buffer");
+}
+
+// ============================================================================
+// TCP Echo Service (Port 7777)
+// ============================================================================
+
+TailscaleComponent::TcpConnection* TailscaleComponent::find_tcp_connection_(uint32_t src_ip, uint16_t src_port) {
+  for (auto& conn : this->tcp_connections_) {
+    if (conn.src_ip == src_ip && conn.src_port == src_port && conn.state != TcpState::CLOSED) {
+      return &conn;
+    }
+  }
+  return nullptr;
+}
+
+uint16_t TailscaleComponent::calculate_ip_checksum_(const uint8_t* ip_header, size_t header_len) {
+  uint32_t sum = 0;
+  for (size_t i = 0; i < header_len; i += 2) {
+    sum += (ip_header[i] << 8) | ip_header[i + 1];
+  }
+  while (sum >> 16) {
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  }
+  return ~sum;
+}
+
+uint16_t TailscaleComponent::calculate_tcp_checksum_(const uint8_t* ip_header, const uint8_t* tcp_header, size_t tcp_len) {
+  // TCP checksum includes pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + protocol(1) + tcp_len(2)
+  uint32_t sum = 0;
+
+  // Source IP (bytes 12-15 of IP header)
+  sum += (ip_header[12] << 8) | ip_header[13];
+  sum += (ip_header[14] << 8) | ip_header[15];
+
+  // Dest IP (bytes 16-19 of IP header)
+  sum += (ip_header[16] << 8) | ip_header[17];
+  sum += (ip_header[18] << 8) | ip_header[19];
+
+  // Protocol (6 for TCP) and TCP length
+  sum += 6;  // TCP protocol
+  sum += tcp_len;
+
+  // TCP header + data
+  for (size_t i = 0; i < tcp_len; i += 2) {
+    if (i + 1 < tcp_len) {
+      sum += (tcp_header[i] << 8) | tcp_header[i + 1];
+    } else {
+      sum += tcp_header[i] << 8;
+    }
+  }
+
+  // Fold 32-bit sum to 16 bits
+  while (sum >> 16) {
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  }
+
+  return ~sum;
+}
+
+void TailscaleComponent::send_tcp_packet_(const TcpConnection& conn, uint8_t flags, const uint8_t* payload, size_t payload_len) {
+  // Build IP + TCP packet
+  const size_t ip_header_len = 20;
+  const size_t tcp_header_len = 20;
+  const size_t total_len = ip_header_len + tcp_header_len + payload_len;
+
+  uint8_t packet[1500];
+  if (total_len > sizeof(packet)) {
+    ESP_LOGW(TAG, "TCP packet too large: %zu bytes", total_len);
+    return;
+  }
+
+  memset(packet, 0, total_len);
+
+  // Build IP header
+  packet[0] = 0x45;  // Version 4, IHL 5
+  packet[1] = 0x00;  // DSCP/ECN
+  packet[2] = (total_len >> 8) & 0xFF;
+  packet[3] = total_len & 0xFF;
+  packet[4] = 0x00;  // ID
+  packet[5] = 0x00;
+  packet[6] = 0x40;  // Flags: Don't Fragment
+  packet[7] = 0x00;
+  packet[8] = 64;    // TTL
+  packet[9] = 6;     // Protocol: TCP
+  // Checksum at bytes 10-11 (set later)
+
+  // Our IP (destination in original packet = source in reply)
+  // Extract from node config
+  std::string our_ip = this->node_config_.ipv4_address;
+  if (our_ip.find('/') != std::string::npos) {
+    our_ip = our_ip.substr(0, our_ip.find('/'));
+  }
+
+  // Parse our IP
+  uint32_t ip_parts[4];
+  sscanf(our_ip.c_str(), "%u.%u.%u.%u", &ip_parts[0], &ip_parts[1], &ip_parts[2], &ip_parts[3]);
+  packet[12] = ip_parts[0];
+  packet[13] = ip_parts[1];
+  packet[14] = ip_parts[2];
+  packet[15] = ip_parts[3];
+
+  // Dest IP (from connection)
+  packet[16] = (conn.src_ip >> 24) & 0xFF;
+  packet[17] = (conn.src_ip >> 16) & 0xFF;
+  packet[18] = (conn.src_ip >> 8) & 0xFF;
+  packet[19] = conn.src_ip & 0xFF;
+
+  // Calculate IP checksum
+  uint16_t ip_checksum = this->calculate_ip_checksum_(packet, ip_header_len);
+  packet[10] = (ip_checksum >> 8) & 0xFF;
+  packet[11] = ip_checksum & 0xFF;
+
+  // Build TCP header
+  uint8_t* tcp = packet + ip_header_len;
+  tcp[0] = (TCP_ECHO_PORT >> 8) & 0xFF;  // Source port
+  tcp[1] = TCP_ECHO_PORT & 0xFF;
+  tcp[2] = (conn.src_port >> 8) & 0xFF;  // Dest port
+  tcp[3] = conn.src_port & 0xFF;
+
+  // Sequence number
+  tcp[4] = (conn.seq >> 24) & 0xFF;
+  tcp[5] = (conn.seq >> 16) & 0xFF;
+  tcp[6] = (conn.seq >> 8) & 0xFF;
+  tcp[7] = conn.seq & 0xFF;
+
+  // ACK number
+  tcp[8] = (conn.ack >> 24) & 0xFF;
+  tcp[9] = (conn.ack >> 16) & 0xFF;
+  tcp[10] = (conn.ack >> 8) & 0xFF;
+  tcp[11] = conn.ack & 0xFF;
+
+  // Data offset (5 words = 20 bytes) + flags
+  tcp[12] = 0x50;  // Data offset: 5 * 4 = 20 bytes
+  tcp[13] = flags;  // Flags: SYN, ACK, FIN, etc.
+
+  // Window size
+  tcp[14] = 0x20;  // 8192 bytes
+  tcp[15] = 0x00;
+
+  // Checksum (bytes 16-17, set later)
+  // Urgent pointer
+  tcp[18] = 0x00;
+  tcp[19] = 0x00;
+
+  // Copy payload if present
+  if (payload_len > 0 && payload != nullptr) {
+    memcpy(tcp + tcp_header_len, payload, payload_len);
+  }
+
+  // Calculate TCP checksum
+  uint16_t tcp_checksum = this->calculate_tcp_checksum_(packet, tcp, tcp_header_len + payload_len);
+  tcp[16] = (tcp_checksum >> 8) & 0xFF;
+  tcp[17] = tcp_checksum & 0xFF;
+
+  // Send via WireGuard
+  if (this->wg_session_) {
+    ESP_LOGI(TAG, "→ Sending TCP packet: flags=0x%02x, seq=%u, ack=%u, payload=%zu bytes",
+             flags, conn.seq, conn.ack, payload_len);
+    this->wg_session_->send_ip_packet(packet, total_len);
+  }
+}
+
+void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len) {
+  // Parse IP header
+  uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;
+  if (len < ip_ihl + 20) {
+    ESP_LOGW(TAG, "TCP packet too small");
+    return;
+  }
+
+  // Extract source IP
+  uint32_t src_ip = (ip_packet[12] << 24) | (ip_packet[13] << 16) |
+                    (ip_packet[14] << 8) | ip_packet[15];
+
+  // Parse TCP header
+  const uint8_t* tcp = ip_packet + ip_ihl;
+  uint16_t src_port = (tcp[0] << 8) | tcp[1];
+  uint16_t dst_port = (tcp[2] << 8) | tcp[3];
+  uint32_t seq = (tcp[4] << 24) | (tcp[5] << 16) | (tcp[6] << 8) | tcp[7];
+  uint32_t ack = (tcp[8] << 24) | (tcp[9] << 16) | (tcp[10] << 8) | tcp[11];
+  uint8_t data_offset = (tcp[12] >> 4) * 4;
+  uint8_t flags = tcp[13];
+
+  // Check if it's for our echo port
+  if (dst_port != TCP_ECHO_PORT) {
+    ESP_LOGD(TAG, "TCP packet not for echo port (dst=%u)", dst_port);
+    return;
+  }
+
+  ESP_LOGI(TAG, "← TCP packet: src=%u.%u.%u.%u:%u, flags=0x%02x, seq=%u, ack=%u",
+           (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+           (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port, flags, seq, ack);
+
+  // Extract payload
+  size_t payload_len = len - ip_ihl - data_offset;
+  const uint8_t* payload = (payload_len > 0) ? (tcp + data_offset) : nullptr;
+
+  ESP_LOGD(TAG, "TCP payload: len=%zu, ip_ihl=%u, tcp_data_offset=%u, payload_len=%zu",
+           len, ip_ihl, data_offset, payload_len);
+
+  // Find or create connection
+  TcpConnection* conn = this->find_tcp_connection_(src_ip, src_port);
+
+  // Handle SYN (new connection)
+  if ((flags & 0x02) && !(flags & 0x10)) {  // SYN without ACK
+    ESP_LOGI(TAG, "→ TCP SYN received, sending SYN-ACK");
+
+    // Find or create connection slot
+    if (!conn) {
+      if (this->tcp_connections_.size() < MAX_TCP_CONNECTIONS) {
+        TcpConnection new_conn;
+        new_conn.src_ip = src_ip;
+        new_conn.src_port = src_port;
+        new_conn.seq = (esp_random() % 90000) + 10000;  // Initial sequence number
+        new_conn.ack = seq + 1;  // ACK their SYN
+        new_conn.state = TcpState::SYN_RECEIVED;
+        new_conn.last_activity = millis();
+        this->tcp_connections_.push_back(new_conn);
+        conn = &this->tcp_connections_.back();
+      } else {
+        ESP_LOGW(TAG, "Too many TCP connections, dropping SYN");
+        return;
+      }
+    } else {
+      conn->ack = seq + 1;
+      conn->state = TcpState::SYN_RECEIVED;
+    }
+
+    // Send SYN-ACK
+    this->send_tcp_packet_(*conn, 0x12, nullptr, 0);  // SYN + ACK
+    conn->seq++;  // SYN consumes one sequence number
+    return;
+  }
+
+  if (!conn) {
+    ESP_LOGD(TAG, "TCP packet for unknown connection, ignoring");
+    return;
+  }
+
+  // Update last activity
+  conn->last_activity = millis();
+
+  // Handle ACK (final handshake or data ACK)
+  if (flags & 0x10) {  // ACK flag
+    if (conn->state == TcpState::SYN_RECEIVED) {
+      ESP_LOGI(TAG, "→ TCP connection established");
+      conn->state = TcpState::ESTABLISHED;
+    }
+  }
+
+  // Handle data
+  ESP_LOGD(TAG, "Checking for data: payload_len=%zu, state=%d (ESTABLISHED=%d)",
+           payload_len, (int)conn->state, (int)TcpState::ESTABLISHED);
+  if (payload_len > 0 && conn->state == TcpState::ESTABLISHED) {
+    ESP_LOGI(TAG, "← Received %zu bytes of data", payload_len);
+
+    // Log received data as hex
+    ESP_LOGI(TAG, "   Data (hex): %02x %02x %02x %02x %02x %02x %02x %02x",
+             payload[0], payload[1], payload[2], payload[3],
+             payload[4], payload[5], payload[6], payload[7]);
+
+    // Add to receive buffer
+    conn->rx_buffer.insert(conn->rx_buffer.end(), payload, payload + payload_len);
+    conn->ack = seq + payload_len;  // Update ACK
+
+    ESP_LOGI(TAG, "   Buffer now has %zu bytes", conn->rx_buffer.size());
+
+    // Check for newline
+    auto newline_pos = std::find(conn->rx_buffer.begin(), conn->rx_buffer.end(), '\n');
+    if (newline_pos != conn->rx_buffer.end()) {
+      // Echo the line back (including newline)
+      size_t line_len = newline_pos - conn->rx_buffer.begin() + 1;
+      ESP_LOGI(TAG, "→ Echoing %zu bytes back", line_len);
+
+      this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), line_len);  // PSH + ACK
+      conn->seq += line_len;
+
+      // Remove echoed data from buffer
+      conn->rx_buffer.erase(conn->rx_buffer.begin(), newline_pos + 1);
+    } else {
+      // Just ACK the data
+      this->send_tcp_packet_(*conn, 0x10, nullptr, 0);  // ACK
+    }
+  }
+
+  // Handle FIN (connection close)
+  if (flags & 0x01) {  // FIN flag
+    ESP_LOGI(TAG, "→ TCP FIN received, closing connection");
+
+    // Before closing, check if there's any pending data in the buffer to echo
+    if (!conn->rx_buffer.empty()) {
+      ESP_LOGI(TAG, "→ Processing %zu bytes of buffered data before closing", conn->rx_buffer.size());
+
+      // Check for newline in buffer
+      auto newline_pos = std::find(conn->rx_buffer.begin(), conn->rx_buffer.end(), '\n');
+      if (newline_pos != conn->rx_buffer.end()) {
+        // Echo complete line
+        size_t line_len = newline_pos - conn->rx_buffer.begin() + 1;
+        ESP_LOGI(TAG, "→ Echoing %zu bytes before close", line_len);
+        this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), line_len);  // PSH + ACK
+        conn->seq += line_len;
+      } else {
+        // No newline - echo what we have
+        ESP_LOGI(TAG, "→ Echoing %zu bytes (no newline) before close", conn->rx_buffer.size());
+        this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), conn->rx_buffer.size());  // PSH + ACK
+        conn->seq += conn->rx_buffer.size();
+      }
+
+      conn->rx_buffer.clear();
+    }
+
+    conn->ack = seq + 1;
+    this->send_tcp_packet_(*conn, 0x11, nullptr, 0);  // FIN + ACK
+    conn->state = TcpState::CLOSED;
+  }
 }
 
 }  // namespace tailscale
