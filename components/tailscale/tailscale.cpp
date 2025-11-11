@@ -4822,12 +4822,14 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
            (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
            (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port, flags, seq, ack);
 
-  // Extract payload
-  size_t payload_len = len - ip_ihl - data_offset;
+  // Extract payload - use IP Total Length field to avoid counting padding
+  // IP Total Length is at bytes 2-3 of IP header
+  uint16_t ip_total_len = (ip_packet[2] << 8) | ip_packet[3];
+  size_t payload_len = ip_total_len - ip_ihl - data_offset;
   const uint8_t* payload = (payload_len > 0) ? (tcp + data_offset) : nullptr;
 
-  ESP_LOGD(TAG, "TCP payload: len=%zu, ip_ihl=%u, tcp_data_offset=%u, payload_len=%zu",
-           len, ip_ihl, data_offset, payload_len);
+  ESP_LOGD(TAG, "TCP payload: buffer_len=%zu, ip_total_len=%u, ip_ihl=%u, tcp_data_offset=%u, payload_len=%zu",
+           len, ip_total_len, ip_ihl, data_offset, payload_len);
 
   // Find or create connection
   TcpConnection* conn = this->find_tcp_connection_(src_ip, src_port);
@@ -4883,18 +4885,34 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
   ESP_LOGD(TAG, "Checking for data: payload_len=%zu, state=%d (ESTABLISHED=%d)",
            payload_len, (int)conn->state, (int)TcpState::ESTABLISHED);
   if (payload_len > 0 && conn->state == TcpState::ESTABLISHED) {
-    ESP_LOGI(TAG, "← Received %zu bytes of data", payload_len);
+    ESP_LOGI(TAG, "← Received %zu bytes of data at seq=%u (expecting seq=%u)",
+             payload_len, seq, conn->ack);
 
-    // Log received data as hex
-    ESP_LOGI(TAG, "   Data (hex): %02x %02x %02x %02x %02x %02x %02x %02x",
-             payload[0], payload[1], payload[2], payload[3],
-             payload[4], payload[5], payload[6], payload[7]);
+    // TCP deduplication: Only process if this is new data at the expected sequence
+    if (seq == conn->ack) {
+      // Log received data as hex
+      if (payload_len >= 8) {
+        ESP_LOGI(TAG, "   Data (hex): %02x %02x %02x %02x %02x %02x %02x %02x",
+                 payload[0], payload[1], payload[2], payload[3],
+                 payload[4], payload[5], payload[6], payload[7]);
+      }
 
-    // Add to receive buffer
-    conn->rx_buffer.insert(conn->rx_buffer.end(), payload, payload + payload_len);
-    conn->ack = seq + payload_len;  // Update ACK
+      // Add to receive buffer
+      conn->rx_buffer.insert(conn->rx_buffer.end(), payload, payload + payload_len);
+      conn->ack = seq + payload_len;  // Update ACK
 
-    ESP_LOGI(TAG, "   Buffer now has %zu bytes", conn->rx_buffer.size());
+      ESP_LOGI(TAG, "   Buffer now has %zu bytes, next expected seq=%u",
+               conn->rx_buffer.size(), conn->ack);
+    } else if (seq < conn->ack) {
+      // Retransmission of data we already have - just re-ACK
+      ESP_LOGW(TAG, "   Duplicate data (seq=%u < expected=%u), re-ACKing", seq, conn->ack);
+      this->send_tcp_packet_(*conn, 0x10, nullptr, 0);  // ACK
+      return;  // Don't process duplicate data
+    } else {
+      // Future data (out of order) - not expected in our simple implementation
+      ESP_LOGW(TAG, "   Out-of-order data (seq=%u > expected=%u), ignoring", seq, conn->ack);
+      return;
+    }
 
     // Check for newline
     auto newline_pos = std::find(conn->rx_buffer.begin(), conn->rx_buffer.end(), '\n');
@@ -4916,7 +4934,7 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
 
   // Handle FIN (connection close)
   if (flags & 0x01) {  // FIN flag
-    ESP_LOGI(TAG, "→ TCP FIN received, closing connection");
+    ESP_LOGI(TAG, "→ TCP FIN received (seq=%u), closing connection", seq);
 
     // Before closing, check if there's any pending data in the buffer to echo
     if (!conn->rx_buffer.empty()) {
@@ -4940,9 +4958,28 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
       conn->rx_buffer.clear();
     }
 
-    conn->ack = seq + 1;
+    // ACK the FIN (FIN consumes one sequence number)
+    // Only update ack if this FIN is at or after the expected sequence
+    if (seq >= conn->ack) {
+      conn->ack = seq + 1;
+    }
+    // If seq < conn->ack, it's a retransmitted FIN, keep current ack
+
     this->send_tcp_packet_(*conn, 0x11, nullptr, 0);  // FIN + ACK
     conn->state = TcpState::CLOSED;
+  }
+
+  // Cleanup closed connections
+  auto it = this->tcp_connections_.begin();
+  while (it != this->tcp_connections_.end()) {
+    if (it->state == TcpState::CLOSED) {
+      ESP_LOGI(TAG, "→ Cleaning up closed TCP connection from %u.%u.%u.%u:%u",
+               (it->src_ip >> 24) & 0xFF, (it->src_ip >> 16) & 0xFF,
+               (it->src_ip >> 8) & 0xFF, it->src_ip & 0xFF, it->src_port);
+      it = this->tcp_connections_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
