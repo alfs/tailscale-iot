@@ -2760,9 +2760,84 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
       ESP_LOGI(TAG, "  ✓ Disco PONG received from %s:%u", src_ip, src_port);
       this->handle_disco_pong_(src_ip, src_port);
       break;
-    case 3:  // CALL_ME_MAYBE
-      ESP_LOGI(TAG, "  → Disco CALL_ME_MAYBE received (not implemented)");
+    case 3: {  // CALL_ME_MAYBE
+      ESP_LOGI(TAG, "  → Disco CALL_ME_MAYBE received");
+
+      // Payload starts at plaintext[2] (after type and version)
+      size_t payload_len = encrypted_len - crypto_box_MACBYTES - 2;
+
+      // Each endpoint is 18 bytes: 16 bytes IPv6 address + 2 bytes port
+      if (payload_len % 18 != 0) {
+        ESP_LOGW(TAG, "  ⚠️ Invalid CALL_ME_MAYBE payload length: %zu (not multiple of 18)", payload_len);
+        break;
+      }
+
+      size_t num_endpoints = payload_len / 18;
+      ESP_LOGI(TAG, "  Found %zu endpoint(s) in CALL_ME_MAYBE", num_endpoints);
+
+      // Convert sender's disco key to hex format
+      char sender_disco_hex[65];  // 32 bytes = 64 hex chars + null terminator
+      for (int i = 0; i < 32; i++) {
+        snprintf(&sender_disco_hex[i * 2], 3, "%02x", sender_disco_pubkey[i]);
+      }
+      sender_disco_hex[64] = '\0';
+
+      std::string sender_disco_key_str = std::string("discokey:") + sender_disco_hex;
+      ESP_LOGD(TAG, "  Sender disco key: %s", sender_disco_key_str.c_str());
+
+      // Find the sender in our peer list
+      PeerInfo* sender_peer = nullptr;
+      for (auto& peer : this->node_config_.peers) {
+        if (peer.disco_key == sender_disco_key_str) {
+          sender_peer = &peer;
+          ESP_LOGI(TAG, "  ✓ Found sender peer: %s", peer.hostname.c_str());
+          break;
+        }
+      }
+
+      if (!sender_peer) {
+        ESP_LOGW(TAG, "  ⚠️ Sender not found in peer list");
+        break;
+      }
+
+      // Parse and send disco PINGs to each endpoint
+      for (size_t i = 0; i < num_endpoints; i++) {
+        const uint8_t* endpoint_data = &plaintext[2 + i * 18];
+
+        // IPv6 address is 16 bytes
+        const uint8_t* ip_bytes = endpoint_data;
+
+        // Port is last 2 bytes (big-endian)
+        uint16_t port = (endpoint_data[16] << 8) | endpoint_data[17];
+
+        // Check if this is an IPv4-mapped IPv6 address (::ffff:a.b.c.d)
+        bool is_ipv4_mapped = true;
+        for (int j = 0; j < 10; j++) {
+          if (ip_bytes[j] != 0) {
+            is_ipv4_mapped = false;
+            break;
+          }
+        }
+        if (is_ipv4_mapped && (ip_bytes[10] != 0xff || ip_bytes[11] != 0xff)) {
+          is_ipv4_mapped = false;
+        }
+
+        if (is_ipv4_mapped) {
+          // Extract IPv4 address from last 4 bytes
+          char ip_str[INET_ADDRSTRLEN];
+          snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
+                   ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]);
+
+          ESP_LOGI(TAG, "    Endpoint %zu: %s:%u", i + 1, ip_str, port);
+
+          // Send disco PING to this endpoint
+          this->send_disco_ping_(std::string(ip_str), port, sender_disco_key_str);
+        } else {
+          ESP_LOGD(TAG, "    Endpoint %zu: Non-IPv4 address (skipped)", i + 1);
+        }
+      }
       break;
+    }
     default:
       ESP_LOGW(TAG, "  Unknown Disco message type: %u", msg_type);
       break;

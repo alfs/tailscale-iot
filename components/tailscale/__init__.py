@@ -104,7 +104,14 @@ async def to_code(config):
         cg.add_build_flag("-DNOISE_USE_BLAKE2S=1")           # Required for Tailscale TS2021
         cg.add_build_flag("-DNOISE_USE_REFERENCE_BACKEND=1")  # Required for BLAKE2s (not in libsodium)
         cg.add_build_flag("-DNOISE_USE_LIBSODIUM=1")         # Use libsodium for Curve25519 & ChaCha20-Poly1305
-        
+
+        # Selectively disable reference backend implementations to avoid conflicts with libsodium
+        cg.add_build_flag("-DNOISE_USE_REFERENCE_CHACHA=0")     # Use libsodium ChaCha20 instead
+        cg.add_build_flag("-DNOISE_USE_REFERENCE_POLY1305=0")   # Use libsodium Poly1305 instead
+        cg.add_build_flag("-DNOISE_USE_REFERENCE_SHA256=0")     # Use libsodium SHA256 instead
+        cg.add_build_flag("-DNOISE_USE_REFERENCE_BLAKE2S=1")    # Only use reference BLAKE2s (not in libsodium)
+        cg.add_build_flag("-DNOISE_USE_CUSTOM_RAND=1")          # Use custom esp_fill_random implementation
+
         # Legacy defines for compatibility
         cg.add_build_flag("-DUSE_LIBSODIUM=1")
         cg.add_build_flag("-DUSE_SODIUM=1")
