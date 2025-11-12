@@ -20,9 +20,12 @@
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
 #include <esp_crt_bundle.h>
 #endif
+#include <mbedtls/error.h>
 
 // For ESP32 hardware random number generator
 #include <esp_random.h>
+#include <esp_system.h>
+#include <esp_heap_caps.h>
 
 namespace esphome {
 namespace tailscale {
@@ -330,10 +333,86 @@ bool DerpClient::do_tls_handshake_() {
     ESP_LOGE(TAG, "   → Return code: %d", ret);
     ESP_LOGE(TAG, "   → Target: %s:%d", this->server_host_.c_str(), this->server_port_);
 
+    // Check current heap status to detect OOM
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    ESP_LOGE(TAG, "   → Free heap: %zu bytes (minimum was: %zu bytes)", free_heap, min_free_heap);
+
     // Get error from last operation
     esp_err_t err = esp_tls_get_conn_state(tls, nullptr);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "   → Connection state error: %s (0x%x)", esp_err_to_name(err), err);
+    }
+
+    // Check if this looks like an OOM condition
+    // mbedtls_ssl_setup error -0x7F00 (MBEDTLS_ERR_SSL_ALLOC_FAILED) indicates allocation failure
+    // We detect this by checking if free heap is critically low (<20KB) or if ESP-TLS state indicates memory issue
+    bool is_oom = (free_heap < 20480) || (err == ESP_ERR_NO_MEM);
+
+    if (is_oom) {
+      // Increment OOM recovery attempts
+      this->oom_recovery_attempts_++;
+      this->last_oom_time_ = esphome::millis();
+
+      ESP_LOGE(TAG, "");
+      ESP_LOGE(TAG, "╔════════════════════════════════════════════════════════════╗");
+      ESP_LOGE(TAG, "║  ⚠️  OUT OF MEMORY ERROR DETECTED  ⚠️                      ║");
+      ESP_LOGE(TAG, "╠════════════════════════════════════════════════════════════╣");
+      ESP_LOGE(TAG, "║  TLS handshake failed - likely mbedtls allocation error    ║");
+      ESP_LOGE(TAG, "║  Error code: -0x7F00 (MBEDTLS_ERR_SSL_ALLOC_FAILED)       ║");
+      ESP_LOGE(TAG, "║                                                            ║");
+      ESP_LOGE(TAG, "║  Free heap: %-6zu bytes (critically low!)                 ║", free_heap);
+      ESP_LOGE(TAG, "║  Min free:  %-6zu bytes                                   ║", min_free_heap);
+      ESP_LOGE(TAG, "║  Recovery attempt: %d/%d                                   ║",
+               this->oom_recovery_attempts_, MAX_OOM_RECOVERY_ATTEMPTS);
+      ESP_LOGE(TAG, "║                                                            ║");
+      ESP_LOGE(TAG, "║  The ESP32 has run out of RAM during TLS handshake.       ║");
+      ESP_LOGE(TAG, "║  This typically happens when too many connections are      ║");
+      ESP_LOGE(TAG, "║  active or memory fragmentation is severe.                ║");
+
+      if (this->oom_recovery_attempts_ >= MAX_OOM_RECOVERY_ATTEMPTS) {
+        ESP_LOGE(TAG, "║                                                            ║");
+        ESP_LOGE(TAG, "║  ❌ Maximum recovery attempts reached!                     ║");
+        ESP_LOGE(TAG, "║  ACTION: Restarting ESP32 in 5 seconds...                 ║");
+        ESP_LOGE(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGE(TAG, "");
+
+        esp_tls_conn_destroy(tls);
+        delay(5000);
+        ESP_LOGE(TAG, "🔄 Initiating ESP32 restart now...");
+        esp_restart();
+        return false;  // Never reached
+      } else {
+        ESP_LOGE(TAG, "║                                                            ║");
+        ESP_LOGE(TAG, "║  🔧 ATTEMPTING RECOVERY:                                   ║");
+        ESP_LOGE(TAG, "║     1. Closing TLS connection and freeing resources       ║");
+        ESP_LOGE(TAG, "║     2. Disconnecting DERP client                          ║");
+        ESP_LOGE(TAG, "║     3. Waiting 5 seconds for memory to stabilize          ║");
+        ESP_LOGE(TAG, "║     4. Will retry connection                              ║");
+        ESP_LOGE(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGE(TAG, "");
+
+        // Clean up TLS connection
+        esp_tls_conn_destroy(tls);
+
+        // Disconnect DERP client to free all resources
+        ESP_LOGW(TAG, "🧹 Closing DERP connection to free memory...");
+        this->disconnect();
+
+        // Report memory status after cleanup
+        size_t free_after = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        ESP_LOGI(TAG, "💾 Memory freed: %zu bytes (was: %zu, now: %zu)",
+                 free_after - free_heap, free_heap, free_after);
+
+        // Wait for memory to stabilize
+        ESP_LOGW(TAG, "⏳ Waiting %d seconds for memory to stabilize...",
+                 OOM_RECOVERY_DELAY_MS / 1000);
+        delay(OOM_RECOVERY_DELAY_MS);
+
+        // Return false to trigger retry
+        ESP_LOGI(TAG, "🔄 OOM recovery complete, will retry connection");
+        return false;
+      }
     }
 
     // Common causes for TLS connection failures:
@@ -342,6 +421,7 @@ bool DerpClient::do_tls_handshake_() {
     ESP_LOGE(TAG, "      2. TCP connection failed (network/DNS issue)");
     ESP_LOGE(TAG, "      3. TLS handshake timeout (server unreachable)");
     ESP_LOGE(TAG, "      4. Incompatible TLS version or cipher suite");
+    ESP_LOGE(TAG, "      5. Out of memory (mbedtls allocation failed)");
 
     esp_tls_conn_destroy(tls);
     return false;
@@ -368,6 +448,13 @@ bool DerpClient::do_tls_handshake_() {
   ESP_LOGI(TAG, "✓ TLS connection established to %s:%d",
            this->server_host_.c_str(), this->server_port_);
   ESP_LOGI(TAG, "   → Certificate verification: PASSED");
+
+  // Reset OOM recovery counter on successful connection
+  if (this->oom_recovery_attempts_ > 0) {
+    ESP_LOGI(TAG, "✓ OOM recovery successful! Resetting counter (was: %d)",
+             this->oom_recovery_attempts_);
+    this->oom_recovery_attempts_ = 0;
+  }
 
   return true;
 }

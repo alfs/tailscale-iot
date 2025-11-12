@@ -141,6 +141,12 @@ class DerpClient {
   static constexpr uint32_t IDLE_TIMEOUT_MS = 180000;        // 3 min
   static constexpr uint32_t PING_TIMEOUT_MS = 5000;          // 5s
 
+  // OOM recovery tracking
+  uint8_t oom_recovery_attempts_{0};
+  uint32_t last_oom_time_{0};
+  static constexpr uint8_t MAX_OOM_RECOVERY_ATTEMPTS = 3;
+  static constexpr uint32_t OOM_RECOVERY_DELAY_MS = 5000;    // 5s delay between retries
+
   // Constants
   static constexpr uint32_t KEY_LEN = 32;
   static constexpr uint32_t NONCE_LEN = 24;

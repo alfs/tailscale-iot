@@ -230,6 +230,25 @@ void TailscaleComponent::loop() {
     this->process_buffered_wg_packets_();
   }
 
+  // Periodic WireGuard statistics logging (every 30 seconds)
+  static uint32_t last_wg_stats_log = 0;
+  uint32_t now = millis();
+  if (now - last_wg_stats_log >= 30000 && (this->wg_direct_udp_tx_ > 0 || this->wg_derp_tx_ > 0)) {
+    ESP_LOGI(TAG, "═══ WireGuard Path Performance Statistics ═══");
+    ESP_LOGI(TAG, "  Direct UDP:  TX=%u (Failed=%u), RX=%u | Loss=%u%%",
+             this->wg_direct_udp_tx_, this->wg_direct_udp_tx_failed_, this->wg_direct_udp_rx_,
+             (this->wg_direct_udp_tx_ > 0) ? ((this->wg_direct_udp_tx_ - this->wg_direct_udp_rx_) * 100 / this->wg_direct_udp_tx_) : 0);
+    ESP_LOGI(TAG, "  DERP Relay:  TX=%u, RX=%u | Loss=%u%%",
+             this->wg_derp_tx_, this->wg_derp_rx_,
+             (this->wg_derp_tx_ > 0) ? ((this->wg_derp_tx_ - this->wg_derp_rx_) * 100 / this->wg_derp_tx_) : 0);
+    ESP_LOGI(TAG, "  Last Activity: Direct TX=%us ago, Direct RX=%us ago, DERP RX=%us ago",
+             (this->last_wg_direct_tx_time_ > 0) ? ((now - this->last_wg_direct_tx_time_) / 1000) : 999,
+             (this->last_wg_direct_rx_time_ > 0) ? ((now - this->last_wg_direct_rx_time_) / 1000) : 999,
+             (this->last_wg_derp_rx_time_ > 0) ? ((now - this->last_wg_derp_rx_time_) / 1000) : 999);
+    ESP_LOGI(TAG, "  Path Status: %s", this->direct_path_confirmed_ ? "✅ Direct UDP Active" : "⚠️  DERP Relay Only");
+    last_wg_stats_log = now;
+  }
+
   // State machine processing
   switch (this->state_) {
     case TailscaleState::IDLE:
@@ -476,15 +495,15 @@ void TailscaleComponent::handle_fetching_map_state_() {
                                    (const uint8_t*)peer_pub_raw.data(),
                                    nullptr)) {  // No preshared key for Tailscale
 
-        // Set up send callback - send WireGuard packets via direct UDP (preferred) or DERP relay (fallback)
-        // IMPORTANT: After Disco PONG confirmation, prefer direct UDP for lower latency.
-        // Fall back to DERP relay if direct path is not confirmed or direct send fails.
+        // Set up send callback - send WireGuard packets via direct UDP (if enabled) or DERP relay (default)
+        // IMPORTANT: Direct UDP requires both user preference (prefer_direct_udp_) AND Disco PONG confirmation.
+        // Fall back to DERP relay if direct path is not preferred/confirmed or direct send fails.
         this->wg_session_->set_send_callback([this](const uint8_t* packet, size_t len) {
           if (!this->node_config_.peers.empty()) {
             const auto& peer = this->node_config_.peers[0];
 
-            // Prefer direct UDP if path is confirmed via Disco PONG
-            if (this->direct_path_confirmed_ && !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
+            // Use direct UDP only if user enabled it AND path is confirmed via Disco PONG
+            if (this->prefer_direct_udp_ && this->direct_path_confirmed_ && !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
               struct sockaddr_in dest_addr;
               dest_addr.sin_family = AF_INET;
               dest_addr.sin_port = htons(peer.port);
@@ -493,10 +512,29 @@ void TailscaleComponent::handle_fetching_map_state_() {
               ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
                                    (struct sockaddr*)&dest_addr, sizeof(dest_addr));
               if (sent >= 0) {
-                ESP_LOGI(TAG, "→ Sent WireGuard packet directly to %s:%u (%zu bytes)",
-                        peer.endpoint.c_str(), peer.port, len);
+                this->wg_direct_udp_tx_++;
+                this->last_wg_direct_tx_time_ = millis();
+                ESP_LOGI(TAG, "📤 TX#%u: Direct UDP WireGuard to %s:%u (%zu bytes) [Total: Direct=%u/Failed=%u, DERP=%u]",
+                        this->wg_direct_udp_tx_, peer.endpoint.c_str(), peer.port, len,
+                        this->wg_direct_udp_tx_, this->wg_direct_udp_tx_failed_, this->wg_derp_tx_);
               } else {
-                ESP_LOGW(TAG, "✗ Failed to send WireGuard packet: errno=%d", errno);
+                this->wg_direct_udp_tx_failed_++;
+                ESP_LOGW(TAG, "✗ TX FAILED: Direct UDP send failed, errno=%d (%s) [Failures: %u]",
+                        errno, strerror(errno), this->wg_direct_udp_tx_failed_);
+
+                // Fall back to DERP if direct send fails
+                if (this->derp_client_ && this->derp_client_->is_ready()) {
+                  std::string peer_pub_key = peer.public_key;
+                  if (peer_pub_key.find("nodekey:") == 0) {
+                    peer_pub_key = peer_pub_key.substr(8);
+                  }
+                  std::string peer_key_raw = this->hex_decode(peer_pub_key);
+                  if (peer_key_raw.size() == 32) {
+                    this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
+                    this->wg_derp_tx_++;
+                    ESP_LOGI(TAG, "→ Fell back to DERP relay (%zu bytes)", len);
+                  }
+                }
               }
             } else if (this->derp_client_ && this->derp_client_->is_ready()) {
               // Fallback to DERP relay if direct path not confirmed or send failed
@@ -507,7 +545,9 @@ void TailscaleComponent::handle_fetching_map_state_() {
               std::string peer_key_raw = this->hex_decode(peer_pub_key);
               if (peer_key_raw.size() == 32) {
                 this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
-                ESP_LOGI(TAG, "→ Sent WireGuard packet via DERP relay (%zu bytes)", len);
+                this->wg_derp_tx_++;
+                ESP_LOGI(TAG, "📤 TX#%u: DERP relay (%zu bytes) [Direct not confirmed, Total: DERP=%u]",
+                        this->wg_derp_tx_, len, this->wg_derp_tx_);
               } else {
                 ESP_LOGW(TAG, "✗ Invalid peer key size for DERP send");
               }
@@ -519,7 +559,20 @@ void TailscaleComponent::handle_fetching_map_state_() {
 
         // Set up decrypt callback - handle decrypted IP packets
         this->wg_session_->set_decrypt_callback([this](const uint8_t* ip_packet, size_t len) {
-          ESP_LOGI(TAG, "← Decrypted IP packet (%zu bytes)", len);
+          // Track RX based on current send mode
+          if (this->direct_path_confirmed_) {
+            this->wg_direct_udp_rx_++;
+            this->last_wg_direct_rx_time_ = millis();
+            uint32_t rtt = (this->last_wg_direct_tx_time_ > 0) ?
+                           (millis() - this->last_wg_direct_tx_time_) : 0;
+            ESP_LOGI(TAG, "📥 RX#%u: Decrypted IP packet via Direct UDP (%zu bytes) [RTT: %ums, Total: Direct RX=%u, TX=%u]",
+                    this->wg_direct_udp_rx_, len, rtt, this->wg_direct_udp_rx_, this->wg_direct_udp_tx_);
+          } else {
+            this->wg_derp_rx_++;
+            this->last_wg_derp_rx_time_ = millis();
+            ESP_LOGI(TAG, "📥 RX#%u: Decrypted IP packet via DERP (%zu bytes) [Total: DERP RX=%u, TX=%u]",
+                    this->wg_derp_rx_, len, this->wg_derp_rx_, this->wg_derp_tx_);
+          }
 
           // Validate minimum IP header size
           if (len < 20) {

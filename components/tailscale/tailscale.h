@@ -98,6 +98,7 @@ class TailscaleComponent : public PollingComponent {
   void set_time_source(time::RealTimeClock *time) { this->time_source_ = time; }
   void add_disco_ping_target(const std::string &hostname) { this->disco_ping_targets_.push_back(hostname); }
   void set_preferred_derp(uint32_t region) { this->preferred_derp_ = region; }
+  void set_prefer_direct_udp(bool prefer) { this->prefer_direct_udp_ = prefer; }
 
   // State getters
   TailscaleState get_state() const { return this->state_; }
@@ -160,6 +161,7 @@ class TailscaleComponent : public PollingComponent {
   std::string control_public_key_;  // Optional server public key
   std::string device_name_;
   uint32_t preferred_derp_{28};  // Preferred DERP region (default 28)
+  bool prefer_direct_udp_{false};  // Prefer direct UDP over DERP relay (default false for reliability)
   time::RealTimeClock *time_source_{nullptr};
   Component *wireguard_component_{nullptr};
 
@@ -269,6 +271,16 @@ class TailscaleComponent : public PollingComponent {
   void start_udp_relay_();  // Initialize UDP relay socket
   void process_udp_relay_();  // Check for and forward packets (non-blocking)
   void stop_udp_relay_();  // Clean up UDP relay resources
+
+  // WireGuard send/receive diagnostics (to debug direct UDP vs DERP performance)
+  uint32_t wg_direct_udp_tx_{0};       // Count of WireGuard packets sent via direct UDP
+  uint32_t wg_direct_udp_tx_failed_{0}; // Count of failed direct UDP sends
+  uint32_t wg_derp_tx_{0};             // Count of WireGuard packets sent via DERP relay
+  uint32_t wg_direct_udp_rx_{0};       // Count of WireGuard responses received via direct UDP
+  uint32_t wg_derp_rx_{0};             // Count of WireGuard responses received via DERP
+  uint32_t last_wg_direct_tx_time_{0}; // Timestamp of last direct UDP send
+  uint32_t last_wg_direct_rx_time_{0}; // Timestamp of last direct UDP receive
+  uint32_t last_wg_derp_rx_time_{0};   // Timestamp of last DERP receive
 
   // Timing
   uint32_t last_update_time_{0};
