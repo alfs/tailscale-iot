@@ -22,15 +22,12 @@ WireGuardSession::~WireGuardSession() {
   crypto_zero(this->rx_key_, sizeof(this->rx_key_));
   crypto_zero(this->preshared_key_, sizeof(this->preshared_key_));
 
-  // Clean up device and peer if allocated
+  // Clean up device if allocated (peer is part of device, so no separate delete needed)
   if (this->wg_device_) {
     delete static_cast<wireguard_device*>(this->wg_device_);
     this->wg_device_ = nullptr;
   }
-  if (this->wg_peer_) {
-    delete static_cast<wireguard_peer*>(this->wg_peer_);
-    this->wg_peer_ = nullptr;
-  }
+  this->wg_peer_ = nullptr;
 }
 
 bool WireGuardSession::init(const uint8_t* our_private_key,
@@ -52,14 +49,11 @@ bool WireGuardSession::init(const uint8_t* our_private_key,
     ESP_LOGD(TAG, "WireGuard library already initialized");
   }
 
-  // Allocate device and peer structures
+  // Allocate device structure
   auto* device = new wireguard_device();
-  auto* peer = new wireguard_peer();
   memset(device, 0, sizeof(wireguard_device));
-  memset(peer, 0, sizeof(wireguard_peer));
 
   this->wg_device_ = device;
-  this->wg_peer_ = peer;
 
   // Copy our private key
   memcpy(this->our_private_, our_private_key, 32);
@@ -71,6 +65,16 @@ bool WireGuardSession::init(const uint8_t* our_private_key,
     return false;
   }
   ESP_LOGI(TAG, "✓ WireGuard device initialized");
+
+  // Allocate peer from device's internal peer array (CRITICAL for responder mode)
+  ESP_LOGI(TAG, "Allocating peer from device...");
+  auto* peer = peer_alloc(device);
+  if (!peer) {
+    ESP_LOGE(TAG, "✗ Failed to allocate peer from device");
+    return false;
+  }
+  ESP_LOGI(TAG, "✓ Peer allocated from device");
+  this->wg_peer_ = peer;
 
   // Initialize peer with peer's public key and optional preshared key
   const uint8_t* psk = preshared_key;
@@ -242,8 +246,11 @@ bool WireGuardSession::send_keepalive() {
   }
 
   auto* peer = static_cast<wireguard_peer*>(this->wg_peer_);
+  ESP_LOGD(TAG, "DEBUG: send_keepalive() retrieved peer = %p, curr_keypair.valid = %d",
+           peer, peer ? peer->curr_keypair.valid : -1);
   if (!peer || !peer->curr_keypair.valid) {
-    ESP_LOGE(TAG, "No valid keypair for keepalive encryption");
+    ESP_LOGE(TAG, "No valid keypair for keepalive encryption (peer=%p, valid=%d)",
+             peer, peer ? peer->curr_keypair.valid : -1);
     return false;
   }
 
@@ -284,41 +291,114 @@ bool WireGuardSession::handle_handshake_initiation_(const uint8_t* msg, size_t l
     return false;
   }
 
+  if (!this->send_cb_) {
+    ESP_LOGE(TAG, "Send callback not set");
+    return false;
+  }
+
   ESP_LOGI(TAG, "← Received handshake initiation from peer");
 
-  // CRITICAL: esp_wireguard library (v0.4.2) does NOT support responder mode
-  // The library only has initiator-side functions:
-  //   - wireguard_create_handshake_initiation()
-  //   - wireguard_process_handshake_response()
-  // There is NO function to process incoming initiations as a responder.
-  //
-  // However, in Tailscale's design, both peers act as initiators simultaneously.
-  // This is called "racing initiators" - both try to establish the tunnel, and
-  // whichever completes first wins.
-  //
-  // When we receive a handshake initiation, it means the peer is also trying to
-  // establish the tunnel. The correct response is to ALSO send our own handshake
-  // initiation. The WireGuard protocol handles concurrent initiations gracefully.
-
-  // If we're not already initiating, start our own handshake
-  if (this->state_ == WgState::IDLE || this->state_ == WgState::ERROR) {
-    ESP_LOGI(TAG, "Responding with our own handshake initiation (racing initiators)");
-    return this->start_handshake();
-  }
-
-  // If we're already initiating, just log and wait for the response
-  if (this->state_ == WgState::INITIATING) {
-    ESP_LOGD(TAG, "Already initiating handshake, waiting for response");
-    return true;  // Not an error
-  }
-
-  // If session is already established, log but don't reset it
+  // If session is already established, we can optionally process rekey
   if (this->state_ == WgState::ESTABLISHED) {
-    ESP_LOGD(TAG, "Session already established, ignoring redundant initiation");
-    return true;
+    ESP_LOGD(TAG, "Session already established, processing rekey initiation");
+    // Fall through to process the initiation for rekey
   }
 
-  return false;
+  auto* device = static_cast<wireguard_device*>(this->wg_device_);
+  auto* initiation = const_cast<message_handshake_initiation*>(
+    reinterpret_cast<const message_handshake_initiation*>(msg)
+  );
+
+  // Process the handshake initiation as responder
+  ESP_LOGI(TAG, "Processing handshake initiation as responder...");
+  auto* peer = wireguard_process_initiation_message(device, initiation);
+  if (!peer) {
+    ESP_LOGE(TAG, "✗ Failed to process handshake initiation");
+    return false;
+  }
+  ESP_LOGI(TAG, "✓ Handshake initiation processed");
+
+  // CRITICAL: Update wg_peer_ to point to the new peer returned by library
+  // wireguard_process_initiation_message returns a new/updated peer pointer
+  // that must be used for all subsequent operations
+  this->wg_peer_ = peer;
+  ESP_LOGD(TAG, "DEBUG: Updated wg_peer_ = %p, curr_keypair.valid = %d",
+           peer, peer ? peer->curr_keypair.valid : -1);
+
+  // Create handshake response
+  message_handshake_response response;
+  memset(&response, 0, sizeof(response));
+
+  ESP_LOGI(TAG, "Creating handshake response...");
+  if (!wireguard_create_handshake_response(device, peer, &response)) {
+    ESP_LOGE(TAG, "✗ Failed to create handshake response");
+    return false;
+  }
+  ESP_LOGI(TAG, "✓ Handshake response created (%d bytes)", sizeof(response));
+
+  // Extract our sender_index from the response (bytes 4-7, little-endian)
+  // This becomes our local_index for receiving packets
+  uint32_t our_sender_index = U8TO32_LITTLE(reinterpret_cast<const uint8_t*>(&response) + 4);
+  ESP_LOGW(TAG, "Library generated sender_index (our local_index): 0x%08x", our_sender_index);
+
+  // CRITICAL FIX: wireguard-lwip library generates sender_index=0 which is invalid
+  // Generate a random non-zero sender_index and inject it into the response
+  if (our_sender_index == 0) {
+    ESP_LOGW(TAG, "🐛 BUG: Library generated invalid sender_index=0");
+    our_sender_index = esp_random();  // Generate random 32-bit value
+    if (our_sender_index == 0) {
+      our_sender_index = 1;  // Ensure non-zero
+    }
+    ESP_LOGW(TAG, "✓ FIX: Generated valid sender_index: 0x%08x", our_sender_index);
+
+    // Inject the sender_index into the response message (bytes 4-7, little-endian)
+    U32TO8_LITTLE(reinterpret_cast<uint8_t*>(&response) + 4, our_sender_index);
+    ESP_LOGI(TAG, "✓ Injected sender_index into handshake response");
+  }
+
+  // Send response via callback
+  ESP_LOGI(TAG, "Sending handshake response...");
+  this->send_cb_(reinterpret_cast<const uint8_t*>(&response), sizeof(response));
+
+  // Start the session (we are responder, not initiator)
+  wireguard_start_session(peer, false);  // false = we are responder
+
+  // BUG FIX: For responders, wireguard_start_session() stores the keypair in next_keypair, not curr_keypair!
+  // We need to promote it immediately so decryption works. Normally this happens when the first
+  // data packet arrives, but we're implementing responder-only mode where we expect data immediately.
+  if (peer && peer->next_keypair.valid) {
+    ESP_LOGW(TAG, "🔧 FIX: Promoting next_keypair to curr_keypair for responder mode");
+    ESP_LOGD(TAG, "  Before: curr_keypair.valid=%d, next_keypair.valid=%d",
+             peer->curr_keypair.valid, peer->next_keypair.valid);
+    ESP_LOGD(TAG, "  next_keypair indices: local=0x%08x, remote=0x%08x",
+             peer->next_keypair.local_index, peer->next_keypair.remote_index);
+
+    keypair_update(peer, &peer->next_keypair);
+
+    ESP_LOGI(TAG, "  After: curr_keypair.valid=%d, local_index=0x%08x, remote_index=0x%08x",
+             peer->curr_keypair.valid, peer->curr_keypair.local_index, peer->curr_keypair.remote_index);
+  } else {
+    ESP_LOGE(TAG, "✗ Cannot promote keypair: peer=%p, next_keypair.valid=%d",
+             peer, peer ? peer->next_keypair.valid : -1);
+  }
+
+  this->we_are_initiator_ = false;
+  this->state_ = WgState::ESTABLISHED;
+  this->last_rx_time_ = millis();
+
+  ESP_LOGI(TAG, "✓ WireGuard session established as responder!");
+
+  // CRITICAL: Send keepalive packet to complete session establishment
+  // According to WireGuard protocol, the responder should send a keepalive
+  // after handshake completion to signal session is ready and trigger the
+  // initiator to start sending data packets.
+  if (!this->send_keepalive()) {
+    ESP_LOGW(TAG, "Failed to send initial keepalive after handshake");
+  } else {
+    ESP_LOGI(TAG, "✓ Sent keepalive to confirm session establishment");
+  }
+
+  return true;
 }
 
 bool WireGuardSession::handle_handshake_response_(const uint8_t* msg, size_t len) {
