@@ -476,22 +476,43 @@ void TailscaleComponent::handle_fetching_map_state_() {
                                    (const uint8_t*)peer_pub_raw.data(),
                                    nullptr)) {  // No preshared key for Tailscale
 
-        // Set up send callback - route WireGuard packets via DERP
+        // Set up send callback - send WireGuard packets via DERP relay
+        // IMPORTANT: Use DERP relay for all WireGuard packets to ensure peer receives them.
+        // Peer sends handshake initiation via DERP, so we must respond via DERP as well.
         this->wg_session_->set_send_callback([this](const uint8_t* packet, size_t len) {
-          if (this->derp_client_ && !this->node_config_.peers.empty()) {
-            // Send via DERP to peer's node public key
+          if (!this->node_config_.peers.empty()) {
             const auto& peer = this->node_config_.peers[0];
-            std::string peer_pub_key = peer.public_key;
-            // Strip "nodekey:" prefix if present
-            if (peer_pub_key.find("nodekey:") == 0) {
-              peer_pub_key = peer_pub_key.substr(8);
-            }
-            std::string peer_key_raw = this->hex_decode(peer_pub_key);
-            if (peer_key_raw.size() == 32) {
-              this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
-              ESP_LOGD(TAG, "→ Sent WireGuard packet via DERP (%zu bytes)", len);
+
+            // Send via DERP relay (primary method)
+            if (this->derp_client_ && this->derp_client_->is_ready()) {
+              std::string peer_pub_key = peer.public_key;
+              if (peer_pub_key.find("nodekey:") == 0) {
+                peer_pub_key = peer_pub_key.substr(8);
+              }
+              std::string peer_key_raw = this->hex_decode(peer_pub_key);
+              if (peer_key_raw.size() == 32) {
+                this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
+                ESP_LOGI(TAG, "→ Sent WireGuard packet via DERP relay (%zu bytes)", len);
+              } else {
+                ESP_LOGW(TAG, "✗ Invalid peer key size for DERP send");
+              }
+            } else if (!peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
+              // Fallback to direct UDP if DERP not available
+              struct sockaddr_in dest_addr;
+              dest_addr.sin_family = AF_INET;
+              dest_addr.sin_port = htons(peer.port);
+              inet_pton(AF_INET, peer.endpoint.c_str(), &dest_addr.sin_addr);
+
+              ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
+                                   (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+              if (sent >= 0) {
+                ESP_LOGD(TAG, "→ Sent WireGuard packet directly to %s:%u (%zu bytes)",
+                        peer.endpoint.c_str(), peer.port, len);
+              } else {
+                ESP_LOGW(TAG, "✗ Failed to send WireGuard packet: errno=%d", errno);
+              }
             } else {
-              ESP_LOGE(TAG, "✗ Invalid peer key size for DERP send: %zu", peer_key_raw.size());
+              ESP_LOGW(TAG, "✗ No route to send WireGuard packet (DERP not ready, no direct endpoint)");
             }
           }
         });
@@ -518,18 +539,17 @@ void TailscaleComponent::handle_fetching_map_state_() {
           }
 
           // Handle ICMP (protocol 1) or TCP (protocol 6)
-          if (ip_protocol == 1) {
-            // ICMP handling (existing code below)
-          } else if (ip_protocol == 6) {
+          if (ip_protocol == 6) {
             // TCP handling
             this->handle_tcp_packet_(ip_packet, len);
             return;
-          } else {
+          } else if (ip_protocol != 1) {
+            // Not ICMP or TCP - unsupported
             ESP_LOGD(TAG, "Unsupported protocol=%d, ignoring", ip_protocol);
             return;
           }
 
-          // Validate ICMP header size
+          // ICMP handling - validate header size
           if (len < ip_ihl + 8) {
             ESP_LOGW(TAG, "Packet too small for ICMP header");
             return;
@@ -737,18 +757,23 @@ void TailscaleComponent::handle_connected_state_() {
       // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
       // Must wait for DERP handshake to complete before sending WireGuard packets
       if (this->derp_client_->is_ready() && !this->wg_handshake_sent_) {
-        // DERP is now fully authenticated and ready to send packets
-        if (this->wg_session_) {
-          if (this->wg_session_->start_handshake()) {
-            ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP");
-            this->wg_handshake_sent_ = true;
+        // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
+        // Auto-initiation is DISABLED to avoid racing initiators crash
+        // The WireGuard library doesn't handle transitioning from initiator to responder
+        ESP_LOGI(TAG, "DERP ready - waiting for peer to initiate (responder-only mode)");
+        this->wg_handshake_sent_ = true;  // Prevent repeated logging
 
-            // Start UDP relay for WireGuard → DERP packet forwarding
-            this->start_udp_relay_();
-          } else {
-            ESP_LOGW(TAG, "Failed to start WireGuard handshake");
-          }
-        }
+        // Start UDP relay for WireGuard → DERP packet forwarding
+        this->start_udp_relay_();
+
+        // DISABLED: Auto-initiation causes crash with racing initiators
+        // if (this->wg_session_) {
+        //   if (this->wg_session_->start_handshake()) {
+        //     ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP");
+        //     this->wg_handshake_sent_ = true;
+        //     this->start_udp_relay_();
+        //   }
+        // }
 
         // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
         // Server already knows ESP32 prefers DERP 28 from initial map request
@@ -2692,7 +2717,7 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
   // Check for Disco magic: TS💬 (0x54 0x53 0xf0 0x9f 0x92 0xac)
   const uint8_t disco_magic[6] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};
   if (len >= 6 && memcmp(buf, disco_magic, 6) == 0) {
-    ESP_LOGD(TAG, "📡 Routing to Disco handler (magic: TS💬)");
+    ESP_LOGI(TAG, "📡 Routing to Disco handler (magic: TS💬)");
     this->handle_disco_packet_(buf, len, src);
     return;
   }
@@ -2704,11 +2729,30 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     return;
   }
 
-  // NOTE: WireGuard packets are no longer routed through unified socket.
-  // With direct esp_wireguard control, WireGuard binds its own socket and receives packets directly.
-  // The unified socket is only for Disco (NAT traversal) and STUN (endpoint discovery).
+  // Check for WireGuard packets: first byte is 0x01-0x04 (message types)
+  if (buf[0] >= 0x01 && buf[0] <= 0x04) {
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+    uint16_t src_port = ntohs(src->sin_port);
+    ESP_LOGI(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u to session",
+             buf[0], len, src_ip, src_port);
+    if (this->wg_session_) {
+      if (this->wg_session_->receive_wg_packet(buf, len)) {
+        ESP_LOGD(TAG, "✓ WireGuard packet processed successfully");
+      } else {
+        ESP_LOGW(TAG, "✗ WireGuard packet processing failed");
+      }
+    } else {
+      ESP_LOGW(TAG, "⚠️  WireGuard packet received but no session active");
+    }
+    return;
+  }
 
-  // Unknown packet type (not Disco or STUN)
+  // NOTE: WireGuard packets are now routed through unified socket (updated 2025-11-12).
+  // Previously they were handled by esp_wireguard's own socket, but stats showed
+  // they were received on unified socket and dropped, preventing direct connections.
+
+  // Unknown packet type (not Disco, STUN, or WireGuard)
   char src_ip[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
   uint16_t src_port = ntohs(src->sin_port);
