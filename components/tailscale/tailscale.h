@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <map>
 #include <cstring>  // for memset
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -56,6 +57,29 @@ struct NodeConfig {
   std::string derp_region;
 };
 
+// TCP socket types (moved to namespace level for socket API)
+enum class TcpState {
+  CLOSED,
+  SYN_RECEIVED,
+  ESTABLISHED,
+  FIN_WAIT
+};
+
+// Forward declarations
+class TailscaleSocket;
+
+struct TcpConnection {
+  uint32_t src_ip{0};
+  uint16_t src_port{0};
+  uint16_t dst_port{0};     // Listening port (for socket lookup)
+  uint32_t seq{0};          // Our sequence number
+  uint32_t ack{0};          // Expected next byte from peer
+  TcpState state{TcpState::CLOSED};
+  std::vector<uint8_t> rx_buffer;  // Receive buffer
+  uint32_t last_activity{0};
+  TailscaleSocket* socket{nullptr};  // Socket handler for this connection
+};
+
 class TailscaleComponent : public PollingComponent {
  public:
   TailscaleComponent() = default;
@@ -79,6 +103,30 @@ class TailscaleComponent : public PollingComponent {
   TailscaleState get_state() const { return this->state_; }
   bool is_connected() const { return this->state_ == TailscaleState::CONNECTED; }
   const NodeConfig &get_node_config() const { return this->node_config_; }
+
+  // TCP Socket API
+  /**
+   * Bind a socket handler to a specific TCP port.
+   * The socket will receive callbacks for connections on this port.
+   * @param port TCP port to listen on
+   * @param socket Socket handler (must remain valid for component lifetime)
+   * @return true if bound successfully, false if port already bound
+   */
+  bool bind_socket(uint16_t port, TailscaleSocket* socket);
+
+  /**
+   * Send TCP data on a connection (called by TailscaleSocket).
+   * @param conn The TCP connection
+   * @param data Data to send
+   * @param len Length of data
+   */
+  void send_tcp_data(TcpConnection* conn, const uint8_t* data, size_t len);
+
+  /**
+   * Close a TCP connection (called by TailscaleSocket).
+   * @param conn The TCP connection to close
+   */
+  void close_tcp_connection(TcpConnection* conn);
 
  protected:
   // State machine methods
@@ -238,30 +286,15 @@ class TailscaleComponent : public PollingComponent {
   bool check_server_keepalive_();  // Check for incoming server keepalive messages
 
   // TCP Echo Service (port 7777)
-  enum class TcpState {
-    CLOSED,
-    SYN_RECEIVED,
-    ESTABLISHED,
-    FIN_WAIT
-  };
-
-  struct TcpConnection {
-    uint32_t src_ip{0};
-    uint16_t src_port{0};
-    uint32_t seq{0};          // Our sequence number
-    uint32_t ack{0};          // Expected next byte from peer
-    TcpState state{TcpState::CLOSED};
-    std::vector<uint8_t> rx_buffer;  // Receive buffer until newline
-    uint32_t last_activity{0};
-  };
-
   static const uint16_t TCP_ECHO_PORT = 7777;
   static const size_t MAX_TCP_CONNECTIONS = 4;
   std::vector<TcpConnection> tcp_connections_;
+  std::map<uint16_t, TailscaleSocket*> bound_sockets_;  // port -> socket mapping
 
   void handle_tcp_packet_(const uint8_t* ip_packet, size_t len);
   void send_tcp_packet_(const TcpConnection& conn, uint8_t flags, const uint8_t* payload, size_t payload_len);
   TcpConnection* find_tcp_connection_(uint32_t src_ip, uint16_t src_port);
+  TailscaleSocket* find_socket_(uint16_t port);
   uint16_t calculate_tcp_checksum_(const uint8_t* ip_header, const uint8_t* tcp_header, size_t tcp_len);
   uint16_t calculate_ip_checksum_(const uint8_t* ip_header, size_t header_len);
 };

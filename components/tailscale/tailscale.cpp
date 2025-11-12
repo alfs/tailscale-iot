@@ -3,6 +3,8 @@
 #include "crypto_box_simple.h"
 #include "crypto_test.h"
 #include "local_server_cert.h"
+#include "echo_socket.h"
+#include "http_server.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"  // For LwIPLock
@@ -169,7 +171,32 @@ void TailscaleComponent::setup() {
   ESP_LOGI(TAG, "Node keys generated successfully");
   ESP_LOGD(TAG, "Machine key (first 16 chars): %s", this->machine_key_.substr(0, 16).c_str());
   ESP_LOGD(TAG, "Node public key (first 16 chars): %s", this->node_key_public_.substr(0, 16).c_str());
-  
+
+  // Setup TCP echo server on port 7777
+  static EchoSocket echo_socket;
+  if (this->bind_socket(TCP_ECHO_PORT, &echo_socket)) {
+    ESP_LOGI(TAG, "Echo server bound to port %u", TCP_ECHO_PORT);
+  } else {
+    ESP_LOGW(TAG, "Failed to bind echo server to port %u", TCP_ECHO_PORT);
+  }
+
+  // Setup second echo server on port 8888 (test multiple sockets)
+  static EchoSocket echo_socket2;
+  if (this->bind_socket(8888, &echo_socket2)) {
+    ESP_LOGI(TAG, "Echo server 2 bound to port 8888");
+  } else {
+    ESP_LOGW(TAG, "Failed to bind echo server 2 to port 8888");
+  }
+
+  // Setup HTTP server on port 8080
+  static HTTPServerSocket http_server;
+  http_server.set_tailscale_component(this);
+  if (this->bind_socket(8080, &http_server)) {
+    ESP_LOGI(TAG, "HTTP server bound to port 8080");
+  } else {
+    ESP_LOGW(TAG, "Failed to bind HTTP server to port 8080");
+  }
+
   // Initialize state
   this->state_ = TailscaleState::INITIALIZING;
   // Transition to initializing state
@@ -4635,7 +4662,7 @@ void TailscaleComponent::process_buffered_wg_packets_() {
 // TCP Echo Service (Port 7777)
 // ============================================================================
 
-TailscaleComponent::TcpConnection* TailscaleComponent::find_tcp_connection_(uint32_t src_ip, uint16_t src_port) {
+TcpConnection* TailscaleComponent::find_tcp_connection_(uint32_t src_ip, uint16_t src_port) {
   for (auto& conn : this->tcp_connections_) {
     if (conn.src_ip == src_ip && conn.src_port == src_port && conn.state != TcpState::CLOSED) {
       return &conn;
@@ -4743,8 +4770,8 @@ void TailscaleComponent::send_tcp_packet_(const TcpConnection& conn, uint8_t fla
 
   // Build TCP header
   uint8_t* tcp = packet + ip_header_len;
-  tcp[0] = (TCP_ECHO_PORT >> 8) & 0xFF;  // Source port
-  tcp[1] = TCP_ECHO_PORT & 0xFF;
+  tcp[0] = (conn.dst_port >> 8) & 0xFF;  // Source port (from connection)
+  tcp[1] = conn.dst_port & 0xFF;
   tcp[2] = (conn.src_port >> 8) & 0xFF;  // Dest port
   tcp[3] = conn.src_port & 0xFF;
 
@@ -4812,13 +4839,14 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
   uint8_t data_offset = (tcp[12] >> 4) * 4;
   uint8_t flags = tcp[13];
 
-  // Check if it's for our echo port
-  if (dst_port != TCP_ECHO_PORT) {
-    ESP_LOGD(TAG, "TCP packet not for echo port (dst=%u)", dst_port);
+  // Check if we have a socket bound to this port
+  TailscaleSocket* socket = this->find_socket_(dst_port);
+  if (!socket) {
+    ESP_LOGD(TAG, "TCP packet for unbound port %u, ignoring", dst_port);
     return;
   }
 
-  ESP_LOGI(TAG, "← TCP packet: src=%u.%u.%u.%u:%u, flags=0x%02x, seq=%u, ack=%u",
+  ESP_LOGI(TAG, "← TCP packet: src=%u.%u.%u.%u:%u, dst_port=%u, flags=0x%02x, seq=%u, ack=%u",
            (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
            (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port, flags, seq, ack);
 
@@ -4844,6 +4872,8 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
         TcpConnection new_conn;
         new_conn.src_ip = src_ip;
         new_conn.src_port = src_port;
+        new_conn.dst_port = dst_port;
+        new_conn.socket = socket;
         new_conn.seq = (esp_random() % 90000) + 10000;  // Initial sequence number
         new_conn.ack = seq + 1;  // ACK their SYN
         new_conn.state = TcpState::SYN_RECEIVED;
@@ -4878,6 +4908,11 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
     if (conn->state == TcpState::SYN_RECEIVED) {
       ESP_LOGI(TAG, "→ TCP connection established");
       conn->state = TcpState::ESTABLISHED;
+
+      // Notify socket of new connection
+      if (conn->socket) {
+        conn->socket->on_connect(conn);
+      }
     }
   }
 
@@ -4903,6 +4938,18 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
 
       ESP_LOGI(TAG, "   Buffer now has %zu bytes, next expected seq=%u",
                conn->rx_buffer.size(), conn->ack);
+
+      // Notify socket of new data (after adding to buffer)
+      if (conn->socket && !conn->rx_buffer.empty()) {
+        size_t consumed = conn->socket->on_data(conn, conn->rx_buffer.data(), conn->rx_buffer.size());
+        if (consumed > 0 && consumed <= conn->rx_buffer.size()) {
+          ESP_LOGD(TAG, "   Socket consumed %zu bytes", consumed);
+          conn->rx_buffer.erase(conn->rx_buffer.begin(), conn->rx_buffer.begin() + consumed);
+        }
+      } else {
+        // No socket handler - just ACK
+        this->send_tcp_packet_(*conn, 0x10, nullptr, 0);  // ACK
+      }
     } else if (seq < conn->ack) {
       // Retransmission of data we already have - just re-ACK
       ESP_LOGW(TAG, "   Duplicate data (seq=%u < expected=%u), re-ACKing", seq, conn->ack);
@@ -4913,50 +4960,26 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
       ESP_LOGW(TAG, "   Out-of-order data (seq=%u > expected=%u), ignoring", seq, conn->ack);
       return;
     }
-
-    // Check for newline
-    auto newline_pos = std::find(conn->rx_buffer.begin(), conn->rx_buffer.end(), '\n');
-    if (newline_pos != conn->rx_buffer.end()) {
-      // Echo the line back (including newline)
-      size_t line_len = newline_pos - conn->rx_buffer.begin() + 1;
-      ESP_LOGI(TAG, "→ Echoing %zu bytes back", line_len);
-
-      this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), line_len);  // PSH + ACK
-      conn->seq += line_len;
-
-      // Remove echoed data from buffer
-      conn->rx_buffer.erase(conn->rx_buffer.begin(), newline_pos + 1);
-    } else {
-      // Just ACK the data
-      this->send_tcp_packet_(*conn, 0x10, nullptr, 0);  // ACK
-    }
   }
 
   // Handle FIN (connection close)
   if (flags & 0x01) {  // FIN flag
     ESP_LOGI(TAG, "→ TCP FIN received (seq=%u), closing connection", seq);
 
-    // Before closing, check if there's any pending data in the buffer to echo
-    if (!conn->rx_buffer.empty()) {
-      ESP_LOGI(TAG, "→ Processing %zu bytes of buffered data before closing", conn->rx_buffer.size());
-
-      // Check for newline in buffer
-      auto newline_pos = std::find(conn->rx_buffer.begin(), conn->rx_buffer.end(), '\n');
-      if (newline_pos != conn->rx_buffer.end()) {
-        // Echo complete line
-        size_t line_len = newline_pos - conn->rx_buffer.begin() + 1;
-        ESP_LOGI(TAG, "→ Echoing %zu bytes before close", line_len);
-        this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), line_len);  // PSH + ACK
-        conn->seq += line_len;
-      } else {
-        // No newline - echo what we have
-        ESP_LOGI(TAG, "→ Echoing %zu bytes (no newline) before close", conn->rx_buffer.size());
-        this->send_tcp_packet_(*conn, 0x18, conn->rx_buffer.data(), conn->rx_buffer.size());  // PSH + ACK
-        conn->seq += conn->rx_buffer.size();
+    // Notify socket before closing (gives socket chance to handle remaining data)
+    if (conn->socket) {
+      if (!conn->rx_buffer.empty()) {
+        ESP_LOGI(TAG, "→ Notifying socket of %zu buffered bytes before close", conn->rx_buffer.size());
+        // Give socket one last chance to process buffered data
+        size_t consumed = conn->socket->on_data(conn, conn->rx_buffer.data(), conn->rx_buffer.size());
+        if (consumed > 0 && consumed <= conn->rx_buffer.size()) {
+          conn->rx_buffer.erase(conn->rx_buffer.begin(), conn->rx_buffer.begin() + consumed);
+        }
       }
-
-      conn->rx_buffer.clear();
+      conn->socket->on_disconnect(conn);
     }
+
+    conn->rx_buffer.clear();
 
     // ACK the FIN (FIN consumes one sequence number)
     // Only update ack if this FIN is at or after the expected sequence
@@ -4981,6 +5004,66 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
       ++it;
     }
   }
+}
+
+// ============================================================================
+// TCP Socket API Implementation
+// ============================================================================
+
+bool TailscaleComponent::bind_socket(uint16_t port, TailscaleSocket* socket) {
+  if (!socket) {
+    ESP_LOGE(TAG, "Cannot bind null socket to port %u", port);
+    return false;
+  }
+
+  // Check if port already bound
+  if (this->bound_sockets_.find(port) != this->bound_sockets_.end()) {
+    ESP_LOGW(TAG, "Port %u already bound", port);
+    return false;
+  }
+
+  // Bind the socket
+  this->bound_sockets_[port] = socket;
+  socket->set_port(port);
+  socket->set_parent(this);
+
+  ESP_LOGI(TAG, "Bound socket to port %u", port);
+  return true;
+}
+
+void TailscaleComponent::send_tcp_data(TcpConnection* conn, const uint8_t* data, size_t len) {
+  if (!conn || !data || len == 0) {
+    return;
+  }
+
+  ESP_LOGD(TAG, "Sending %zu bytes on TCP connection", len);
+  this->send_tcp_packet_(*conn, 0x18, data, len);  // PSH + ACK
+  conn->seq += len;
+}
+
+void TailscaleComponent::close_tcp_connection(TcpConnection* conn) {
+  if (!conn) {
+    return;
+  }
+
+  if (conn->socket) {
+    conn->socket->on_disconnect(conn);
+  }
+
+  ESP_LOGI(TAG, "Closing TCP connection to %u.%u.%u.%u:%u",
+           (conn->src_ip >> 24) & 0xFF, (conn->src_ip >> 16) & 0xFF,
+           (conn->src_ip >> 8) & 0xFF, conn->src_ip & 0xFF, conn->src_port);
+
+  this->send_tcp_packet_(*conn, 0x11, nullptr, 0);  // FIN + ACK
+  conn->state = TcpState::CLOSED;
+}
+
+TailscaleSocket* TailscaleComponent::find_socket_(uint16_t port) {
+  auto it = this->bound_sockets_.find(port);
+  if (it != this->bound_sockets_.end()) {
+    return it->second;
+  }
+  return nullptr;
 }
 
 }  // namespace tailscale
