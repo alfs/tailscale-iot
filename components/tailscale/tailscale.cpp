@@ -476,15 +476,30 @@ void TailscaleComponent::handle_fetching_map_state_() {
                                    (const uint8_t*)peer_pub_raw.data(),
                                    nullptr)) {  // No preshared key for Tailscale
 
-        // Set up send callback - send WireGuard packets via DERP relay
-        // IMPORTANT: Use DERP relay for all WireGuard packets to ensure peer receives them.
-        // Peer sends handshake initiation via DERP, so we must respond via DERP as well.
+        // Set up send callback - send WireGuard packets via direct UDP (preferred) or DERP relay (fallback)
+        // IMPORTANT: After Disco PONG confirmation, prefer direct UDP for lower latency.
+        // Fall back to DERP relay if direct path is not confirmed or direct send fails.
         this->wg_session_->set_send_callback([this](const uint8_t* packet, size_t len) {
           if (!this->node_config_.peers.empty()) {
             const auto& peer = this->node_config_.peers[0];
 
-            // Send via DERP relay (primary method)
-            if (this->derp_client_ && this->derp_client_->is_ready()) {
+            // Prefer direct UDP if path is confirmed via Disco PONG
+            if (this->direct_path_confirmed_ && !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
+              struct sockaddr_in dest_addr;
+              dest_addr.sin_family = AF_INET;
+              dest_addr.sin_port = htons(peer.port);
+              inet_pton(AF_INET, peer.endpoint.c_str(), &dest_addr.sin_addr);
+
+              ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
+                                   (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+              if (sent >= 0) {
+                ESP_LOGI(TAG, "→ Sent WireGuard packet directly to %s:%u (%zu bytes)",
+                        peer.endpoint.c_str(), peer.port, len);
+              } else {
+                ESP_LOGW(TAG, "✗ Failed to send WireGuard packet: errno=%d", errno);
+              }
+            } else if (this->derp_client_ && this->derp_client_->is_ready()) {
+              // Fallback to DERP relay if direct path not confirmed or send failed
               std::string peer_pub_key = peer.public_key;
               if (peer_pub_key.find("nodekey:") == 0) {
                 peer_pub_key = peer_pub_key.substr(8);
@@ -496,23 +511,8 @@ void TailscaleComponent::handle_fetching_map_state_() {
               } else {
                 ESP_LOGW(TAG, "✗ Invalid peer key size for DERP send");
               }
-            } else if (!peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
-              // Fallback to direct UDP if DERP not available
-              struct sockaddr_in dest_addr;
-              dest_addr.sin_family = AF_INET;
-              dest_addr.sin_port = htons(peer.port);
-              inet_pton(AF_INET, peer.endpoint.c_str(), &dest_addr.sin_addr);
-
-              ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
-                                   (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-              if (sent >= 0) {
-                ESP_LOGD(TAG, "→ Sent WireGuard packet directly to %s:%u (%zu bytes)",
-                        peer.endpoint.c_str(), peer.port, len);
-              } else {
-                ESP_LOGW(TAG, "✗ Failed to send WireGuard packet: errno=%d", errno);
-              }
             } else {
-              ESP_LOGW(TAG, "✗ No route to send WireGuard packet (DERP not ready, no direct endpoint)");
+              ESP_LOGW(TAG, "✗ No route to send WireGuard packet (direct path not confirmed, DERP not ready)");
             }
           }
         });
@@ -3011,7 +3011,12 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 // Handle incoming disco PONG responses
 void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
   ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
-  // Future: Could track peer reachability, update route table, etc.
+
+  // Enable direct UDP path for WireGuard packets (instead of routing via DERP)
+  if (!this->direct_path_confirmed_) {
+    this->direct_path_confirmed_ = true;
+    ESP_LOGW(TAG, "🎯 Direct path confirmed! WireGuard will now use direct UDP instead of DERP relay");
+  }
 }
 
 // Handle STUN response packets (endpoint discovery)
