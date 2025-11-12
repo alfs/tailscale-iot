@@ -2885,6 +2885,36 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
   switch (msg_type) {
     case 1: {  // PING
       ESP_LOGI(TAG, "  → Disco PING received, sending PONG...");
+
+      // ENDPOINT LEARNING: Update peer endpoint from source IP of received PING
+      // Convert sender's disco key to hex format to find the peer
+      char sender_disco_hex[65];
+      for (int i = 0; i < 32; i++) {
+        snprintf(&sender_disco_hex[i * 2], 3, "%02x", sender_disco_pubkey[i]);
+      }
+      sender_disco_hex[64] = '\0';
+      std::string sender_disco_key_str = std::string("discokey:") + sender_disco_hex;
+
+      // Find the sender in our peer list and update endpoint
+      for (auto& peer : this->node_config_.peers) {
+        if (peer.disco_key == sender_disco_key_str) {
+          // Learn the endpoint from where the PING came from
+          std::string learned_ip = src_ip;
+          uint16_t learned_port = src_port;
+
+          if (peer.endpoint != learned_ip || peer.port != learned_port) {
+            ESP_LOGW(TAG, "  🎓 ENDPOINT LEARNING: Updating %s endpoint from %s:%u → %s:%u",
+                     peer.hostname.c_str(), peer.endpoint.c_str(), peer.port,
+                     learned_ip.c_str(), learned_port);
+            peer.endpoint = learned_ip;
+            peer.port = learned_port;
+          } else {
+            ESP_LOGD(TAG, "  ✓ Endpoint already correct: %s:%u", learned_ip.c_str(), learned_port);
+          }
+          break;
+        }
+      }
+
       // Encode sender's disco key to base64 for send_disco_pong_
       std::string sender_disco_key_b64 = this->base64_encode(sender_disco_pubkey, 32);
       this->send_disco_pong_(src_ip, src_port, sender_disco_key_b64);
