@@ -57,7 +57,7 @@ void HTTPServerSocket::on(const std::string& path, RouteHandler handler) {
 }
 
 void HTTPServerSocket::on_connect(TcpConnection* conn) {
-  ESP_LOGI(TAG, "HTTP client connected from %u.%u.%u.%u:%u",
+  ESP_LOGD(TAG, "HTTP client connected from %u.%u.%u.%u:%u",
            (conn->src_ip >> 24) & 0xFF, (conn->src_ip >> 16) & 0xFF,
            (conn->src_ip >> 8) & 0xFF, conn->src_ip & 0xFF, conn->src_port);
 
@@ -126,7 +126,7 @@ bool HTTPServerSocket::parse_request(const uint8_t* data, size_t len, HTTPReques
     return false;
   }
 
-  ESP_LOGI(TAG, "HTTP Request: %s %s %s", req.method.c_str(), req.path.c_str(), req.version.c_str());
+  ESP_LOGD(TAG, "HTTP Request: %s %s %s", req.method.c_str(), req.path.c_str(), req.version.c_str());
 
   // Parse headers
   while (std::getline(stream, line) && !line.empty() && line != "\r") {

@@ -51,14 +51,14 @@ static int compare_bytes(const char *label, const uint8_t *actual, const uint8_t
         return -1;
     }
 
-    ESP_LOGI(TAG, "✓ %s OK (%zu bytes)", label, len);
+    ESP_LOGD(TAG, "✓ %s OK (%zu bytes)", label, len);
     return 0;
 }
 
 // Salsa20 test vector from https://github.com/alexwebr/salsa20
 // Set 3, Vector #0 (256-bit key) - matches crypto_box usage
 int test_salsa20_vectors() {
-    ESP_LOGI(TAG, "Testing Salsa20...");
+    ESP_LOGD(TAG, "Testing Salsa20...");
 
     // Key: 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F (32 bytes)
     uint8_t key[32] = {
@@ -147,7 +147,7 @@ extern void hsalsa20(
     const unsigned char c[16]);
 
 int test_hsalsa20_vectors() {
-    ESP_LOGI(TAG, "Testing HSalsa20 (custom implementation)...");
+    ESP_LOGD(TAG, "Testing HSalsa20 (custom implementation)...");
 
     // Test vector from NaCl
     uint8_t key[32] = {
@@ -232,9 +232,9 @@ int test_crypto_box_roundtrip() {
 }
 
 int run_crypto_tests() {
-    ESP_LOGI(TAG, "====================================");
-    ESP_LOGI(TAG, "Running Crypto Test Vectors");
-    ESP_LOGI(TAG, "====================================");
+    ESP_LOGD(TAG, "====================================");
+    ESP_LOGD(TAG, "Running Crypto Test Vectors");
+    ESP_LOGD(TAG, "====================================");
 
     int failures = 0;
 
@@ -249,16 +249,16 @@ int run_crypto_tests() {
     }
 
     // Skip XSalsa20 and crypto_box tests - ESP32 libsodium doesn't include these functions
-    ESP_LOGI(TAG, "Skipping XSalsa20 test (crypto_stream_xsalsa20 not available in ESP32 libsodium)");
-    ESP_LOGI(TAG, "Skipping crypto_box round-trip test (crypto_box_keypair not available in ESP32 libsodium)");
+    ESP_LOGD(TAG, "Skipping XSalsa20 test (crypto_stream_xsalsa20 not available in ESP32 libsodium)");
+    ESP_LOGD(TAG, "Skipping crypto_box round-trip test (crypto_box_keypair not available in ESP32 libsodium)");
 
-    ESP_LOGI(TAG, "====================================");
+    ESP_LOGD(TAG, "====================================");
     if (failures == 0) {
-        ESP_LOGI(TAG, "✓ All available crypto tests PASSED");
+        ESP_LOGD(TAG, "✓ All available crypto tests PASSED");
     } else {
         ESP_LOGE(TAG, "❌ %d test(s) FAILED", failures);
     }
-    ESP_LOGI(TAG, "====================================");
+    ESP_LOGD(TAG, "====================================");
 
     return (failures == 0) ? 0 : -1;
 }

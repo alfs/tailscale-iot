@@ -273,16 +273,16 @@ bool Ts2021Upgrade::parse_url_(const std::string &url) {
 }
 
 void Ts2021Upgrade::set_handshake_bytes(const std::vector<uint8_t> &handshake_init) {
-  ESP_LOGI(TAG, "set_handshake_bytes called with %zu bytes", handshake_init.size());
+  ESP_LOGD(TAG, "set_handshake_bytes called with %zu bytes", handshake_init.size());
   if (handshake_init.size() > 0) {
-    ESP_LOGI(TAG, "First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD(TAG, "First 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
              handshake_init[0], handshake_init[1], handshake_init[2], handshake_init[3],
              handshake_init[4], handshake_init[5], handshake_init[6], handshake_init[7],
              handshake_init[8], handshake_init[9], handshake_init[10], handshake_init[11],
              handshake_init[12], handshake_init[13], handshake_init[14], handshake_init[15]);
   }
   this->handshake_init_ = handshake_init;
-  ESP_LOGI(TAG, "Stored handshake_init_ size: %zu", this->handshake_init_.size());
+  ESP_LOGD(TAG, "Stored handshake_init_ size: %zu", this->handshake_init_.size());
 }
 
 bool Ts2021Upgrade::connect(const std::string &url) {
@@ -366,7 +366,7 @@ bool Ts2021Upgrade::ensure_connection_() {
         this->http2_negotiated_ = true;
       }
     } else {
-      ESP_LOGI(TAG, "TLS connection established (no ALPN negotiated)");
+      ESP_LOGD(TAG, "TLS connection established (no ALPN negotiated)");
     }
   } else {
     ESP_LOGI(TAG, "TLS connection established");
@@ -403,23 +403,23 @@ bool Ts2021Upgrade::perform_http_upgrade_() {
   
   // Build the request path with query parameter for handshake
   std::string request_path = this->path_;
-  ESP_LOGI(TAG, "Handshake init vector size: %zu", this->handshake_init_.size());
+  ESP_LOGD(TAG, "Handshake init vector size: %zu", this->handshake_init_.size());
   
   if (!this->handshake_init_.empty()) {
-    ESP_LOGI(TAG, "Handshake init bytes (first 16): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD(TAG, "Handshake init bytes (first 16): %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
              this->handshake_init_[0], this->handshake_init_[1], this->handshake_init_[2], this->handshake_init_[3],
              this->handshake_init_[4], this->handshake_init_[5], this->handshake_init_[6], this->handshake_init_[7],
              this->handshake_init_[8], this->handshake_init_[9], this->handshake_init_[10], this->handshake_init_[11],
              this->handshake_init_[12], this->handshake_init_[13], this->handshake_init_[14], this->handshake_init_[15]);
     
     std::string handshake_b64 = base64_encode(this->handshake_init_);
-    ESP_LOGI(TAG, "Base64 encoded handshake: %s", handshake_b64.c_str());
+    ESP_LOGD(TAG, "Base64 encoded handshake: %s", handshake_b64.c_str());
     
     if (!handshake_b64.empty()) {
       std::string handshake_encoded = url_encode(handshake_b64);
-      ESP_LOGI(TAG, "URL encoded handshake: %s", handshake_encoded.c_str());
+      ESP_LOGD(TAG, "URL encoded handshake: %s", handshake_encoded.c_str());
       request_path += "?X-Tailscale-Handshake=" + handshake_encoded;
-      ESP_LOGI(TAG, "Full request path: %s", request_path.c_str());
+      ESP_LOGD(TAG, "Full request path: %s", request_path.c_str());
     } else {
       ESP_LOGE(TAG, "Base64 encoding failed!");
     }
@@ -436,15 +436,15 @@ bool Ts2021Upgrade::perform_http_upgrade_() {
   request += "Sec-WebSocket-Protocol: tailscale-control-protocol\r\n";
   request += "User-Agent: esp-ts2021/0.1\r\n\r\n";
 
-  ESP_LOGI(TAG, "Sending WebSocket upgrade request (%d bytes) WITH SUBPROTOCOL HEADER", request.size());
-  ESP_LOGI(TAG, "Full upgrade request:\n%s", request.c_str());
+  ESP_LOGD(TAG, "Sending WebSocket upgrade request (%d bytes) WITH SUBPROTOCOL HEADER", request.size());
+  ESP_LOGD(TAG, "Full upgrade request:\n%s", request.c_str());
 
   if (!this->write_raw(reinterpret_cast<const uint8_t *>(request.data()), request.size())) {
     ESP_LOGE(TAG, "Failed to send upgrade request");
     return false;
   }
 
-  ESP_LOGI(TAG, "Waiting for WebSocket upgrade response...");
+  ESP_LOGD(TAG, "Waiting for WebSocket upgrade response...");
 
   std::vector<uint8_t> response;
   if (!this->read_raw(response, 1024, kDefaultTimeoutMs)) {
@@ -452,7 +452,7 @@ bool Ts2021Upgrade::perform_http_upgrade_() {
     return false;
   }
 
-  ESP_LOGI(TAG, "Received %d bytes in upgrade response", response.size());
+  ESP_LOGD(TAG, "Received %d bytes in upgrade response", response.size());
 
   // Log hex dump of first 40 bytes
   if (response.size() > 0) {
@@ -515,7 +515,7 @@ bool Ts2021Upgrade::perform_http_upgrade_() {
     }
   }
 
-  ESP_LOGI(TAG, "=== WebSocket Upgrade Complete ===");
+  ESP_LOGD(TAG, "=== WebSocket Upgrade Complete ===");
   return true;
 }
 

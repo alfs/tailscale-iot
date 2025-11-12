@@ -104,7 +104,7 @@ bool Ts2021Transport::build_handshake_message(std::vector<uint8_t> &out_cipherte
   out_ciphertext[4] = noise_payload.size() & 0xFF;
   std::copy(noise_payload.begin(), noise_payload.end(), out_ciphertext.begin() + 5);
   
-  ESP_LOGI(TAG, "Wrapped in controlbase framing: %zu bytes total (5 byte header + %zu byte payload)",
+  ESP_LOGD(TAG, "Wrapped in controlbase framing: %zu bytes total (5 byte header + %zu byte payload)",
            out_ciphertext.size(), noise_payload.size());
 
   // Print hex dump of handshake message for debugging
@@ -117,7 +117,7 @@ bool Ts2021Transport::build_handshake_message(std::vector<uint8_t> &out_cipherte
   if (out_ciphertext.size() > 128) {
     hex_dump += "... (truncated)";
   }
-  ESP_LOGI(TAG, "→ SENT handshake message (%zu bytes): %s", out_ciphertext.size(), hex_dump.c_str());
+  ESP_LOGD(TAG, "→ SENT handshake message (%zu bytes): %s", out_ciphertext.size(), hex_dump.c_str());
 
   action = noise_handshakestate_get_action(hs);
   if (action == NOISE_ACTION_SPLIT) {
@@ -151,7 +151,7 @@ bool Ts2021Transport::accept_handshake_message(const uint8_t *data, size_t len) 
   uint8_t msg_type = data[0];
   uint16_t payload_len = (data[1] << 8) | data[2];
   
-  ESP_LOGI(TAG, "Received controlbase message: type=%d, payload_len=%d, total_len=%zu",
+  ESP_LOGD(TAG, "Received controlbase message: type=%d, payload_len=%d, total_len=%zu",
            msg_type, payload_len, len);
 
   // Print hex dump of handshake message for debugging

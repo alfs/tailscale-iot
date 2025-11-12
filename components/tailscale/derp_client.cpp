@@ -701,7 +701,7 @@ bool DerpClient::read_frame_header_(DerpFrameType& type, uint32_t& len) {
         ((uint32_t)header[3] << 8) |
         (uint32_t)header[4];
 
-  ESP_LOGI(TAG, "✓ Read DERP frame header: type=0x%02x, len=%u", (uint8_t)type, len);
+  ESP_LOGD(TAG, "✓ Read DERP frame header: type=0x%02x, len=%u", (uint8_t)type, len);
 
   return true;
 }
@@ -791,7 +791,7 @@ bool DerpClient::handle_server_key_() {
   // Extract server public key
   memcpy(this->server_public_key_, buffer + MAGIC_LEN, KEY_LEN);
 
-  ESP_LOGI(TAG, "✓ Received server key");
+  ESP_LOGD(TAG, "✓ Received server key");
   return true;
 }
 
@@ -817,12 +817,12 @@ bool DerpClient::handle_server_info_() {
     }
   }
 
-  ESP_LOGI(TAG, "✓ Received server info (%d bytes)", len);
+  ESP_LOGD(TAG, "✓ Received server info (%d bytes)", len);
   return true;
 }
 
 bool DerpClient::send_client_info_() {
-  ESP_LOGI(TAG, "→ send_client_info_() START");
+  ESP_LOGD(TAG, "→ send_client_info_() START");
 
   // FrameClientInfo format: 32B our public key + 24B nonce + NaCl box(JSON)
 
@@ -887,7 +887,7 @@ bool DerpClient::send_client_info_() {
     return false;
   }
 
-  ESP_LOGI(TAG, "✓ Sent encrypted client info (nonce + NaCl box)");
+  ESP_LOGD(TAG, "✓ Sent encrypted client info (nonce + NaCl box)");
   return true;
 }
 
@@ -907,7 +907,7 @@ bool DerpClient::handle_recv_packet_(uint32_t len) {
   const uint8_t* packet = this->recv_buffer_ + KEY_LEN;
   size_t packet_len = len - KEY_LEN;
 
-  ESP_LOGI(TAG, "← Received packet (%d bytes) via DERP from peer", packet_len);
+  ESP_LOGD(TAG, "← Received packet (%d bytes) via DERP from peer", packet_len);
 
   if (this->packet_cb_) {
     this->packet_cb_(src_key, packet, packet_len);

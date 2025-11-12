@@ -182,10 +182,10 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
                              const std::string &path, const std::string &payload, const char *&response_ptr,
                              size_t &response_size, uint16_t &status_code, uint32_t timeout_ms, bool close_stream,
                              bool filter_node_only) {
-  ESP_LOGI(TAG, "=== HTTP/2 POST Request ===");
-  ESP_LOGI(TAG, "Stream ID: %u, Path: %s", stream_id, path.c_str());
-  ESP_LOGI(TAG, "Payload: %zu bytes", payload.size());
-  ESP_LOGI(TAG, "JSON filtering: %s", filter_node_only ? "enabled (Node field only)" : "disabled (full response)");
+  ESP_LOGD(TAG, "=== HTTP/2 POST Request ===");
+  ESP_LOGD(TAG, "Stream ID: %u, Path: %s", stream_id, path.c_str());
+  ESP_LOGD(TAG, "Payload: %zu bytes", payload.size());
+  ESP_LOGD(TAG, "JSON filtering: %s", filter_node_only ? "enabled (Node field only)" : "disabled (full response)");
 
   // Store filtering mode for this request
   this->filter_node_only_ = filter_node_only;
@@ -197,7 +197,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   this->filtered_json_size_ = 0;
   this->json_bytes_processed_ = 0;
   memset(this->filtered_json_buffer_, 0, sizeof(this->filtered_json_buffer_));
-  ESP_LOGI(TAG, "JSON parser initialized (filtering: %s)", filter_node_only ? "ON" : "OFF");
+  ESP_LOGD(TAG, "JSON parser initialized (filtering: %s)", filter_node_only ? "ON" : "OFF");
 
   std::vector<uint8_t> header_block;
   encode_literal_header_(header_block, ":method", "POST");
@@ -208,7 +208,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   encode_literal_header_(header_block, "content-length", std::to_string(payload.size()));
   encode_literal_header_(header_block, "accept", "application/json");
 
-  ESP_LOGI(TAG, "Built header block: %zu bytes", header_block.size());
+  ESP_LOGD(TAG, "Built header block: %zu bytes", header_block.size());
 
   // Build HEADERS frame
   Frame headers;
@@ -303,7 +303,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         int16_t status = decode_status_header_(frame.payload);
         if (status > 0) {
           status_code = static_cast<uint16_t>(status);
-          ESP_LOGI(TAG, "HTTP status code: %u (flags=0x%02x)", status_code, frame.flags);
+          ESP_LOGD(TAG, "HTTP status code: %u (flags=0x%02x)", status_code, frame.flags);
         }
         if ((frame.flags & kFlagEndStream) != 0) {
           ESP_LOGW(TAG, "⚠️  Stream %u ended by HEADERS frame with END_STREAM flag - server sent no body!", stream_id);
@@ -316,7 +316,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         size_t payload_size = frame.length;
         const char *payload_ptr = reinterpret_cast<const char *>(this->recv_buffer_.data() + 9);
 
-        ESP_LOGI(TAG, "📥 DATA frame: %zu bytes (flags=0x%02x, stream=%u, total_processed=%zu)",
+        ESP_LOGD(TAG, "📥 DATA frame: %zu bytes (flags=0x%02x, stream=%u, total_processed=%zu)",
                  payload_size, frame.flags, frame.stream_id, this->json_bytes_processed_);
 
         // Log HTTP/2 frame flags for protocol debugging
@@ -339,7 +339,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
                                        ((uint32_t)(uint8_t)payload_ptr[1] << 8) |
                                        ((uint32_t)(uint8_t)payload_ptr[2] << 16) |
                                        ((uint32_t)(uint8_t)payload_ptr[3] << 24);
-            ESP_LOGI(TAG, "Detected Tailscale wire format: JSON length = %u bytes", expected_length);
+            ESP_LOGD(TAG, "Detected Tailscale wire format: JSON length = %u bytes", expected_length);
 
             // Skip the 4-byte prefix
             json_data = payload_ptr + 4;
@@ -351,7 +351,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
 
         // When filtering is disabled, buffer all DATA even without wire format
         if (!this->filter_node_only_ && !has_wire_format && this->json_bytes_processed_ == 0) {
-          ESP_LOGI(TAG, "No wire format detected, buffering raw response (filtering disabled)");
+          ESP_LOGD(TAG, "No wire format detected, buffering raw response (filtering disabled)");
           this->parsing_json_ = true;  // Enable buffering even without wire format
         }
 
@@ -390,7 +390,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
               if (!this->json_complete_ &&
                   this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
                 this->json_complete_ = true;
-                ESP_LOGI(TAG, "✅ Complete JSON detected in full response mode (%zu bytes)",
+                ESP_LOGD(TAG, "✅ Complete JSON detected in full response mode (%zu bytes)",
                          this->filtered_json_size_);
               }
             } else {
@@ -459,13 +459,13 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
           if (this->json_complete_) {
             if (close_stream) {
               // Simple request-response: close after first complete JSON
-              ESP_LOGI(TAG, "✅ Full JSON response completed (%zu bytes) - closing stream",
+              ESP_LOGD(TAG, "✅ Full JSON response completed (%zu bytes) - closing stream",
                        this->filtered_json_size_);
               stream_open = false;
               break;
             } else {
               // Long-polling mode: keep stream open for keepalive messages
-              ESP_LOGI(TAG, "✅ Received initial MapResponse (%zu bytes) - keeping stream open for server keepalives",
+              ESP_LOGD(TAG, "✅ Received initial MapResponse (%zu bytes) - keeping stream open for server keepalives",
                        this->filtered_json_size_);
               // Return first response to caller, stream stays open for receiving server keepalives
               // Caller should use read_next_message() to receive subsequent keepalives
@@ -533,7 +533,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   response_size = this->filtered_json_size_;
 
   uint32_t free_heap = esp_get_free_heap_size();
-  ESP_LOGI(TAG, "✓ Returning filtered JSON: %zu bytes (free heap: %u bytes)",
+  ESP_LOGD(TAG, "✓ Returning filtered JSON: %zu bytes (free heap: %u bytes)",
            this->filtered_json_size_, free_heap);
 
   // Memory safety check: warn if buffer is nearly full
@@ -818,7 +818,7 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
   }
   
   // JSON detection - count braces starting from the offset
-  ESP_LOGI(TAG, "Response format: JSON (size: %zu bytes, offset: %zu)", buffer_size, start_offset);
+  ESP_LOGD(TAG, "Response format: JSON (size: %zu bytes, offset: %zu)", buffer_size, start_offset);
   
   int brace_depth = 0;
   bool in_string = false;
@@ -857,7 +857,7 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
           }
         }
         if (all_whitespace || i + 1 >= buffer_size) {
-          ESP_LOGI(TAG, "✓ JSON complete: depth=0, size=%zu, last_brace_at=%zu", buffer_size, i);
+          ESP_LOGD(TAG, "✓ JSON complete: depth=0, size=%zu, last_brace_at=%zu", buffer_size, i);
           log_full_json("✓ JSON complete", i);
           return true;
         }
@@ -877,7 +877,7 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
     if (!std::isspace(static_cast<unsigned char>(c))) {
       bool ends_with_brace = (c == '}');
       if (ends_with_brace) {
-        ESP_LOGI(TAG, "✓ Complete JSON detected: %zu bytes, depth=0, ends with '}'", buffer_size);
+        ESP_LOGD(TAG, "✓ Complete JSON detected: %zu bytes, depth=0, ends with '}'", buffer_size);
         log_full_json("✓ Complete JSON detected", i - 1);
       }
       return ends_with_brace;
@@ -1051,7 +1051,7 @@ bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_p
             if (!this->json_complete_ &&
                 this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
               this->json_complete_ = true;
-              ESP_LOGI(TAG, "✅ Received complete message: %zu bytes", this->filtered_json_size_);
+              ESP_LOGD(TAG, "✅ Received complete message: %zu bytes", this->filtered_json_size_);
 
               // Return the message but keep stream open
               response_ptr = this->filtered_json_buffer_;

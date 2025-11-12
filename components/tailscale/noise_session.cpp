@@ -173,7 +173,7 @@ bool NoiseSession::set_remote_static(const std::vector<uint8_t> &public_key) {
   }
   
   // DEBUG: Log the remote public key being set
-  ESP_LOGI(TAG, "Setting remote static public key (%zu bytes):", public_key.size());
+  ESP_LOGD(TAG, "Setting remote static public key (%zu bytes):", public_key.size());
   for (size_t i = 0; i < public_key.size() && i < 32; i += 16) {
     size_t chunk = std::min<size_t>(16, public_key.size() - i);
     std::string hex;
@@ -182,7 +182,7 @@ bool NoiseSession::set_remote_static(const std::vector<uint8_t> &public_key) {
       snprintf(buf, sizeof(buf), "%02x ", public_key[i + j]);
       hex += buf;
     }
-    ESP_LOGI(TAG, "  [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
+    ESP_LOGD(TAG, "  [%02zu-%02zu]: %s", i, i + chunk - 1, hex.c_str());
   }
   
   int err = noise_dhstate_set_public_key(dh, public_key.data(), public_key.size());

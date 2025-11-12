@@ -410,10 +410,10 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
   if (!json || len == 0) return false;
 
   const char* end = json + len;
-  ESP_LOGI(TAG, "🔍 STATIC parse (NO heap): %zu bytes", len);
+  ESP_LOGD(TAG, "🔍 STATIC parse (NO heap): %zu bytes", len);
   
   if (allowed_peers && !allowed_peers->empty()) {
-    ESP_LOGI(TAG, "Filtering enabled: only extracting %zu allowed peer(s)", allowed_peers->size());
+    ESP_LOGD(TAG, "Filtering enabled: only extracting %zu allowed peer(s)", allowed_peers->size());
   }
 
   // Clear output (stack memory only)
@@ -734,28 +734,28 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
 
 // Print peer table for debugging
 void print_peer_table(const StaticMapResponse &map) {
-  ESP_LOGI(TAG, "");
-  ESP_LOGI(TAG, "========== PEER TABLE (first %d peers) ==========", map.peer_count);
-  ESP_LOGI(TAG, "Node ID: %s", map.node_id);
-  ESP_LOGI(TAG, "IPv4:    %s", map.node_ipv4);
+  ESP_LOGD(TAG, "");
+  ESP_LOGD(TAG, "========== PEER TABLE (first %d peers) ==========", map.peer_count);
+  ESP_LOGD(TAG, "Node ID: %s", map.node_id);
+  ESP_LOGD(TAG, "IPv4:    %s", map.node_ipv4);
   if (map.derp_host[0] != '\0') {
-    ESP_LOGI(TAG, "DERP:    %s:%d", map.derp_host, map.derp_port);
+    ESP_LOGD(TAG, "DERP:    %s:%d", map.derp_host, map.derp_port);
   }
-  ESP_LOGI(TAG, "");
+  ESP_LOGD(TAG, "");
 
   for (uint8_t i = 0; i < map.peer_count; i++) {
     const StaticPeerInfo *peer = &map.peers[i];
-    ESP_LOGI(TAG, "Peer #%d: %s", i + 1, peer->hostname[0] ? peer->hostname : "(no hostname)");
-    ESP_LOGI(TAG, "  Key:      %s", peer->public_key);
-    ESP_LOGI(TAG, "  Endpoint: %s", peer->endpoint[0] ? peer->endpoint : "(DERP only)");
-    ESP_LOGI(TAG, "  Allowed IPs (%d):", peer->allowed_ip_count);
+    ESP_LOGD(TAG, "Peer #%d: %s", i + 1, peer->hostname[0] ? peer->hostname : "(no hostname)");
+    ESP_LOGD(TAG, "  Key:      %s", peer->public_key);
+    ESP_LOGD(TAG, "  Endpoint: %s", peer->endpoint[0] ? peer->endpoint : "(DERP only)");
+    ESP_LOGD(TAG, "  Allowed IPs (%d):", peer->allowed_ip_count);
     for (uint8_t j = 0; j < peer->allowed_ip_count; j++) {
-      ESP_LOGI(TAG, "    - %s", peer->allowed_ips[j]);
+      ESP_LOGD(TAG, "    - %s", peer->allowed_ips[j]);
     }
   }
 
-  ESP_LOGI(TAG, "==================================================");
-  ESP_LOGI(TAG, "");
+  ESP_LOGD(TAG, "==================================================");
+  ESP_LOGD(TAG, "");
 }
 
 }  // namespace tailscale

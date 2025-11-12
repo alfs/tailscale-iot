@@ -389,7 +389,7 @@ int crypto_box_easy_simple(
     const unsigned char *pk,
     const unsigned char *sk)
 {
-    ESP_LOGI("crypto_box_simple", "▶ Custom crypto_box_easy_simple called (mlen=%llu)",
+    ESP_LOGD("crypto_box_simple", "▶ Custom crypto_box_easy_simple called (mlen=%llu)",
              static_cast<unsigned long long>(mlen));
 
     unsigned char beforenm_key[CRYPTO_BOX_BEFORENMBYTES];
@@ -403,7 +403,7 @@ int crypto_box_easy_simple(
     sodium_memzero(beforenm_key, sizeof(beforenm_key));
 
     if (result == 0) {
-        ESP_LOGI("crypto_box_simple", "✓ Custom crypto_box_easy_simple completed successfully");
+        ESP_LOGD("crypto_box_simple", "✓ Custom crypto_box_easy_simple completed successfully");
     } else {
         ESP_LOGE("crypto_box_simple", "✗ crypto_box_easy_afternm_simple failed");
     }
@@ -420,7 +420,7 @@ int crypto_box_open_easy_simple(
     const unsigned char *pk,
     const unsigned char *sk)
 {
-    ESP_LOGI("crypto_box_simple", "▶ Custom crypto_box_open_easy_simple called (clen=%llu)",
+    ESP_LOGD("crypto_box_simple", "▶ Custom crypto_box_open_easy_simple called (clen=%llu)",
              static_cast<unsigned long long>(clen));
 
     unsigned char beforenm_key[CRYPTO_BOX_BEFORENMBYTES];
@@ -433,7 +433,7 @@ int crypto_box_open_easy_simple(
     sodium_memzero(beforenm_key, sizeof(beforenm_key));
 
     if (result == 0) {
-        ESP_LOGI("crypto_box_simple", "✓ Custom crypto_box_open_easy_simple completed successfully");
+        ESP_LOGD("crypto_box_simple", "✓ Custom crypto_box_open_easy_simple completed successfully");
     } else {
         ESP_LOGE("crypto_box_simple", "✗ crypto_box_open_easy_simple verification failed");
     }

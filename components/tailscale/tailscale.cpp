@@ -127,7 +127,7 @@ static void print_chunked(const char *tag, const char *label, const char *data, 
     memcpy(chunk_buffer, data + offset, current_chunk);
     chunk_buffer[current_chunk] = '\0';
 
-    ESP_LOGI(tag, "  [%zu/%zu] %s", chunk_num, (length + chunk_size - 1) / chunk_size, chunk_buffer);
+    ESP_LOGD(tag, "  [%zu/%zu] %s", chunk_num, (length + chunk_size - 1) / chunk_size, chunk_buffer);
 
     offset += current_chunk;
     chunk_num++;
@@ -546,7 +546,7 @@ void TailscaleComponent::handle_fetching_map_state_() {
               if (peer_key_raw.size() == 32) {
                 this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
                 this->wg_derp_tx_++;
-                ESP_LOGI(TAG, "📤 TX#%u: DERP relay (%zu bytes) [Direct not confirmed, Total: DERP=%u]",
+                ESP_LOGD(TAG, "📤 TX#%u: DERP relay (%zu bytes) [Direct not confirmed, Total: DERP=%u]",
                         this->wg_derp_tx_, len, this->wg_derp_tx_);
               } else {
                 ESP_LOGW(TAG, "✗ Invalid peer key size for DERP send");
@@ -570,7 +570,7 @@ void TailscaleComponent::handle_fetching_map_state_() {
           } else {
             this->wg_derp_rx_++;
             this->last_wg_derp_rx_time_ = millis();
-            ESP_LOGI(TAG, "📥 RX#%u: Decrypted IP packet via DERP (%zu bytes) [Total: DERP RX=%u, TX=%u]",
+            ESP_LOGD(TAG, "📥 RX#%u: Decrypted IP packet via DERP (%zu bytes) [Total: DERP RX=%u, TX=%u]",
                     this->wg_derp_rx_, len, this->wg_derp_rx_, this->wg_derp_tx_);
           }
 
@@ -617,11 +617,11 @@ void TailscaleComponent::handle_fetching_map_state_() {
           uint16_t icmp_id = (icmp_header[4] << 8) | icmp_header[5];
           uint16_t icmp_seq = (icmp_header[6] << 8) | icmp_header[7];
 
-          ESP_LOGI(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
+          ESP_LOGD(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
 
           // Handle ICMP Echo Request (type 8)
           if (icmp_type == 8 && icmp_code == 0) {
-            ESP_LOGI(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
+            ESP_LOGD(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
 
             // Build ICMP Echo Reply packet
             uint8_t reply[1500];  // Max MTU
@@ -678,7 +678,7 @@ void TailscaleComponent::handle_fetching_map_state_() {
 
             // Send reply via WireGuard
             if (this->wg_session_->send_ip_packet(reply, reply_len)) {
-              ESP_LOGI(TAG, "   ✓ Sent ICMP Echo Reply (seq=%u, %zu bytes)", icmp_seq, reply_len);
+              ESP_LOGD(TAG, "   ✓ Sent ICMP Echo Reply (seq=%u, %zu bytes)", icmp_seq, reply_len);
             } else {
               ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply (seq=%u)", icmp_seq);
             }
@@ -2841,7 +2841,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
       n += sprintf(hex + n, "%02x", buf[i+j]);
       if (j % 2 == 1) n += sprintf(hex + n, " ");
     }
-    ESP_LOGI(TAG, "  [%3zu-%3zu]: %s", i, i+15 < len ? i+15 : len-1, hex);
+    ESP_LOGD(TAG, "  [%3zu-%3zu]: %s", i, i+15 < len ? i+15 : len-1, hex);
   }
 
   // Extract sender's disco public key (32 bytes at offset 6)
@@ -2877,7 +2877,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
   // CRYPTO DEBUG: Log full keys for Python verification
   ESP_LOGV(TAG, "🔑 Full our disco public key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
-    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
              (uint8_t)our_pub_raw[i+0], (uint8_t)our_pub_raw[i+1], (uint8_t)our_pub_raw[i+2], (uint8_t)our_pub_raw[i+3],
              (uint8_t)our_pub_raw[i+4], (uint8_t)our_pub_raw[i+5], (uint8_t)our_pub_raw[i+6], (uint8_t)our_pub_raw[i+7],
@@ -2887,7 +2887,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 
   ESP_LOGV(TAG, "🔑 Full sender disco public key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
-    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
              sender_disco_pubkey[i+0], sender_disco_pubkey[i+1], sender_disco_pubkey[i+2], sender_disco_pubkey[i+3],
              sender_disco_pubkey[i+4], sender_disco_pubkey[i+5], sender_disco_pubkey[i+6], sender_disco_pubkey[i+7],
@@ -2897,7 +2897,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 
   ESP_LOGV(TAG, "🔑 Full our disco private key (32 bytes):");
   for (int i = 0; i < 32; i += 16) {
-    ESP_LOGI(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+    ESP_LOGD(TAG, "  [%2d-%2d]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
              i, i+15,
              (uint8_t)our_priv_raw[i+0], (uint8_t)our_priv_raw[i+1], (uint8_t)our_priv_raw[i+2], (uint8_t)our_priv_raw[i+3],
              (uint8_t)our_priv_raw[i+4], (uint8_t)our_priv_raw[i+5], (uint8_t)our_priv_raw[i+6], (uint8_t)our_priv_raw[i+7],
@@ -2906,10 +2906,10 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
   }
 
   ESP_LOGV(TAG, "🔑 Full nonce (24 bytes):");
-  ESP_LOGI(TAG, "  [ 0-15]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
+  ESP_LOGD(TAG, "  [ 0-15]: %02x%02x%02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x",
            nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5], nonce[6], nonce[7],
            nonce[8], nonce[9], nonce[10], nonce[11], nonce[12], nonce[13], nonce[14], nonce[15]);
-  ESP_LOGI(TAG, "  [16-23]: %02x%02x%02x%02x%02x%02x%02x%02x",
+  ESP_LOGD(TAG, "  [16-23]: %02x%02x%02x%02x%02x%02x%02x%02x",
            nonce[16], nonce[17], nonce[18], nonce[19], nonce[20], nonce[21], nonce[22], nonce[23]);
 
   ESP_LOGD(TAG, "  Attempting decrypt: enc_len=%zu", encrypted_len);
@@ -3256,7 +3256,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     return;
   }
 
-  ESP_LOGI(TAG, "→ Sending Disco ping to %s:%u", endpoint.c_str(), port);
+  ESP_LOGD(TAG, "→ Sending Disco ping to %s:%u", endpoint.c_str(), port);
   ESP_LOGD(TAG, "  Peer disco key (%d chars): %s", peer_disco_key.length(), peer_disco_key.c_str());
 
   // Disco protocol constants
@@ -3368,7 +3368,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   // Encrypted payload (46 bytes plaintext + 16 bytes MAC = 62 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
   
-  ESP_LOGI(TAG, "  Built encrypted disco message: %d bytes total", message.size());
+  ESP_LOGD(TAG, "  Built encrypted disco message: %d bytes total", message.size());
 
   // Send UDP packet
   struct sockaddr_in dest_addr{};
@@ -3381,16 +3381,16 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   }
 
   // Log detailed packet information before sending
-  ESP_LOGI(TAG, "  Disco packet details:");
-  ESP_LOGI(TAG, "    Total size: %d bytes", message.size());
-  ESP_LOGI(TAG, "    Magic:      %02x %02x %02x %02x %02x %02x",
+  ESP_LOGD(TAG, "  Disco packet details:");
+  ESP_LOGD(TAG, "    Total size: %d bytes", message.size());
+  ESP_LOGD(TAG, "    Magic:      %02x %02x %02x %02x %02x %02x",
            message[0], message[1], message[2], message[3], message[4], message[5]);
-  ESP_LOGI(TAG, "    Our pubkey: %02x%02x%02x%02x... (32 bytes at offset 6)",
+  ESP_LOGD(TAG, "    Our pubkey: %02x%02x%02x%02x... (32 bytes at offset 6)",
            message[6], message[7], message[8], message[9]);
-  ESP_LOGI(TAG, "    Nonce:      %02x%02x%02x%02x... (24 bytes at offset 38)",
+  ESP_LOGD(TAG, "    Nonce:      %02x%02x%02x%02x... (24 bytes at offset 38)",
            message[38], message[39], message[40], message[41]);
-  ESP_LOGI(TAG, "    Encrypted:  %d bytes at offset 62", message.size() - 62);
-  ESP_LOGI(TAG, "  Destination: %s:%u", endpoint.c_str(), port);
+  ESP_LOGD(TAG, "    Encrypted:  %d bytes at offset 62", message.size() - 62);
+  ESP_LOGD(TAG, "  Destination: %s:%u", endpoint.c_str(), port);
 
   ssize_t sent = sendto(this->unified_socket_, message.data(), message.size(), 0,
                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
@@ -3399,10 +3399,10 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     ESP_LOGE(TAG, "❌ Failed to send disco ping: errno %d (%s)", errno, strerror(errno));
     ESP_LOGE(TAG, "   Socket: %d, Dest addr: %s:%u", this->unified_socket_, endpoint.c_str(), port);
   } else {
-    ESP_LOGI(TAG, "✓ Sent Disco ping (%d bytes) to %s:%u", sent, endpoint.c_str(), port);
-    ESP_LOGI(TAG, "  Full packet (hex): ");
+    ESP_LOGD(TAG, "✓ Sent Disco ping (%d bytes) to %s:%u", sent, endpoint.c_str(), port);
+    ESP_LOGD(TAG, "  Full packet (hex): ");
     for (size_t i = 0; i < std::min((size_t)sent, (size_t)80); i++) {
-      if (i % 16 == 0) ESP_LOGI(TAG, "    %04x:", i);
+      if (i % 16 == 0) ESP_LOGD(TAG, "    %04x:", i);
       printf(" %02x", (uint8_t)message[i]);
       if ((i + 1) % 16 == 0 || i == sent - 1) printf("\n");
     }
@@ -3792,8 +3792,8 @@ bool TailscaleComponent::perform_stun_query_() {
     stun_request[8 + i] = esp_random() % 256;
   }
 
-  ESP_LOGI(TAG, "STUN request to %s:%d (%d bytes):", stun_server, stun_port, (int)sizeof(stun_request));
-  ESP_LOGI(TAG, "  Hex: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+  ESP_LOGD(TAG, "STUN request to %s:%d (%d bytes):", stun_server, stun_port, (int)sizeof(stun_request));
+  ESP_LOGD(TAG, "  Hex: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
            stun_request[0], stun_request[1], stun_request[2], stun_request[3],
            stun_request[4], stun_request[5], stun_request[6], stun_request[7],
            stun_request[8], stun_request[9], stun_request[10], stun_request[11],
@@ -4378,18 +4378,18 @@ bool TailscaleComponent::check_server_keepalive_() {
     // Received a message from server!
     this->last_server_message_time_ = current_time;
 
-    ESP_LOGI(TAG, "✅ Received server message: %zu bytes", response_size);
+    ESP_LOGD(TAG, "✅ Received server message: %zu bytes", response_size);
 
     // Log the message content for debugging
     if (response_ptr && response_size > 0) {
       std::string message(response_ptr, std::min(response_size, (size_t)200));
-      ESP_LOGI(TAG, "   Message: %s", message.c_str());
+      ESP_LOGD(TAG, "   Message: %s", message.c_str());
 
       // Check if it's a keepalive message
       if (message.find("\"KeepAlive\":true") != std::string::npos) {
         ESP_LOGI(TAG, "   📡 Server keepalive received (connection alive)");
       } else {
-        ESP_LOGI(TAG, "   📥 Server sent data update (may contain new peer info)");
+        ESP_LOGD(TAG, "   📥 Server sent data update (may contain new peer info)");
         // TODO: Parse and process server updates (peer changes, network map updates, etc.)
       }
     }
@@ -4458,7 +4458,7 @@ bool TailscaleComponent::send_endpoint_update_() {
 
 // Handle packets received from DERP relay
 void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint8_t* packet, size_t len) {
-  ESP_LOGI(TAG, "← Received packet from DERP relay (%d bytes)", len);
+  ESP_LOGD(TAG, "← Received packet from DERP relay (%d bytes)", len);
 
   ESP_LOGD(TAG, "  From peer: %02x%02x%02x%02x...",
            peer_key[0], peer_key[1], peer_key[2], peer_key[3]);
@@ -4480,7 +4480,7 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
         break;
     }
 
-    ESP_LOGI(TAG, "  📦 Packet type: 0x%02x = %s", msg_type, type_name);
+    ESP_LOGD(TAG, "  📦 Packet type: 0x%02x = %s", msg_type, type_name);
     ESP_LOGD(TAG, "  Packet header: %02x%02x%02x%02x... (%d bytes)",
              packet[0], packet[1], packet[2], packet[3], len);
   }
@@ -4488,7 +4488,7 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
   // Route WireGuard packets to WireGuardSession (or buffer if session not ready)
   if (len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
     if (this->wg_session_) {
-      ESP_LOGI(TAG, "  ← Routing WireGuard packet to session");
+      ESP_LOGD(TAG, "  ← Routing WireGuard packet to session");
       if (!this->wg_session_->receive_wg_packet(packet, len)) {
         ESP_LOGW(TAG, "  Failed to process WireGuard packet");
       }
@@ -4944,7 +4944,7 @@ void TailscaleComponent::send_tcp_packet_(const TcpConnection& conn, uint8_t fla
 
   // Send via WireGuard
   if (this->wg_session_) {
-    ESP_LOGI(TAG, "→ Sending TCP packet: flags=0x%02x, seq=%u, ack=%u, payload=%zu bytes",
+    ESP_LOGD(TAG, "→ Sending TCP packet: flags=0x%02x, seq=%u, ack=%u, payload=%zu bytes",
              flags, conn.seq, conn.ack, payload_len);
     this->wg_session_->send_ip_packet(packet, total_len);
   }
@@ -4978,7 +4978,7 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
     return;
   }
 
-  ESP_LOGI(TAG, "← TCP packet: src=%u.%u.%u.%u:%u, dst_port=%u, flags=0x%02x, seq=%u, ack=%u",
+  ESP_LOGD(TAG, "← TCP packet: src=%u.%u.%u.%u:%u, dst_port=%u, flags=0x%02x, seq=%u, ack=%u",
            (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
            (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port, flags, seq, ack);
 
@@ -4996,7 +4996,7 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
 
   // Handle SYN (new connection)
   if ((flags & 0x02) && !(flags & 0x10)) {  // SYN without ACK
-    ESP_LOGI(TAG, "→ TCP SYN received, sending SYN-ACK");
+    ESP_LOGD(TAG, "→ TCP SYN received, sending SYN-ACK");
 
     // Find or create connection slot
     if (!conn) {
@@ -5038,7 +5038,7 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
   // Handle ACK (final handshake or data ACK)
   if (flags & 0x10) {  // ACK flag
     if (conn->state == TcpState::SYN_RECEIVED) {
-      ESP_LOGI(TAG, "→ TCP connection established");
+      ESP_LOGD(TAG, "→ TCP connection established");
       conn->state = TcpState::ESTABLISHED;
 
       // Notify socket of new connection
@@ -5052,14 +5052,14 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
   ESP_LOGD(TAG, "Checking for data: payload_len=%zu, state=%d (ESTABLISHED=%d)",
            payload_len, (int)conn->state, (int)TcpState::ESTABLISHED);
   if (payload_len > 0 && conn->state == TcpState::ESTABLISHED) {
-    ESP_LOGI(TAG, "← Received %zu bytes of data at seq=%u (expecting seq=%u)",
+    ESP_LOGD(TAG, "← Received %zu bytes of data at seq=%u (expecting seq=%u)",
              payload_len, seq, conn->ack);
 
     // TCP deduplication: Only process if this is new data at the expected sequence
     if (seq == conn->ack) {
       // Log received data as hex
       if (payload_len >= 8) {
-        ESP_LOGI(TAG, "   Data (hex): %02x %02x %02x %02x %02x %02x %02x %02x",
+        ESP_LOGD(TAG, "   Data (hex): %02x %02x %02x %02x %02x %02x %02x %02x",
                  payload[0], payload[1], payload[2], payload[3],
                  payload[4], payload[5], payload[6], payload[7]);
       }
@@ -5068,7 +5068,7 @@ void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len
       conn->rx_buffer.insert(conn->rx_buffer.end(), payload, payload + payload_len);
       conn->ack = seq + payload_len;  // Update ACK
 
-      ESP_LOGI(TAG, "   Buffer now has %zu bytes, next expected seq=%u",
+      ESP_LOGD(TAG, "   Buffer now has %zu bytes, next expected seq=%u",
                conn->rx_buffer.size(), conn->ack);
 
       // Notify socket of new data (after adding to buffer)
@@ -5159,7 +5159,7 @@ bool TailscaleComponent::bind_socket(uint16_t port, TailscaleSocket* socket) {
   socket->set_port(port);
   socket->set_parent(this);
 
-  ESP_LOGI(TAG, "Bound socket to port %u", port);
+  ESP_LOGD(TAG, "Bound socket to port %u", port);
   return true;
 }
 
