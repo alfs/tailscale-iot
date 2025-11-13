@@ -3400,12 +3400,6 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     ESP_LOGE(TAG, "   Socket: %d, Dest addr: %s:%u", this->unified_socket_, endpoint.c_str(), port);
   } else {
     ESP_LOGD(TAG, "✓ Sent Disco ping (%d bytes) to %s:%u", sent, endpoint.c_str(), port);
-    ESP_LOGD(TAG, "  Full packet (hex): ");
-    for (size_t i = 0; i < std::min((size_t)sent, (size_t)80); i++) {
-      if (i % 16 == 0) ESP_LOGD(TAG, "    %04x:", i);
-      printf(" %02x", (uint8_t)message[i]);
-      if ((i + 1) % 16 == 0 || i == sent - 1) printf("\n");
-    }
   }
 }
 
