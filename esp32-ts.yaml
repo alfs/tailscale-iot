@@ -45,8 +45,8 @@ wifi:
 
 # Enable logging
 logger:
-  #level: INFO
-  level: DEBUG
+  level: INFO
+  #level: DEBUG
   #level: VERBOSE
 
 # Time source (required)
@@ -66,12 +66,8 @@ tailscale:
   control_url: !secret headscale_url
   device_name: "esp"
   time_id: sntp_time
-  # wireguard_id: wg_iface  # Removed - Tailscale now manages WireGuard directly
   update_interval: 5s  # Reduced from 5s to 2s for faster reconnection checks
   allowed_peers: !secret allowed_peers
-  preferred_derp: 666
-
-# WireGuard component removed - Tailscale manages WireGuard directly via esp_wireguard API
-# This avoids "netif already added" conflict
-
+  preferred_derp: 999
+  prefer_direct_udp: true # Prefer direct UDP routing after Disco PONG confirmation, else use DERP
 

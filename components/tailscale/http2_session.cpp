@@ -260,25 +260,25 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   }
 
   // Read response frames
-  ESP_LOGD(TAG, "Reading response for stream %u", stream_id);
-  
+  ESP_LOGD(TAG, "Reading response for stream %u (close_stream=%d)", stream_id, close_stream);
+
   // Use static buffer instead of dynamic string to avoid heap fragmentation
   this->response_buffer_used_ = 0;
   // Only zero the first byte for null termination - no need to zero entire 80KB buffer
   if (this->response_buffer_) {
     this->response_buffer_[0] = '\0';
   }
-  
+
   status_code = 0;
   bool stream_open = true;
 
   while (stream_open) {
     App.feed_wdt();  // Reset watchdog during response reading
-    
+
     Frame frame;
     if (!this->read_frame_(frame, timeout_ms)) {
       // Check if we have complete JSON in static buffer (without creating temporary string!)
-      if (this->response_buffer_used_ > 0 && 
+      if (this->response_buffer_used_ > 0 &&
           this->has_complete_json_(this->response_buffer_, this->response_buffer_used_)) {
         ESP_LOGW(TAG, "Timed out waiting for additional frames; treating stream as complete after %zu bytes",
                  this->response_buffer_used_);
@@ -291,11 +291,14 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
     ESP_LOGD(TAG, "Response frame: type=%d, flags=0x%02x, stream_id=%u, length=%u",
              frame.type, frame.flags, frame.stream_id, frame.length);
 
-    // Ignore frames not for our stream (unless they're connection-level control frames)
+    // Handle frames for unexpected streams
     if (frame.stream_id != stream_id && frame.stream_id != 0) {
-      ESP_LOGE(TAG, "Received frame for unexpected stream %u (expected %u) - stream desync detected",
+      // Don't drain - just abort on unexpected stream
+      // This happens when there's a persistent stream active (stream 3) and we're sending
+      // a new request (stream 5+). The persistent stream data is NOT old/stale.
+      ESP_LOGE(TAG, "Received frame for unexpected stream %u (expected %u) - stream conflict",
                frame.stream_id, stream_id);
-      ESP_LOGE(TAG, "This usually means a previous request failed. Aborting to prevent buffer overflow.");
+      ESP_LOGE(TAG, "This usually means a persistent stream is active. Aborting this request.");
       return false;
     }
     switch (frame.type) {
