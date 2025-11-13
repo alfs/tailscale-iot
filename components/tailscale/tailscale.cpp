@@ -2392,7 +2392,7 @@ void TailscaleComponent::check_unified_socket_() {
     static uint32_t last_debug_log = 0;
     recvfrom_call_count++;
     if (millis() - last_debug_log >= 30000) {
-      ESP_LOGI(TAG, "🔍 recvfrom() called %u times (socket fd=%d, port=%u)",
+      ESP_LOGD(TAG, "🔍 recvfrom() called %u times (socket fd=%d, port=%u)",
                recvfrom_call_count, this->unified_socket_, this->unified_port_);
       last_debug_log = millis();
     }
@@ -2610,7 +2610,7 @@ void TailscaleComponent::check_icmp_responses_() {
         this->nat_discovery_state_.active = false;
 
         // Now send the actual disco ping with normal TTL
-        ESP_LOGI(TAG, "→ Sending disco PING to %s:%u (NAT will use %s:%u)",
+        ESP_LOGD(TAG, "→ Sending disco PING to %s:%u (NAT will use %s:%u)",
                  this->nat_discovery_state_.peer_ip.c_str(),
                  this->nat_discovery_state_.peer_port,
                  stun_ip_str.c_str(), nat_port);
