@@ -404,6 +404,47 @@ static void safe_strncpy(char *dest, const char *src, size_t dest_size, size_t s
   dest[copy_len] = '\0';
 }
 
+// Helper: Decode hex string to binary bytes (returns number of bytes decoded, or 0 on error)
+static size_t hex_decode_to_bytes(const char *hex_str, size_t hex_len, uint8_t *output, size_t output_size) {
+  if (hex_len % 2 != 0) {
+    ESP_LOGE(TAG, "Hex string has odd length: %zu", hex_len);
+    return 0;
+  }
+
+  size_t byte_count = hex_len / 2;
+  if (byte_count > output_size) {
+    ESP_LOGE(TAG, "Hex decode buffer too small: need %zu, have %zu", byte_count, output_size);
+    return 0;
+  }
+
+  for (size_t i = 0; i < hex_len; i += 2) {
+    char high = hex_str[i];
+    char low = hex_str[i + 1];
+
+    // Convert hex characters to nibbles
+    uint8_t high_nibble, low_nibble;
+    if (high >= '0' && high <= '9') high_nibble = high - '0';
+    else if (high >= 'a' && high <= 'f') high_nibble = high - 'a' + 10;
+    else if (high >= 'A' && high <= 'F') high_nibble = high - 'A' + 10;
+    else {
+      ESP_LOGE(TAG, "Invalid hex character: %c", high);
+      return 0;
+    }
+
+    if (low >= '0' && low <= '9') low_nibble = low - '0';
+    else if (low >= 'a' && low <= 'f') low_nibble = low - 'a' + 10;
+    else if (low >= 'A' && low <= 'F') low_nibble = low - 'A' + 10;
+    else {
+      ESP_LOGE(TAG, "Invalid hex character: %c", low);
+      return 0;
+    }
+
+    output[i / 2] = (high_nibble << 4) | low_nibble;
+  }
+
+  return byte_count;
+}
+
 // STATIC BUFFER PARSER - Absolutely NO heap allocations
 bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
                       const std::vector<std::string> *allowed_peers) {
@@ -490,12 +531,10 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
   // ========== Extract Peers (with optional filtering) ==========
   const char* peers_start = find_str(json, end, "\"Peers\":[");
   if (peers_start) {
-    // Storage limit is always MAX_PEERS (static buffer size)
-    // But when filtering, we scan ALL peers in the response
     if (allowed_peers && !allowed_peers->empty()) {
-      ESP_LOGI(TAG, "Found Peers section (scanning all peers, storing up to %d matches)", MAX_PEERS);
+      ESP_LOGI(TAG, "Found Peers section (filtering enabled, up to %d matches)", MAX_PEERS);
     } else {
-      ESP_LOGI(TAG, "Found Peers section (extracting first %d peers, no filtering)", MAX_PEERS);
+      ESP_LOGI(TAG, "Found Peers section (extracting first %d peers, no filter)", MAX_PEERS);
     }
 
     const char* peers_end = peers_start + 9;
@@ -508,7 +547,6 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
 
     const char* p = peers_start + 9;
     int peers_processed = 0;  // Count all peers seen
-    int peers_skipped = 0;    // Count peers skipped due to filtering
 
     while (p < peers_end && out.peer_count < MAX_PEERS) {
       // Find next peer object
@@ -524,37 +562,59 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
         peer_obj_end++;
       }
 
-      StaticPeerInfo *peer = &out.peers[out.peer_count];
+      MinimalPeerInfo *peer = &out.peers[out.peer_count];
       peer->valid = false;
-      peer->allowed_ip_count = 0;
 
-      // Extract Key (public key)
+      // Extract Key (node public key) - format: "nodekey:HEXSTRING"
       const char* key_field = find_str(peer_obj_start, peer_obj_end, "\"Key\":");
       if (key_field) {
         size_t key_len;
         const char* key_val = extract_quoted_value(key_field + 6, peer_obj_end, &key_len);
-        if (key_val) {
-          safe_strncpy(peer->public_key, key_val, sizeof(peer->public_key), key_len);
-          peer->valid = true;
+        if (key_val && key_len > 8) {
+          // Check for "nodekey:" prefix (8 chars)
+          const char* hex_start = key_val;
+          size_t hex_len = key_len;
+          if (key_len > 8 && memcmp(key_val, "nodekey:", 8) == 0) {
+            hex_start = key_val + 8;
+            hex_len = key_len - 8;
+          }
+
+          // Decode hex to binary (should be 64 hex chars = 32 bytes)
+          if (hex_decode_to_bytes(hex_start, hex_len, peer->node_key, sizeof(peer->node_key)) == 32) {
+            peer->valid = true;
+          } else {
+            ESP_LOGW(TAG, "  Failed to decode node key (len=%zu)", hex_len);
+          }
         }
       }
 
       if (!peer->valid) {
         p = peer_obj_end;
-        continue;  // Skip peers without keys
+        continue;  // Skip peers without valid node keys
       }
 
-      // Extract DiscoKey for NAT traversal
+      // Extract DiscoKey for NAT traversal - format: "discokey:HEXSTRING"
       const char* disco_field = find_str(peer_obj_start, peer_obj_end, "\"DiscoKey\":");
       if (disco_field) {
         size_t disco_len;
         const char* disco_val = extract_quoted_value(disco_field + 11, peer_obj_end, &disco_len);
-        if (disco_val) {
-          safe_strncpy(peer->disco_key, disco_val, sizeof(peer->disco_key), disco_len);
+        if (disco_val && disco_len > 9) {
+          // Check for "discokey:" prefix (9 chars)
+          const char* hex_start = disco_val;
+          size_t hex_len = disco_len;
+          if (disco_len > 9 && memcmp(disco_val, "discokey:", 9) == 0) {
+            hex_start = disco_val + 9;
+            hex_len = disco_len - 9;
+          }
+
+          // Decode hex to binary (should be 64 hex chars = 32 bytes)
+          if (hex_decode_to_bytes(hex_start, hex_len, peer->disco_key, sizeof(peer->disco_key)) != 32) {
+            ESP_LOGW(TAG, "  Failed to decode disco key (len=%zu)", hex_len);
+          }
         }
       }
 
-      // Extract Name (preferred) or HostName for easier identification
+      // Extract Name (preferred) or HostName for logging/debugging
       size_t hostname_len = 0;
       const char* hostname_val = nullptr;
 
@@ -579,68 +639,59 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
       if (allowed_peers && !allowed_peers->empty()) {
         bool is_allowed = false;
         std::string hostname_str(peer->hostname);
-        
+
         for (const auto& target : *allowed_peers) {
           if (hostname_str == target || hostname_str.find(target) == 0) {
             is_allowed = true;
             break;
           }
         }
-        
+
         if (!is_allowed) {
-          peers_skipped++;
-          ESP_LOGD(TAG, "  Skipping peer %d: %s (not in allowed list)", 
+          ESP_LOGD(TAG, "  Skipping peer %d: %s (not in allowed list)",
                    peers_processed, peer->hostname[0] ? peer->hostname : "(no hostname)");
           p = peer_obj_end;
           continue;  // Skip this peer
         }
       }
 
-      // Extract first Endpoint only
-      const char* endpoints_field = find_str(peer_obj_start, peer_obj_end, "\"Endpoints\":[");
-      if (endpoints_field) {
-        const char* ep_p = endpoints_field + 13;
-        size_t ep_len;
-        const char* ep_val = extract_quoted_value(ep_p, peer_obj_end, &ep_len);
-        if (ep_val) {
-          safe_strncpy(peer->endpoint, ep_val, sizeof(peer->endpoint), ep_len);
-        }
-      }
-
-      // Extract first 3 AllowedIPs
+      // Extract first AllowedIP as tailscale_ip (strip CIDR suffix)
       const char* allowed_field = find_str(peer_obj_start, peer_obj_end, "\"AllowedIPs\":[");
       if (allowed_field) {
         const char* ip_p = allowed_field + 14;
-        while (ip_p < peer_obj_end && peer->allowed_ip_count < MAX_ALLOWED_IPS) {
-          size_t ip_len;
-          const char* ip_val = extract_quoted_value(ip_p, peer_obj_end, &ip_len);
-          if (!ip_val) break;
-
-          safe_strncpy(peer->allowed_ips[peer->allowed_ip_count], ip_val,
-                      sizeof(peer->allowed_ips[0]), ip_len);
-          peer->allowed_ip_count++;
-
-          ip_p = ip_val + ip_len + 1;
-          if (ip_p >= peer_obj_end || *ip_p == ']') break;
+        size_t ip_len;
+        const char* ip_val = extract_quoted_value(ip_p, peer_obj_end, &ip_len);
+        if (ip_val) {
+          // Find CIDR slash and strip suffix (e.g., "100.64.0.17/32" -> "100.64.0.17")
+          size_t ip_only_len = ip_len;
+          for (size_t i = 0; i < ip_len; i++) {
+            if (ip_val[i] == '/') {
+              ip_only_len = i;
+              break;
+            }
+          }
+          safe_strncpy(peer->tailscale_ip, ip_val, sizeof(peer->tailscale_ip), ip_only_len);
         }
       }
 
       out.peer_count++;
-      ESP_LOGD(TAG, "  ✓ Peer %d: %s [%.16s...] (endpoint: %s, %d allowed IPs)",
+
+      // Log peer with first 8 bytes of disco key for verification
+      ESP_LOGD(TAG, "  ✓ Peer %d: %s (IP: %s, disco: %02x%02x%02x%02x...)",
                out.peer_count,
                peer->hostname[0] ? peer->hostname : "(no hostname)",
-               peer->public_key,
-               peer->endpoint[0] ? peer->endpoint : "none",
-               peer->allowed_ip_count);
+               peer->tailscale_ip[0] ? peer->tailscale_ip : "none",
+               peer->disco_key[0], peer->disco_key[1], peer->disco_key[2], peer->disco_key[3]);
 
       p = peer_obj_end;
     }
 
     if (allowed_peers && !allowed_peers->empty()) {
-      ESP_LOGI(TAG, "✓ Extracted %d peers (filtered from %d total, skipped %d)",
-               out.peer_count, peers_processed, peers_skipped);
+      ESP_LOGI(TAG, "✓ Extracted %d peers (filtered from %d total, using MinimalPeerInfo - %d bytes)",
+               out.peer_count, peers_processed, out.peer_count * sizeof(MinimalPeerInfo));
     } else {
-      ESP_LOGI(TAG, "✓ Extracted %d peers (static buffer, NO heap used)", out.peer_count);
+      ESP_LOGI(TAG, "✓ Extracted %d peers (no filter, using MinimalPeerInfo - %d bytes)",
+               out.peer_count, out.peer_count * sizeof(MinimalPeerInfo));
     }
   }
 
@@ -744,14 +795,20 @@ void print_peer_table(const StaticMapResponse &map) {
   ESP_LOGD(TAG, "");
 
   for (uint8_t i = 0; i < map.peer_count; i++) {
-    const StaticPeerInfo *peer = &map.peers[i];
+    const MinimalPeerInfo *peer = &map.peers[i];
     ESP_LOGD(TAG, "Peer #%d: %s", i + 1, peer->hostname[0] ? peer->hostname : "(no hostname)");
-    ESP_LOGD(TAG, "  Key:      %s", peer->public_key);
-    ESP_LOGD(TAG, "  Endpoint: %s", peer->endpoint[0] ? peer->endpoint : "(DERP only)");
-    ESP_LOGD(TAG, "  Allowed IPs (%d):", peer->allowed_ip_count);
-    for (uint8_t j = 0; j < peer->allowed_ip_count; j++) {
-      ESP_LOGD(TAG, "    - %s", peer->allowed_ips[j]);
-    }
+
+    // Display first 8 bytes of node_key in hex
+    ESP_LOGD(TAG, "  Node Key: %02x%02x%02x%02x%02x%02x%02x%02x...",
+             peer->node_key[0], peer->node_key[1], peer->node_key[2], peer->node_key[3],
+             peer->node_key[4], peer->node_key[5], peer->node_key[6], peer->node_key[7]);
+
+    // Display first 8 bytes of disco_key in hex
+    ESP_LOGD(TAG, "  Disco Key: %02x%02x%02x%02x%02x%02x%02x%02x...",
+             peer->disco_key[0], peer->disco_key[1], peer->disco_key[2], peer->disco_key[3],
+             peer->disco_key[4], peer->disco_key[5], peer->disco_key[6], peer->disco_key[7]);
+
+    ESP_LOGD(TAG, "  Tailscale IP: %s", peer->tailscale_ip[0] ? peer->tailscale_ip : "(none)");
   }
 
   ESP_LOGD(TAG, "==================================================");

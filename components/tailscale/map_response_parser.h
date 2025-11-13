@@ -9,12 +9,29 @@ namespace esphome {
 namespace tailscale {
 
 // STATIC BUFFER PEER STORAGE - NO HEAP ALLOCATIONS
-constexpr size_t MAX_PEERS = 5;  // Limit to first 5 peers to conserve memory
-constexpr size_t MAX_KEY_LEN = 80;  // Increased to fit "discokey:" (9) + 64 hex chars + null terminator
+constexpr size_t MAX_PEERS = 5;  // Start conservative - 5 peers × 112 bytes = 560 bytes (vs 2.7KB with old struct)
+constexpr size_t MAX_KEY_LEN = 80;  // For legacy compatibility (not used in MinimalPeerInfo)
 constexpr size_t MAX_ENDPOINT_LEN = 128;
 constexpr size_t MAX_ALLOWED_IPS = 3;
 constexpr size_t MAX_IP_LEN = 64;
 
+// Minimal peer info for dynamic discovery (saves memory: 112 bytes vs 544 bytes)
+struct MinimalPeerInfo {
+  uint8_t disco_key[32];      // Binary disco key for O(1) lookup on incoming disco packets
+  uint8_t node_key[32];       // Binary node key for WireGuard handshake
+  char tailscale_ip[16];      // e.g. "100.64.0.17" (for routing)
+  char hostname[32];          // For logging/debugging only
+  bool valid;
+
+  MinimalPeerInfo() : valid(false) {
+    memset(disco_key, 0, sizeof(disco_key));
+    memset(node_key, 0, sizeof(node_key));
+    memset(tailscale_ip, 0, sizeof(tailscale_ip));
+    memset(hostname, 0, sizeof(hostname));
+  }
+};
+
+// Legacy struct for backwards compatibility (not used in new code)
 struct StaticPeerInfo {
   char public_key[MAX_KEY_LEN];
   char disco_key[MAX_KEY_LEN];      // Disco key for NAT traversal
@@ -38,7 +55,7 @@ struct StaticMapResponse {
   char node_ipv4[48];  // IPv4 address like "100.64.0.5"
   // TODO: IPv6 support removed to conserve memory (~48 bytes saved)
   // To re-enable: add char node_ipv6[48] and update parser to extract IPv6 addresses
-  StaticPeerInfo peers[MAX_PEERS];
+  MinimalPeerInfo peers[MAX_PEERS];  // Using minimal struct for dynamic discovery
   uint8_t peer_count;
 
   // DERP relay server (first node from DERPMap)

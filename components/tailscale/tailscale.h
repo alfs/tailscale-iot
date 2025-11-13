@@ -12,7 +12,7 @@
 #include "map_payload.h"
 #include "hostinfo_builder.h"
 #include "derp_client.h"
-#include "wireguard_session.h"
+#include "wireguard_device_manager.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -55,6 +55,56 @@ struct NodeConfig {
   std::string ipv6_address;
   std::vector<PeerInfo> peers;
   std::string derp_region;
+};
+
+// Multi-peer session tracking
+struct PeerSession {
+  // Identity
+  std::string node_key;          // Binary node key (for DERP routing)
+  std::string disco_key;         // Disco key (for Disco encryption)
+  std::string tailscale_ip;      // Tailscale IP (e.g., "100.64.0.5") - routing key
+  std::string hostname;          // Hostname for filtering/logging
+  uint64_t node_id;              // Node ID from map response
+
+  // Network state
+  std::string endpoint;          // Last known IP:port
+  uint16_t endpoint_port;
+  uint32_t last_endpoint_update;
+
+  // WireGuard tunnel (peer managed by shared WireGuardDeviceManager)
+  uint32_t wg_rx_packets;
+  uint32_t wg_tx_packets;
+  uint32_t last_wg_activity;
+  uint32_t wireguard_local_index;   // Our receiver_index for this peer's data packets
+
+  // Disco protocol state
+  bool direct_path_confirmed;
+  uint32_t first_disco_ping_time;
+  uint32_t last_disco_pong_time;
+  bool derp_fallback_enabled;
+  uint32_t disco_ping_sent_count;
+  uint32_t last_disco_ping_time;
+
+  // Statistics
+  uint32_t created_at;
+  uint32_t last_activity;
+
+  PeerSession()
+      : endpoint_port(0),
+        last_endpoint_update(0),
+        wg_rx_packets(0),
+        wg_tx_packets(0),
+        last_wg_activity(0),
+        wireguard_local_index(0),
+        direct_path_confirmed(false),
+        first_disco_ping_time(0),
+        last_disco_pong_time(0),
+        derp_fallback_enabled(false),
+        disco_ping_sent_count(0),
+        last_disco_ping_time(0),
+        created_at(0),
+        last_activity(0),
+        node_id(0) {}
 };
 
 // TCP socket types (moved to namespace level for socket API)
@@ -233,8 +283,27 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<Ts2021Transport> ts2021_transport_;
   std::unique_ptr<Ts2021Upgrade> upgrade_channel_;
   std::unique_ptr<DerpClient> derp_client_;
-  std::unique_ptr<WireGuardSession> wg_session_;
+
+  // MULTI-PEER SUPPORT: Replace single wg_session_ with per-peer sessions
+  std::vector<PeerSession> peer_sessions_;                  // Active peer sessions (max MAX_PEERS)
+  std::map<std::string, size_t> ip_to_peer_;                // "100.64.0.x" -> peer_sessions_ index
+  std::map<std::string, size_t> disco_key_to_peer_;         // disco_key -> peer_sessions_ index
+  std::map<uint32_t, size_t> wireguard_receiver_to_peer_;   // WireGuard receiver_index -> peer_sessions_ index
+
+  // Performance optimization: Cache last successful peer index for O(1) lookup before O(n) scan
+  // Packets are typically consecutive from the same peer, so this avoids repeated linear scans
+  size_t last_rx_peer_idx_{SIZE_MAX};  // SIZE_MAX = no cached peer
+
+  // SHARED WIREGUARD DEVICE: ONE device for all peers (minimizes memory usage)
+  std::unique_ptr<WireGuardDeviceManager> wg_device_manager_;
   // derp_initialized_ removed - now using static variable in handle_fetching_map_state_() for true persistence
+
+  // Dynamic WireGuard peer switching (LRU eviction)
+  bool activate_peer_wireguard_(size_t peer_idx);
+  void deactivate_peer_wireguard_(size_t peer_idx);
+  size_t find_lru_active_wireguard_peer_();
+  size_t count_active_wireguard_peers_();
+  static constexpr size_t MAX_ACTIVE_WIREGUARD_PEERS = 1;  // One active peer, replace on contact from new peer
 
   // WireGuard packet buffer to handle race condition (packets arrive before session ready)
   struct BufferedPacket {

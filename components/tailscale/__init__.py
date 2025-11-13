@@ -78,7 +78,11 @@ async def to_code(config):
     # Add required libraries
     cg.add_library("droscy/esp_wireguard", "0.4.2")
     cg.add_library("esphome/libsodium", "1.10020.7")
-    
+
+    # Configure esp_wireguard library for dynamic peer switching
+    # Keep only 1 active WireGuard session, dynamically switch between peers using LRU eviction
+    cg.add_build_flag("-DCONFIG_WIREGUARD_MAX_PEERS=1")
+
     # Use linker wrapping to replace libsodium's sodium_init with our ESP32-C3 safe version
     cg.add_build_flag("-Wl,--wrap=sodium_init")
     

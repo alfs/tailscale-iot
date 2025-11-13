@@ -226,7 +226,7 @@ void TailscaleComponent::loop() {
   // - NEW packets arriving afterwards get buffered but never processed
   // - Result: Packets only released during "racing initiators" handshake attempts (~5s interval)
   // Fix: Continuously check and process buffered packets as they arrive
-  if (this->wg_session_) {
+  if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
     this->process_buffered_wg_packets_();
   }
 
@@ -492,247 +492,372 @@ void TailscaleComponent::handle_fetching_map_state_() {
              this->derp_client_.get());
   }
 
-  // Initialize WireGuard session for encrypted peer-to-peer communication
-  // Using WireGuardSession adapter to avoid esp_netif crashes - routes through unified socket/DERP
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // MULTI-PEER WIREGUARD SESSION INITIALIZATION
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // Initialize WireGuard sessions for encrypted peer-to-peer communication
+  // ARCHITECTURE: One WireGuardSession per peer, all sharing unified socket + DERP client
+  //
+  // Key data structures:
+  //   - peer_sessions_: Vector of PeerSession structs (one per peer)
+  //   - ip_to_peer_: Map from Tailscale IP -> peer_sessions_ index
+  //   - disco_key_to_peer_: Map from disco_key -> peer_sessions_ index
+  //   - wireguard_receiver_to_peer_: Map from WireGuard receiver_index -> peer_sessions_ index
+  //
+  // Routing:
+  //   - Outgoing: Application specifies destination IP -> lookup via ip_to_peer_ -> send via peer's WgSession
+  //   - Incoming WG: Extract receiver_index -> lookup via wireguard_receiver_to_peer_ -> decrypt via peer's WgSession
+  //   - Incoming Disco: Extract disco_key -> lookup via disco_key_to_peer_ -> handle PING/PONG for that peer
+  // ═══════════════════════════════════════════════════════════════════════════════════
+
   if (!this->node_config_.peers.empty()) {
-    ESP_LOGI(TAG, "→ Initializing WireGuard session with first peer...");
+    ESP_LOGI(TAG, "→ Initializing shared WireGuard device for %zu peer(s) (max %zu active)...",
+             this->node_config_.peers.size(), MAX_ACTIVE_WIREGUARD_PEERS);
 
-    // Decode our node private key (WireGuard uses node_key, not machine_key)
-    ESP_LOGD(TAG, "  Our node private key length: %zu", this->node_key_private_.size());
+    // Decode our node private key ONCE (shared across all peer sessions)
     std::string our_priv_raw = this->base64_decode(this->node_key_private_);
-    ESP_LOGD(TAG, "  Decoded our private key: %zu bytes", our_priv_raw.size());
-
-    // Get first peer's public key from map response
-    const auto& peer = this->node_config_.peers[0];
-    ESP_LOGD(TAG, "  Peer public key length: %zu", peer.public_key.size());
-    ESP_LOGD(TAG, "  Peer public key raw: %s", peer.public_key.c_str());
-
-    // Strip "nodekey:" prefix if present (Tailscale keys have prefixes)
-    std::string peer_pub_key = peer.public_key;
-    if (peer_pub_key.find("nodekey:") == 0) {
-      peer_pub_key = peer_pub_key.substr(8);  // Remove "nodekey:" prefix
-      ESP_LOGD(TAG, "  Stripped 'nodekey:' prefix, remaining: %s", peer_pub_key.c_str());
+    if (our_priv_raw.size() != 32) {
+      ESP_LOGE(TAG, "✗ Invalid our private key size: %zu bytes (expected 32)", our_priv_raw.size());
+      this->transition_to(TailscaleState::ERROR);
+      return;
     }
 
-    std::string peer_pub_raw = this->hex_decode(peer_pub_key);
-    ESP_LOGD(TAG, "  Decoded peer public key: %zu bytes", peer_pub_raw.size());
+    // Clear existing peer sessions (in case of reconnection)
+    this->peer_sessions_.clear();
+    this->ip_to_peer_.clear();
+    this->disco_key_to_peer_.clear();
+    this->wireguard_receiver_to_peer_.clear();
+    this->last_rx_peer_idx_ = SIZE_MAX;  // Invalidate cache
 
-    if (our_priv_raw.size() != 32 || peer_pub_raw.size() != 32) {
-      ESP_LOGE(TAG, "✗ Invalid key sizes (our_priv=%zu, peer_pub=%zu)",
-               our_priv_raw.size(), peer_pub_raw.size());
-    } else {
-      // Create WireGuard session
-      this->wg_session_ = std::make_unique<WireGuardSession>();
+    // Initialize the shared WireGuard device manager ONCE
+    this->wg_device_manager_ = std::make_unique<WireGuardDeviceManager>();
+    if (!this->wg_device_manager_->init((const uint8_t*)our_priv_raw.data())) {
+      ESP_LOGE(TAG, "✗ Failed to initialize WireGuard device manager");
+      this->transition_to(TailscaleState::ERROR);
+      return;
+    }
+    ESP_LOGI(TAG, "✓ WireGuard device manager initialized");
 
-      if (this->wg_session_->init((const uint8_t*)our_priv_raw.data(),
-                                   (const uint8_t*)peer_pub_raw.data(),
-                                   nullptr)) {  // No preshared key for Tailscale
+    // Set global send callback (routes packets based on peer IP)
+    this->wg_device_manager_->set_send_callback(
+      [this](const std::string& peer_tailscale_ip, const uint8_t* packet, size_t len) {
+        // Find peer session by IP
+        auto it = this->ip_to_peer_.find(peer_tailscale_ip);
+        if (it == this->ip_to_peer_.end()) {
+          ESP_LOGW(TAG, "✗ Cannot send WG packet: peer %s not found", peer_tailscale_ip.c_str());
+          return;
+        }
 
-        // Set up send callback - send WireGuard packets via direct UDP (if enabled) or DERP relay (default)
-        // IMPORTANT: Direct UDP requires both user preference (prefer_direct_udp_) AND Disco PONG confirmation.
-        // Fall back to DERP relay if direct path is not preferred/confirmed or direct send fails.
-        this->wg_session_->set_send_callback([this](const uint8_t* packet, size_t len) {
-          if (!this->node_config_.peers.empty()) {
-            const auto& peer = this->node_config_.peers[0];
+        size_t session_idx = it->second;
+        if (session_idx >= this->peer_sessions_.size()) {
+          ESP_LOGW(TAG, "✗ Invalid peer session index %zu", session_idx);
+          return;
+        }
 
-            // Use direct UDP only if:
-            // 1. User enabled it (prefer_direct_udp_)
-            // 2. Path is confirmed via Disco PONG (direct_path_confirmed_)
-            // 3. DERP fallback is NOT enabled (derp_fallback_enabled_)
-            if (this->prefer_direct_udp_ && this->direct_path_confirmed_ && !this->derp_fallback_enabled_ &&
-                !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
-              struct sockaddr_in dest_addr;
-              dest_addr.sin_family = AF_INET;
-              dest_addr.sin_port = htons(peer.port);
-              inet_pton(AF_INET, peer.endpoint.c_str(), &dest_addr.sin_addr);
+        PeerSession& peer_session = this->peer_sessions_[session_idx];
 
-              ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
-                                   (struct sockaddr*)&dest_addr, sizeof(dest_addr));
-              if (sent >= 0) {
-                this->wg_direct_udp_tx_++;
-                this->last_wg_direct_tx_time_ = millis();
-                ESP_LOGI(TAG, "📤 TX#%u: Direct UDP WireGuard to %s:%u (%zu bytes) [Total: Direct=%u/Failed=%u, DERP=%u]",
-                        this->wg_direct_udp_tx_, peer.endpoint.c_str(), peer.port, len,
-                        this->wg_direct_udp_tx_, this->wg_direct_udp_tx_failed_, this->wg_derp_tx_);
-              } else {
-                this->wg_direct_udp_tx_failed_++;
-                ESP_LOGW(TAG, "✗ TX FAILED: Direct UDP send failed, errno=%d (%s) [Failures: %u]",
-                        errno, strerror(errno), this->wg_direct_udp_tx_failed_);
-
-                // Fall back to DERP if direct send fails
-                if (this->derp_client_ && this->derp_client_->is_ready()) {
-                  std::string peer_pub_key = peer.public_key;
-                  if (peer_pub_key.find("nodekey:") == 0) {
-                    peer_pub_key = peer_pub_key.substr(8);
-                  }
-                  std::string peer_key_raw = this->hex_decode(peer_pub_key);
-                  if (peer_key_raw.size() == 32) {
-                    this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
-                    this->wg_derp_tx_++;
-                    ESP_LOGI(TAG, "→ Fell back to DERP relay (%zu bytes)", len);
-                  }
-                }
-              }
-            } else if (this->derp_client_ && this->derp_client_->is_ready()) {
-              // Fallback to DERP relay if direct path not confirmed or send failed
-              std::string peer_pub_key = peer.public_key;
-              if (peer_pub_key.find("nodekey:") == 0) {
-                peer_pub_key = peer_pub_key.substr(8);
-              }
-              std::string peer_key_raw = this->hex_decode(peer_pub_key);
-              if (peer_key_raw.size() == 32) {
-                this->derp_client_->send_packet((const uint8_t*)peer_key_raw.data(), packet, len);
-                this->wg_derp_tx_++;
-                ESP_LOGD(TAG, "📤 TX#%u: DERP relay (%zu bytes) [Direct not confirmed, Total: DERP=%u]",
-                        this->wg_derp_tx_, len, this->wg_derp_tx_);
-              } else {
-                ESP_LOGW(TAG, "✗ Invalid peer key size for DERP send");
-              }
-            } else {
-              ESP_LOGW(TAG, "✗ No route to send WireGuard packet (direct path not confirmed, DERP not ready)");
-            }
+        // DYNAMIC SWITCHING: Ensure peer has active WireGuard session
+        if (this->wg_device_manager_->get_peer(peer_session.tailscale_ip) == nullptr) {
+          ESP_LOGI(TAG, "Peer[%zu] %s not active, activating on-demand...", session_idx, peer_session.hostname.c_str());
+          if (!this->activate_peer_wireguard_(session_idx)) {
+            ESP_LOGE(TAG, "Failed to activate peer for send");
+            return;
           }
-        });
+        }
 
-        // Set up decrypt callback - handle decrypted IP packets
-        this->wg_session_->set_decrypt_callback([this](const uint8_t* ip_packet, size_t len) {
-          // Track RX based on current send mode
-          if (this->direct_path_confirmed_) {
-            this->wg_direct_udp_rx_++;
-            this->last_wg_direct_rx_time_ = millis();
-            uint32_t rtt = (this->last_wg_direct_tx_time_ > 0) ?
-                           (millis() - this->last_wg_direct_tx_time_) : 0;
-            ESP_LOGI(TAG, "📥 RX#%u: Decrypted IP packet via Direct UDP (%zu bytes) [RTT: %ums, Total: Direct RX=%u, TX=%u]",
-                    this->wg_direct_udp_rx_, len, rtt, this->wg_direct_udp_rx_, this->wg_direct_udp_tx_);
+        // Use direct UDP only if:
+        // 1. User enabled it (prefer_direct_udp_)
+        // 2. Path is confirmed via Disco PONG (peer_session.direct_path_confirmed)
+        // 3. DERP fallback is NOT enabled (peer_session.derp_fallback_enabled)
+        if (this->prefer_direct_udp_ && peer_session.direct_path_confirmed &&
+            !peer_session.derp_fallback_enabled &&
+            !peer_session.endpoint.empty() && peer_session.endpoint_port > 0 &&
+            this->unified_socket_ >= 0) {
+
+          struct sockaddr_in dest_addr;
+          dest_addr.sin_family = AF_INET;
+          dest_addr.sin_port = htons(peer_session.endpoint_port);
+          inet_pton(AF_INET, peer_session.endpoint.c_str(), &dest_addr.sin_addr);
+
+          ssize_t sent = sendto(this->unified_socket_, packet, len, 0,
+                               (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+          if (sent >= 0) {
+            peer_session.wg_tx_packets++;
+            peer_session.last_wg_activity = millis();
+            this->wg_direct_udp_tx_++;
+            this->last_wg_direct_tx_time_ = millis();
+            ESP_LOGD(TAG, "📤 Peer[%zu] %s: Direct UDP WG TX (%zu bytes)",
+                     session_idx, peer_session.hostname.c_str(), len);
           } else {
-            this->wg_derp_rx_++;
-            this->last_wg_derp_rx_time_ = millis();
-            ESP_LOGD(TAG, "📥 RX#%u: Decrypted IP packet via DERP (%zu bytes) [Total: DERP RX=%u, TX=%u]",
-                    this->wg_derp_rx_, len, this->wg_derp_rx_, this->wg_derp_tx_);
-          }
+            this->wg_direct_udp_tx_failed_++;
+            ESP_LOGW(TAG, "✗ Peer[%zu] %s: Direct UDP send failed, falling back to DERP",
+                     session_idx, peer_session.hostname.c_str());
 
-          // Validate minimum IP header size
-          if (len < 20) {
-            ESP_LOGW(TAG, "Packet too small for IP header");
-            return;
-          }
-
-          // Extract IP header fields
-          uint8_t ip_version = (ip_packet[0] >> 4) & 0x0F;
-          uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;  // IHL in bytes
-          uint8_t ip_protocol = ip_packet[9];
-
-          // Verify IPv4
-          if (ip_version != 4) {
-            ESP_LOGD(TAG, "Not IPv4 (version=%d), ignoring", ip_version);
-            return;
-          }
-
-          // Handle ICMP (protocol 1) or TCP (protocol 6)
-          if (ip_protocol == 6) {
-            // TCP handling
-            this->handle_tcp_packet_(ip_packet, len);
-            return;
-          } else if (ip_protocol != 1) {
-            // Not ICMP or TCP - unsupported
-            ESP_LOGD(TAG, "Unsupported protocol=%d, ignoring", ip_protocol);
-            return;
-          }
-
-          // ICMP handling - validate header size
-          if (len < ip_ihl + 8) {
-            ESP_LOGW(TAG, "Packet too small for ICMP header");
-            return;
-          }
-
-          // Extract ICMP header
-          const uint8_t* icmp_header = ip_packet + ip_ihl;
-          uint8_t icmp_type = icmp_header[0];
-          uint8_t icmp_code = icmp_header[1];
-
-          // Extract ICMP identifier and sequence number (both big-endian uint16_t)
-          uint16_t icmp_id = (icmp_header[4] << 8) | icmp_header[5];
-          uint16_t icmp_seq = (icmp_header[6] << 8) | icmp_header[7];
-
-          ESP_LOGD(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
-
-          // Handle ICMP Echo Request (type 8)
-          if (icmp_type == 8 && icmp_code == 0) {
-            ESP_LOGD(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
-
-            // Build ICMP Echo Reply packet
-            uint8_t reply[1500];  // Max MTU
-            size_t reply_len = len;
-
-            if (reply_len > sizeof(reply)) {
-              ESP_LOGW(TAG, "Packet too large to reply (%zu > %zu)", reply_len, sizeof(reply));
-              return;
+            // Fall back to DERP if direct send fails
+            if (this->derp_client_ && this->derp_client_->is_ready()) {
+              this->derp_client_->send_packet((const uint8_t*)peer_session.node_key.data(), packet, len);
+              peer_session.wg_tx_packets++;
+              peer_session.last_wg_activity = millis();
+              this->wg_derp_tx_++;
             }
+          }
+        } else if (this->derp_client_ && this->derp_client_->is_ready()) {
+          // Fallback to DERP relay if direct path not confirmed
+          this->derp_client_->send_packet((const uint8_t*)peer_session.node_key.data(), packet, len);
+          peer_session.wg_tx_packets++;
+          peer_session.last_wg_activity = millis();
+          this->wg_derp_tx_++;
+          ESP_LOGD(TAG, "📤 Peer[%zu] %s: DERP relay WG TX (%zu bytes)",
+                   session_idx, peer_session.hostname.c_str(), len);
+        } else {
+          ESP_LOGW(TAG, "✗ Peer[%zu] %s: No route to send WG packet",
+                   session_idx, peer_session.hostname.c_str());
+        }
+      });
 
-            // Copy original packet
-            memcpy(reply, ip_packet, len);
+    // Set global decrypt callback (routes decrypted packets based on peer IP)
+    this->wg_device_manager_->set_decrypt_callback(
+      [this](const std::string& peer_tailscale_ip, const uint8_t* ip_packet, size_t len) {
+        // Find peer session by IP
+        auto it = this->ip_to_peer_.find(peer_tailscale_ip);
+        if (it == this->ip_to_peer_.end()) {
+          ESP_LOGW(TAG, "✗ Cannot route decrypted packet: peer %s not found", peer_tailscale_ip.c_str());
+          return;
+        }
 
-            // Swap IP addresses (source ← → destination)
-            uint32_t temp_ip;
-            memcpy(&temp_ip, &reply[12], 4);  // Save source IP
-            memcpy(&reply[12], &reply[16], 4);  // Dest → Source
-            memcpy(&reply[16], &temp_ip, 4);  // Source → Dest
+        size_t session_idx = it->second;
+        if (session_idx >= this->peer_sessions_.size()) {
+          ESP_LOGW(TAG, "✗ Invalid peer session index %zu", session_idx);
+          return;
+        }
 
-            // Update IP header checksum (zero it first for calculation)
-            reply[10] = 0;
-            reply[11] = 0;
-            uint16_t ip_checksum = 0;
-            for (size_t i = 0; i < ip_ihl; i += 2) {
-              uint16_t word = (reply[i] << 8) | reply[i + 1];
-              uint32_t sum = ip_checksum + word;
-              ip_checksum = (sum & 0xFFFF) + (sum >> 16);
-            }
-            ip_checksum = ~ip_checksum;
-            reply[10] = ip_checksum >> 8;
-            reply[11] = ip_checksum & 0xFF;
+        PeerSession& peer_session = this->peer_sessions_[session_idx];
+        peer_session.wg_rx_packets++;
+        peer_session.last_wg_activity = millis();
 
-            // Change ICMP type to Echo Reply (0)
-            reply[ip_ihl] = 0;
+        // Track RX based on current send mode
+        if (peer_session.direct_path_confirmed) {
+          this->wg_direct_udp_rx_++;
+          this->last_wg_direct_rx_time_ = millis();
+          ESP_LOGD(TAG, "📥 Peer[%zu] %s: Direct UDP WG RX (%zu bytes)",
+                   session_idx, peer_session.hostname.c_str(), len);
+        } else {
+          this->wg_derp_rx_++;
+          this->last_wg_derp_rx_time_ = millis();
+          ESP_LOGD(TAG, "📥 Peer[%zu] %s: DERP relay WG RX (%zu bytes)",
+                   session_idx, peer_session.hostname.c_str(), len);
+        }
 
-            // Recalculate ICMP checksum
-            reply[ip_ihl + 2] = 0;  // Zero checksum field
-            reply[ip_ihl + 3] = 0;
-            size_t icmp_len = len - ip_ihl;
-            uint16_t icmp_checksum = 0;
-            for (size_t i = 0; i < icmp_len; i += 2) {
-              uint16_t word;
-              if (i + 1 < icmp_len) {
-                word = (reply[ip_ihl + i] << 8) | reply[ip_ihl + i + 1];
-              } else {
-                word = reply[ip_ihl + i] << 8;  // Last odd byte
-              }
-              uint32_t sum = icmp_checksum + word;
-              icmp_checksum = (sum & 0xFFFF) + (sum >> 16);
-            }
-            icmp_checksum = ~icmp_checksum;
-            reply[ip_ihl + 2] = icmp_checksum >> 8;
-            reply[ip_ihl + 3] = icmp_checksum & 0xFF;
+        // Validate minimum IP header size
+        if (len < 20) {
+          ESP_LOGW(TAG, "Packet too small for IP header");
+          return;
+        }
 
-            // Send reply via WireGuard
-            if (this->wg_session_->send_ip_packet(reply, reply_len)) {
-              ESP_LOGD(TAG, "   ✓ Sent ICMP Echo Reply (seq=%u, %zu bytes)", icmp_seq, reply_len);
+        // Extract IP header fields
+        uint8_t ip_version = (ip_packet[0] >> 4) & 0x0F;
+        uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;  // IHL in bytes
+        uint8_t ip_protocol = ip_packet[9];
+
+        // Verify IPv4
+        if (ip_version != 4) {
+          ESP_LOGD(TAG, "Not IPv4 (version=%d), ignoring", ip_version);
+          return;
+        }
+
+        // Handle ICMP (protocol 1) or TCP (protocol 6)
+        if (ip_protocol == 6) {
+          // TCP handling
+          this->handle_tcp_packet_(ip_packet, len);
+          return;
+        } else if (ip_protocol != 1) {
+          // Not ICMP or TCP - unsupported
+          ESP_LOGD(TAG, "Unsupported protocol=%d, ignoring", ip_protocol);
+          return;
+        }
+
+        // ICMP handling - validate header size
+        if (len < ip_ihl + 8) {
+          ESP_LOGW(TAG, "Packet too small for ICMP header");
+          return;
+        }
+
+        // Extract ICMP header
+        const uint8_t* icmp_header = ip_packet + ip_ihl;
+        uint8_t icmp_type = icmp_header[0];
+        uint8_t icmp_code = icmp_header[1];
+
+        // Extract ICMP identifier and sequence number (both big-endian uint16_t)
+        uint16_t icmp_id = (icmp_header[4] << 8) | icmp_header[5];
+        uint16_t icmp_seq = (icmp_header[6] << 8) | icmp_header[7];
+
+        ESP_LOGD(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
+
+        // Handle ICMP Echo Request (type 8)
+        if (icmp_type == 8 && icmp_code == 0) {
+          ESP_LOGD(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
+
+          // Build ICMP Echo Reply packet
+          uint8_t reply[1500];  // Max MTU
+          size_t reply_len = len;
+
+          if (reply_len > sizeof(reply)) {
+            ESP_LOGW(TAG, "Packet too large to reply (%zu > %zu)", reply_len, sizeof(reply));
+            return;
+          }
+
+          // Copy original packet
+          memcpy(reply, ip_packet, len);
+
+          // Swap IP addresses (source ← → destination)
+          uint32_t temp_ip;
+          memcpy(&temp_ip, &reply[12], 4);  // Save source IP
+          memcpy(&reply[12], &reply[16], 4);  // Dest → Source
+          memcpy(&reply[16], &temp_ip, 4);  // Source → Dest
+
+          // Update IP header checksum (zero it first for calculation)
+          reply[10] = 0;
+          reply[11] = 0;
+          uint16_t ip_checksum = 0;
+          for (size_t i = 0; i < ip_ihl; i += 2) {
+            uint16_t word = (reply[i] << 8) | reply[i + 1];
+            uint32_t sum = ip_checksum + word;
+            ip_checksum = (sum & 0xFFFF) + (sum >> 16);
+          }
+          ip_checksum = ~ip_checksum;
+          reply[10] = ip_checksum >> 8;
+          reply[11] = ip_checksum & 0xFF;
+
+          // Change ICMP type to Echo Reply (0)
+          reply[ip_ihl] = 0;
+
+          // Recalculate ICMP checksum
+          reply[ip_ihl + 2] = 0;  // Zero checksum field
+          reply[ip_ihl + 3] = 0;
+          size_t icmp_len = len - ip_ihl;
+          uint16_t icmp_checksum = 0;
+          for (size_t i = 0; i < icmp_len; i += 2) {
+            uint16_t word;
+            if (i + 1 < icmp_len) {
+              word = (reply[ip_ihl + i] << 8) | reply[ip_ihl + i + 1];
             } else {
-              ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply (seq=%u)", icmp_seq);
+              word = reply[ip_ihl + i] << 8;  // Last odd byte
             }
+            uint32_t sum = icmp_checksum + word;
+            icmp_checksum = (sum & 0xFFFF) + (sum >> 16);
           }
-        });
+          icmp_checksum = ~icmp_checksum;
+          reply[ip_ihl + 2] = icmp_checksum >> 8;
+          reply[ip_ihl + 3] = icmp_checksum & 0xFF;
 
-        // NOTE: Handshake will be sent AFTER DERP connects (see handle_connected_state_)
-        // Starting handshake immediately here caused "Cannot send packet - not connected" errors
-        ESP_LOGI(TAG, "✓ WireGuard session initialized, waiting for DERP connection");
+          // Send reply via WireGuard device manager
+          if (this->wg_device_manager_->send_ip_packet(peer_tailscale_ip, reply, reply_len)) {
+            ESP_LOGD(TAG, "   ✓ Sent ICMP Echo Reply to Peer[%zu] %s (seq=%u, %zu bytes)",
+                     session_idx, peer_session.hostname.c_str(), icmp_seq, reply_len);
+          } else {
+            ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply to Peer[%zu] (seq=%u)",
+                     session_idx, icmp_seq);
+          }
+        }
+      });
 
-        // Process any packets that arrived before session was ready
-        this->process_buffered_wg_packets_();
-      } else {
-        ESP_LOGE(TAG, "Failed to initialize WireGuard session");
-        this->wg_session_.reset();
+    // Populate peer_sessions_ with ALL peers (lightweight tracking)
+    size_t peer_idx = 0;
+    for (const auto& peer_config : this->node_config_.peers) {
+      // Get peer's Tailscale IP from allowed_ips (first IP in the list)
+      std::string peer_tailscale_ip;
+      if (!peer_config.allowed_ips.empty()) {
+        peer_tailscale_ip = peer_config.allowed_ips[0];
+        // Strip CIDR suffix if present (e.g., "100.64.0.5/32" -> "100.64.0.5")
+        size_t slash_pos = peer_tailscale_ip.find('/');
+        if (slash_pos != std::string::npos) {
+          peer_tailscale_ip = peer_tailscale_ip.substr(0, slash_pos);
+        }
+      }
+
+      ESP_LOGI(TAG, "  → Peer %zu/%zu: %s (%s)",
+               peer_idx + 1, this->node_config_.peers.size(),
+               peer_config.hostname.empty() ? "unknown" : peer_config.hostname.c_str(),
+               peer_tailscale_ip.c_str());
+
+      if (peer_tailscale_ip.empty()) {
+        ESP_LOGW(TAG, "    ✗ No Tailscale IP found, skipping peer");
+        peer_idx++;
+        continue;
+      }
+
+      // Create PeerSession struct (WITHOUT wg_session field - managed by WireGuardDeviceManager)
+      PeerSession session;
+      session.tailscale_ip = peer_tailscale_ip;
+      session.hostname = peer_config.hostname;
+      session.node_id = peer_config.node_id;
+      session.endpoint = peer_config.endpoint;
+      session.endpoint_port = peer_config.port;
+      session.created_at = millis();
+      session.last_activity = millis();
+
+      // Store node_key (binary, for DERP routing)
+      std::string peer_pub_key = peer_config.public_key;
+      if (peer_pub_key.find("nodekey:") == 0) {
+        peer_pub_key = peer_pub_key.substr(8);  // Strip "nodekey:" prefix
+      }
+      session.node_key = this->hex_decode(peer_pub_key);
+
+      // Store disco_key (binary, for Disco encryption)
+      if (!peer_config.disco_key.empty()) {
+        std::string disco_key = peer_config.disco_key;
+        if (disco_key.find("discokey:") == 0) {
+          disco_key = disco_key.substr(9);  // Strip "discokey:" prefix
+        }
+        session.disco_key = this->hex_decode(disco_key);
+      }
+
+      // Validate key sizes
+      if (session.node_key.size() != 32) {
+        ESP_LOGW(TAG, "    ✗ Invalid node_key size (%zu bytes), skipping peer", session.node_key.size());
+        peer_idx++;
+        continue;
+      }
+
+      // Add to peer_sessions_ vector (DO NOT activate WireGuard session yet)
+      this->peer_sessions_.push_back(std::move(session));
+      size_t session_idx = this->peer_sessions_.size() - 1;
+
+      // Build lookup maps
+      this->ip_to_peer_[peer_tailscale_ip] = session_idx;
+      if (!this->peer_sessions_[session_idx].disco_key.empty()) {
+        this->disco_key_to_peer_[this->peer_sessions_[session_idx].disco_key] = session_idx;
+      }
+
+      ESP_LOGI(TAG, "    ✓ Peer[%zu] %s: Added to tracking (not yet activated)",
+               session_idx, this->peer_sessions_[session_idx].hostname.c_str());
+
+      peer_idx++;
+    }
+
+    // Activate WireGuard sessions for first N peers only (dynamic switching)
+    size_t peers_to_activate = std::min(this->peer_sessions_.size(), MAX_ACTIVE_WIREGUARD_PEERS);
+    ESP_LOGI(TAG, "→ Activating WireGuard sessions for first %zu peers (max %zu active)...",
+             peers_to_activate, MAX_ACTIVE_WIREGUARD_PEERS);
+
+    for (size_t i = 0; i < peers_to_activate; i++) {
+      if (!this->activate_peer_wireguard_(i)) {
+        ESP_LOGW(TAG, "  ✗ Failed to activate peer[%zu]", i);
       }
     }
+
+    // Log multi-peer initialization summary
+    ESP_LOGI(TAG, "✓ Initialized with %zu total peers, %zu active WireGuard sessions",
+             this->peer_sessions_.size(), this->count_active_wireguard_peers_());
+    ESP_LOGI(TAG, "  Lookup maps: IP→Peer=%zu, DiscoKey→Peer=%zu",
+             this->ip_to_peer_.size(), this->disco_key_to_peer_.size());
+
+    // NOTE: Handshake will be sent AFTER DERP connects (see handle_connected_state_)
+    // Starting handshake immediately here caused "Cannot send packet - not connected" errors
+
+    // Process any packets that arrived before device was ready
+    this->process_buffered_wg_packets_();
+
   } else {
     ESP_LOGW(TAG, "No peers available - skipping WireGuard initialization");
   }
@@ -845,31 +970,39 @@ void TailscaleComponent::handle_connected_state_() {
         }
       }
 
-      // Step 2: Check if DERP is fully READY before sending WireGuard handshake
+      // Step 2: Check if DERP is fully READY before sending WireGuard handshakes
       // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
       // Must wait for DERP handshake to complete before sending WireGuard packets
       if (this->derp_client_->is_ready() && !this->wg_handshake_sent_) {
         // Start UDP relay for WireGuard → DERP packet forwarding
         this->start_udp_relay_();
 
-        // DERP FALLBACK MODE: Enable initiator mode for non-responsive peers
-        // When Disco PONG timeout occurs (peer doesn't respond to our PINGs),
+        // MULTI-PEER HANDSHAKE: Initiate handshakes for peers that need DERP fallback
+        // DERP FALLBACK MODE: When Disco PONG timeout occurs (peer doesn't respond to PINGs),
         // switch from responder-only to initiator mode to establish WireGuard via DERP
-        if (this->derp_fallback_enabled_ && this->wg_session_) {
-          ESP_LOGI(TAG, "🔄 DERP fallback mode - initiating WireGuard handshake via DERP");
-          if (this->wg_session_->start_handshake()) {
-            ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP (initiator mode)");
-            this->wg_handshake_sent_ = true;
+        for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+          auto& peer = this->peer_sessions_[i];
+
+          if (peer.derp_fallback_enabled) {
+            ESP_LOGI(TAG, "🔄 Peer[%zu] %s: DERP fallback mode - initiating WireGuard handshake via DERP",
+                     i, peer.hostname.c_str());
+            if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
+              ESP_LOGI(TAG, "✓ Peer[%zu] %s: WireGuard handshake sent via DERP (initiator mode)",
+                       i, peer.hostname.c_str());
+            } else {
+              ESP_LOGW(TAG, "✗ Peer[%zu] %s: Failed to initiate WireGuard handshake",
+                       i, peer.hostname.c_str());
+            }
           } else {
-            ESP_LOGW(TAG, "Failed to initiate WireGuard handshake");
+            // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
+            // Auto-initiation is DISABLED to avoid racing initiators crash
+            // The WireGuard library doesn't handle transitioning from initiator to responder
+            ESP_LOGD(TAG, "Peer[%zu] %s: DERP ready - waiting for peer to initiate (responder-only mode)",
+                     i, peer.hostname.c_str());
           }
-        } else {
-          // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
-          // Auto-initiation is DISABLED to avoid racing initiators crash
-          // The WireGuard library doesn't handle transitioning from initiator to responder
-          ESP_LOGI(TAG, "DERP ready - waiting for peer to initiate (responder-only mode)");
-          this->wg_handshake_sent_ = true;  // Prevent repeated logging
         }
+
+        this->wg_handshake_sent_ = true;  // Prevent repeated logging
 
         // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
         // Server already knows ESP32 prefers DERP 28 from initial map request
@@ -1949,44 +2082,45 @@ bool TailscaleComponent::fetch_map_response_() {
   }
   // TODO: IPv6 support removed to save memory
 
-  // Convert static peers to NodeConfig peers
+  // Convert MinimalPeerInfo to NodeConfig (lightweight conversion, filtered peers only)
   this->node_config_.peers.clear();
   this->node_config_.peers.reserve(this->static_map_.peer_count);
 
   for (uint8_t i = 0; i < this->static_map_.peer_count; i++) {
-    const StaticPeerInfo *static_peer = &this->static_map_.peers[i];
+    const MinimalPeerInfo *static_peer = &this->static_map_.peers[i];
     if (!static_peer->valid) continue;
 
-    // Filtering is now done during parsing, so all peers here are already approved
     PeerInfo peer;
-    peer.public_key = static_peer->public_key;
-    peer.disco_key = static_peer->disco_key;
+
+    // Convert binary keys to hex strings
+    char node_key_hex[65];
+    for (int j = 0; j < 32; j++) {
+      snprintf(&node_key_hex[j * 2], 3, "%02x", static_peer->node_key[j]);
+    }
+    node_key_hex[64] = '\0';
+    peer.public_key = std::string("nodekey:") + node_key_hex;
+
+    char disco_key_hex[65];
+    for (int j = 0; j < 32; j++) {
+      snprintf(&disco_key_hex[j * 2], 3, "%02x", static_peer->disco_key[j]);
+    }
+    disco_key_hex[64] = '\0';
+    peer.disco_key = std::string("discokey:") + disco_key_hex;
+
     peer.hostname = static_peer->hostname;
+    peer.endpoint = "";
+    peer.port = 0;
 
-    // Parse endpoint
-    if (static_peer->endpoint[0] != '\0') {
-      std::string ep_str = static_peer->endpoint;
-      auto colon = ep_str.find_last_of(':');
-      if (colon != std::string::npos) {
-        peer.endpoint = ep_str.substr(0, colon);
-        peer.port = static_cast<uint16_t>(atoi(ep_str.substr(colon + 1).c_str()));
-      } else {
-        peer.endpoint = ep_str;
-        peer.port = 51820;
-      }
+    if (static_peer->tailscale_ip[0] != '\0') {
+      peer.allowed_ips.push_back(std::string(static_peer->tailscale_ip) + "/32");
     }
 
-    // Copy allowed IPs
-    for (uint8_t j = 0; j < static_peer->allowed_ip_count; j++) {
-      peer.allowed_ips.push_back(static_peer->allowed_ips[j]);
-    }
-
-    peer.online = (static_peer->endpoint[0] != '\0');
-
+    peer.online = false;
     this->node_config_.peers.push_back(std::move(peer));
   }
 
-  ESP_LOGD(TAG, "Converted %d static peers to NodeConfig", this->node_config_.peers.size());
+  ESP_LOGI(TAG, "✓ Converted %d peers (MinimalPeerInfo saved %d bytes static storage)",
+           this->node_config_.peers.size(), this->static_map_.peer_count * (544 - 112));
 
   // Initialize watchdog timer - we just received a message from the server
   this->last_server_message_time_ = millis();
@@ -2855,16 +2989,22 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     char src_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
     uint16_t src_port = ntohs(src->sin_port);
-    ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u to session",
+    ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u",
              buf[0], len, src_ip, src_port);
-    if (this->wg_session_) {
-      if (this->wg_session_->receive_wg_packet(buf, len)) {
-        ESP_LOGD(TAG, "✓ WireGuard packet processed successfully");
+
+    // Route packet to WireGuard device manager (it handles peer routing internally via receiver_index)
+    if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
+      if (this->wg_device_manager_->receive_wg_packet(buf, len)) {
+        ESP_LOGD(TAG, "✓ WireGuard packet processed by device manager");
       } else {
-        ESP_LOGW(TAG, "✗ WireGuard packet processing failed");
+        if (this->peer_sessions_.empty()) {
+          ESP_LOGW(TAG, "⚠️  WireGuard packet received but no peer sessions active");
+        } else {
+          ESP_LOGW(TAG, "✗ WireGuard packet could not be processed by device manager");
+        }
       }
     } else {
-      ESP_LOGW(TAG, "⚠️  WireGuard packet received but no session active");
+      ESP_LOGW(TAG, "✗ WireGuard device manager not initialized");
     }
     return;
   }
@@ -3260,6 +3400,95 @@ void TailscaleComponent::handle_wireguard_packet_(uint8_t* buf, size_t len, stru
   ESP_LOGW(TAG, "   %zu bytes from %s:%u", len, src_ip, src_port);
   ESP_LOGW(TAG, "   With direct esp_wireguard control, WireGuard should receive packets on its own socket.");
   ESP_LOGW(TAG, "   This packet will be ignored. Check network configuration if this appears frequently.");
+}
+
+// ========================================
+// DYNAMIC WIREGUARD PEER SWITCHING (LRU)
+// ========================================
+// Activate WireGuard session for a specific peer (with LRU eviction)
+bool TailscaleComponent::activate_peer_wireguard_(size_t peer_idx) {
+  if (peer_idx >= this->peer_sessions_.size()) {
+    ESP_LOGE(TAG, "Invalid peer index: %zu", peer_idx);
+    return false;
+  }
+
+  auto& peer = this->peer_sessions_[peer_idx];
+
+  // Check if peer already has active WireGuard session
+  if (this->wg_device_manager_->get_peer(peer.tailscale_ip) != nullptr) {
+    ESP_LOGD(TAG, "Peer[%zu] %s already has active WireGuard session", peer_idx, peer.hostname.c_str());
+    return true;
+  }
+
+  // Check if we need to evict an active peer first
+  size_t active_count = this->count_active_wireguard_peers_();
+  if (active_count >= MAX_ACTIVE_WIREGUARD_PEERS) {
+    size_t lru_idx = this->find_lru_active_wireguard_peer_();
+    if (lru_idx != SIZE_MAX) {
+      uint32_t now = millis();
+      uint32_t idle_time = now - this->peer_sessions_[lru_idx].last_wg_activity;
+      ESP_LOGW(TAG, "🔄 PEER REPLACEMENT: Evicting peer[%zu] %s (idle: %u ms) -> Activating peer[%zu] %s",
+               lru_idx, this->peer_sessions_[lru_idx].hostname.c_str(), idle_time,
+               peer_idx, peer.hostname.c_str());
+      this->deactivate_peer_wireguard_(lru_idx);
+    }
+  }
+
+  // Activate WireGuard session for this peer
+  ESP_LOGI(TAG, "Activating WireGuard session for peer[%zu] %s (%s)",
+           peer_idx, peer.hostname.c_str(), peer.tailscale_ip.c_str());
+
+  // Add peer to WireGuard device manager
+  const uint8_t* peer_pub_key = reinterpret_cast<const uint8_t*>(peer.node_key.data());
+  if (!this->wg_device_manager_->add_peer(peer.tailscale_ip, peer_pub_key, nullptr)) {
+    ESP_LOGE(TAG, "Failed to add peer to WireGuard device");
+    return false;
+  }
+
+  ESP_LOGI(TAG, "✓ Peer[%zu] %s activated (%zu/%zu active)",
+           peer_idx, peer.hostname.c_str(),
+           this->count_active_wireguard_peers_(), MAX_ACTIVE_WIREGUARD_PEERS);
+  return true;
+}
+
+// Deactivate WireGuard session for a specific peer
+void TailscaleComponent::deactivate_peer_wireguard_(size_t peer_idx) {
+  if (peer_idx >= this->peer_sessions_.size()) {
+    return;
+  }
+
+  auto& peer = this->peer_sessions_[peer_idx];
+
+  // Remove peer from WireGuard device manager
+  this->wg_device_manager_->remove_peer(peer.tailscale_ip);
+
+  ESP_LOGI(TAG, "Deactivated WireGuard session for peer[%zu] %s",
+           peer_idx, peer.hostname.c_str());
+}
+
+// Find the least recently used active WireGuard peer (for eviction)
+size_t TailscaleComponent::find_lru_active_wireguard_peer_() {
+  size_t lru_idx = SIZE_MAX;
+  uint32_t oldest_activity = UINT32_MAX;
+
+  for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+    auto& peer = this->peer_sessions_[i];
+
+    // Check if peer has active WireGuard session
+    if (this->wg_device_manager_->get_peer(peer.tailscale_ip) != nullptr) {
+      if (peer.last_wg_activity < oldest_activity) {
+        oldest_activity = peer.last_wg_activity;
+        lru_idx = i;
+      }
+    }
+  }
+
+  return lru_idx;
+}
+
+// Count the number of active WireGuard peers
+size_t TailscaleComponent::count_active_wireguard_peers_() {
+  return this->wg_device_manager_->get_peer_count();
 }
 
 // ========================================
@@ -4555,15 +4784,53 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
              packet[0], packet[1], packet[2], packet[3], len);
   }
 
-  // Route WireGuard packets to WireGuardSession (or buffer if session not ready)
+  // Route WireGuard packets to correct peer's WireGuardSession (or buffer if session not ready)
   if (len > 0 && (packet[0] >= 0x01 && packet[0] <= 0x04)) {
-    if (this->wg_session_) {
-      ESP_LOGD(TAG, "  ← Routing WireGuard packet to session");
-      if (!this->wg_session_->receive_wg_packet(packet, len)) {
-        ESP_LOGW(TAG, "  Failed to process WireGuard packet");
+    // MULTI-PEER ROUTING: Find peer by node_key (peer_key parameter is the sender's node_key)
+    std::string peer_key_str((const char*)peer_key, 32);  // node_key is 32 bytes
+    size_t peer_idx = SIZE_MAX;
+
+    for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+      if (this->peer_sessions_[i].node_key == peer_key_str) {
+        peer_idx = i;
+        break;
       }
-    } else {
-      // Session not ready yet - buffer the packet
+    }
+
+    if (peer_idx != SIZE_MAX) {
+      // Found matching peer - check if active, activate if needed (dynamic switching)
+      auto& peer = this->peer_sessions_[peer_idx];
+
+      // Check if peer is active in WireGuard device manager
+      ESP_LOGD(TAG, "  🔍 Checking if Peer[%zu] %s (IP: %s) is active in WireGuard...",
+               peer_idx, peer.hostname.c_str(), peer.tailscale_ip.c_str());
+
+      auto* existing_peer = this->wg_device_manager_ ? this->wg_device_manager_->get_peer(peer.tailscale_ip) : nullptr;
+      ESP_LOGD(TAG, "  🔍 wg_device_manager_=%p, get_peer result=%p",
+               this->wg_device_manager_.get(), existing_peer);
+
+      if (this->wg_device_manager_ && existing_peer == nullptr) {
+        ESP_LOGI(TAG, "  ⚡ Auto-activating Peer[%zu] %s for incoming WireGuard packet",
+                 peer_idx, peer.hostname.c_str());
+        this->activate_peer_wireguard_(peer_idx);
+      } else if (existing_peer != nullptr) {
+        ESP_LOGD(TAG, "  ✓ Peer[%zu] %s already active in WireGuard", peer_idx, peer.hostname.c_str());
+      }
+
+      ESP_LOGD(TAG, "  ← Routing WireGuard packet from Peer[%zu] %s", peer_idx, peer.hostname.c_str());
+    }
+
+    // Route to WireGuard device manager (it handles peer routing internally via receiver_index)
+    if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
+      if (!this->wg_device_manager_->receive_wg_packet(packet, len)) {
+        if (peer_idx != SIZE_MAX) {
+          ESP_LOGW(TAG, "  Failed to process WireGuard packet from Peer[%zu]", peer_idx);
+        } else {
+          ESP_LOGW(TAG, "  ✗ No peer could process WireGuard packet");
+        }
+      }
+    } else if (this->peer_sessions_.empty()) {
+      // No sessions ready - buffer the packet
       if (this->wg_packet_buffer_.size() < MAX_BUFFERED_PACKETS && len <= 1500) {
         BufferedPacket buffered;
         memcpy(buffered.data, packet, len);
@@ -4850,8 +5117,16 @@ void TailscaleComponent::process_buffered_wg_packets_() {
     }
 
     ESP_LOGD(TAG, "  Processing buffered packet (%zu bytes, age: %u ms)", buffered.len, age);
-    if (!this->wg_session_->receive_wg_packet(buffered.data, buffered.len)) {
-      ESP_LOGW(TAG, "  Failed to process buffered packet");
+
+    // Route to WireGuard device manager (it handles peer routing internally)
+    if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
+      if (!this->wg_device_manager_->receive_wg_packet(buffered.data, buffered.len)) {
+        ESP_LOGW(TAG, "  Failed to process buffered packet");
+      } else {
+        ESP_LOGD(TAG, "  ✓ Buffered packet processed by device manager");
+      }
+    } else {
+      ESP_LOGW(TAG, "  ✗ Cannot process buffered packet: device manager not initialized");
     }
   }
 
@@ -5012,11 +5287,30 @@ void TailscaleComponent::send_tcp_packet_(const TcpConnection& conn, uint8_t fla
   tcp[16] = (tcp_checksum >> 8) & 0xFF;
   tcp[17] = tcp_checksum & 0xFF;
 
-  // Send via WireGuard
-  if (this->wg_session_) {
-    ESP_LOGD(TAG, "→ Sending TCP packet: flags=0x%02x, seq=%u, ack=%u, payload=%zu bytes",
-             flags, conn.seq, conn.ack, payload_len);
-    this->wg_session_->send_ip_packet(packet, total_len);
+  // Send via WireGuard - MULTI-PEER: Find peer by destination IP
+  // conn.src_ip is the remote peer's IP (confusing naming - src from their perspective)
+  char peer_ip_str[32];
+  snprintf(peer_ip_str, sizeof(peer_ip_str), "%u.%u.%u.%u",
+           (conn.src_ip >> 24) & 0xFF, (conn.src_ip >> 16) & 0xFF,
+           (conn.src_ip >> 8) & 0xFF, conn.src_ip & 0xFF);
+
+  auto it = this->ip_to_peer_.find(peer_ip_str);
+  if (it != this->ip_to_peer_.end()) {
+    size_t peer_idx = it->second;
+    auto& peer = this->peer_sessions_[peer_idx];
+    ESP_LOGD(TAG, "→ Sending TCP packet to Peer[%zu] %s: flags=0x%02x, seq=%u, ack=%u, payload=%zu bytes",
+             peer_idx, peer.hostname.c_str(), flags, conn.seq, conn.ack, payload_len);
+
+    // Send via WireGuard device manager
+    if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
+      if (!this->wg_device_manager_->send_ip_packet(peer.tailscale_ip, packet, total_len)) {
+        ESP_LOGW(TAG, "✗ Failed to send TCP packet to Peer[%zu] %s", peer_idx, peer.hostname.c_str());
+      }
+    } else {
+      ESP_LOGW(TAG, "✗ WireGuard device manager not initialized");
+    }
+  } else {
+    ESP_LOGW(TAG, "✗ No peer found for IP %s", peer_ip_str);
   }
 }
 

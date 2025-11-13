@@ -45,9 +45,9 @@ wifi:
 
 # Enable logging
 logger:
-  level: INFO
+  #level: INFO
   #level: DEBUG
-  #level: VERBOSE
+  level: VERBOSE
 
 # Time source (required)
 time:
