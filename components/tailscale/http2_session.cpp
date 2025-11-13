@@ -717,7 +717,7 @@ bool Http2Session::pull_bytes_(uint32_t timeout_ms) {
   std::vector<uint8_t> chunk;
   ESP_LOGD(TAG, "pull_bytes_: calling recv_cb to decrypt next message...");
   if (!this->recv_cb_(chunk, timeout_ms)) {
-    ESP_LOGW(TAG, "pull_bytes_: recv_cb failed");
+    ESP_LOGD(TAG, "pull_bytes_: recv_cb failed");
     return false;
   }
   ESP_LOGD(TAG, "pull_bytes_: received %zu bytes, adding to buffer (current size: %zu)",

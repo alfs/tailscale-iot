@@ -671,7 +671,7 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
 
     if (ret == ESP_TLS_ERR_SSL_WANT_READ || ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
       if (deadline_ms >= 0 && deadline_expired()) {
-        ESP_LOGW(TAG, "TS2021 read timeout while waiting for data");
+        ESP_LOGD(TAG, "TS2021 read timeout while waiting for data");
         return false;
       }
       // Reset watchdog to prevent timeout during long network waits
