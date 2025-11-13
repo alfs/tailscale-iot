@@ -2431,7 +2431,7 @@ void TailscaleComponent::check_unified_socket_() {
         }
       }
 
-      ESP_LOGI(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
+      ESP_LOGD(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
                total_udp_rx, received, src_ip, src_port, pkt_type,
                buffer[0], buffer[1], buffer[2], buffer[3],
                buffer[4], buffer[5], buffer[6], buffer[7]);
@@ -2787,7 +2787,7 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     char src_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
     uint16_t src_port = ntohs(src->sin_port);
-    ESP_LOGI(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u to session",
+    ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u to session",
              buf[0], len, src_ip, src_port);
     if (this->wg_session_) {
       if (this->wg_session_->receive_wg_packet(buf, len)) {
@@ -3045,7 +3045,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
           snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
                    ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]);
 
-          ESP_LOGI(TAG, "    Endpoint %zu: %s:%u", i + 1, ip_str, port);
+          ESP_LOGD(TAG, "    Endpoint %zu: %s:%u", i + 1, ip_str, port);
 
           // Send disco PING to this endpoint
           this->send_disco_ping_(std::string(ip_str), port, sender_disco_key_str);
@@ -3843,7 +3843,7 @@ bool TailscaleComponent::perform_stun_query_() {
            ntohs(response_addr.sin_port));
   // Print first 20 bytes (header)
   if (received >= 20) {
-    ESP_LOGI(TAG, "  Header: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD(TAG, "  Header: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
              response[0], response[1], response[2], response[3],
              response[4], response[5], response[6], response[7],
              response[8], response[9], response[10], response[11],
@@ -3852,7 +3852,7 @@ bool TailscaleComponent::perform_stun_query_() {
   }
   // Print attribute bytes (20-31 for 32-byte response)
   if (received >= 32) {
-    ESP_LOGI(TAG, "  Attrs:  %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    ESP_LOGD(TAG, "  Attrs:  %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
              response[20], response[21], response[22], response[23],
              response[24], response[25], response[26], response[27],
              response[28], response[29], response[30], response[31]);

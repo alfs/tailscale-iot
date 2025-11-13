@@ -183,7 +183,7 @@ std::vector<uint8_t> decode_websocket_frame(const uint8_t *data, size_t len, siz
   }
   
   if (len < header_len + payload_len) {
-    ESP_LOGW(TAG, "Incomplete WebSocket frame (need %d, have %d)", 
+    ESP_LOGD(TAG, "Incomplete WebSocket frame (need %d, have %d)", 
              (int)(header_len + payload_len), (int)len);
     return payload;
   }
