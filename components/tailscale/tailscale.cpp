@@ -234,13 +234,30 @@ void TailscaleComponent::loop() {
   static uint32_t last_wg_stats_log = 0;
   uint32_t now = millis();
   if (now - last_wg_stats_log >= 30000 && (this->wg_direct_udp_tx_ > 0 || this->wg_derp_tx_ > 0)) {
+    // Calculate loss percentages safely (handle RX > TX case where keepalives inflate RX count)
+    uint32_t direct_loss_pct = 0;
+    if (this->wg_direct_udp_tx_ > 0) {
+      if (this->wg_direct_udp_rx_ >= this->wg_direct_udp_tx_) {
+        direct_loss_pct = 0;  // RX >= TX means no loss (excess RX from keepalives)
+      } else {
+        direct_loss_pct = ((this->wg_direct_udp_tx_ - this->wg_direct_udp_rx_) * 100 / this->wg_direct_udp_tx_);
+      }
+    }
+
+    uint32_t derp_loss_pct = 0;
+    if (this->wg_derp_tx_ > 0) {
+      if (this->wg_derp_rx_ >= this->wg_derp_tx_) {
+        derp_loss_pct = 0;  // RX >= TX means no loss
+      } else {
+        derp_loss_pct = ((this->wg_derp_tx_ - this->wg_derp_rx_) * 100 / this->wg_derp_tx_);
+      }
+    }
+
     ESP_LOGI(TAG, "═══ WireGuard Path Performance Statistics ═══");
     ESP_LOGI(TAG, "  Direct UDP:  TX=%u (Failed=%u), RX=%u | Loss=%u%%",
-             this->wg_direct_udp_tx_, this->wg_direct_udp_tx_failed_, this->wg_direct_udp_rx_,
-             (this->wg_direct_udp_tx_ > 0) ? ((this->wg_direct_udp_tx_ - this->wg_direct_udp_rx_) * 100 / this->wg_direct_udp_tx_) : 0);
+             this->wg_direct_udp_tx_, this->wg_direct_udp_tx_failed_, this->wg_direct_udp_rx_, direct_loss_pct);
     ESP_LOGI(TAG, "  DERP Relay:  TX=%u, RX=%u | Loss=%u%%",
-             this->wg_derp_tx_, this->wg_derp_rx_,
-             (this->wg_derp_tx_ > 0) ? ((this->wg_derp_tx_ - this->wg_derp_rx_) * 100 / this->wg_derp_tx_) : 0);
+             this->wg_derp_tx_, this->wg_derp_rx_, derp_loss_pct);
     ESP_LOGI(TAG, "  Last Activity: Direct TX=%us ago, Direct RX=%us ago, DERP RX=%us ago",
              (this->last_wg_direct_tx_time_ > 0) ? ((now - this->last_wg_direct_tx_time_) / 1000) : 999,
              (this->last_wg_direct_rx_time_ > 0) ? ((now - this->last_wg_direct_rx_time_) / 1000) : 999,
@@ -2412,6 +2429,7 @@ void TailscaleComponent::check_unified_socket_() {
 
   // Check for incoming packets on unified socket (Disco, STUN, WireGuard)
   // This replaces the old check_disco_responses_() which only checked disco socket
+  // CRITICAL: Drain ALL available packets in a loop to prevent socket buffer overflow
   if (this->unified_socket_ >= 0) {
     // DEBUG: Log that we're about to call recvfrom
     static uint32_t recvfrom_call_count = 0;
@@ -2423,58 +2441,80 @@ void TailscaleComponent::check_unified_socket_() {
       last_debug_log = millis();
     }
 
-    uint8_t buffer[2048];  // Large enough for WireGuard packets
-    struct sockaddr_in sender_addr{};
-    socklen_t sender_len = sizeof(sender_addr);
+    // Loop to drain all available packets from socket buffer
+    // Limit iterations to prevent starving other components (100 packets = ~128KB max processing)
+    const int MAX_PACKETS_PER_CALL = 100;
+    int packets_processed = 0;
 
-    ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                                 (struct sockaddr *)&sender_addr, &sender_len);
+    while (packets_processed < MAX_PACKETS_PER_CALL) {
+      uint8_t buffer[2048];  // Large enough for WireGuard packets
+      struct sockaddr_in sender_addr{};
+      socklen_t sender_len = sizeof(sender_addr);
 
-    if (received > 0) {
-      total_udp_rx++;
-      last_rx_time = millis();
+      ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
+                                   (struct sockaddr *)&sender_addr, &sender_len);
 
-      // Log every received UDP datagram for debugging
-      char src_ip[INET_ADDRSTRLEN];
-      inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
-      uint16_t src_port = ntohs(sender_addr.sin_port);
+      if (received > 0) {
+        packets_processed++;
+        total_udp_rx++;
+        last_rx_time = millis();
 
-      // Identify packet type for counters
-      const char* pkt_type = "UNKNOWN";
-      if (received >= 1) {
-        if (buffer[0] >= 1 && buffer[0] <= 4) {
-          pkt_type = "WireGuard";
-          wireguard_rx++;
-        } else if (received >= 6 && buffer[0] == 'T' && buffer[1] == 'S' &&
-                   buffer[2] == 0xf0 && buffer[3] == 0x9f && buffer[4] == 0x92 && buffer[5] == 0xac) {
-          pkt_type = "Disco";
-          disco_rx++;
-        } else if (received >= 20 && (buffer[0] & 0xC0) == 0x00) {
-          pkt_type = "STUN";
-          stun_rx++;
-        } else {
-          other_rx++;
+        // Log every received UDP datagram for debugging
+        char src_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
+        uint16_t src_port = ntohs(sender_addr.sin_port);
+
+        // Identify packet type for counters
+        const char* pkt_type = "UNKNOWN";
+        if (received >= 1) {
+          if (buffer[0] >= 1 && buffer[0] <= 4) {
+            pkt_type = "WireGuard";
+            wireguard_rx++;
+          } else if (received >= 6 && buffer[0] == 'T' && buffer[1] == 'S' &&
+                     buffer[2] == 0xf0 && buffer[3] == 0x9f && buffer[4] == 0x92 && buffer[5] == 0xac) {
+            pkt_type = "Disco";
+            disco_rx++;
+          } else if (received >= 20 && (buffer[0] & 0xC0) == 0x00) {
+            pkt_type = "STUN";
+            stun_rx++;
+          } else {
+            other_rx++;
+          }
         }
-      }
 
-      ESP_LOGD(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
-               total_udp_rx, received, src_ip, src_port, pkt_type,
-               buffer[0], buffer[1], buffer[2], buffer[3],
-               buffer[4], buffer[5], buffer[6], buffer[7]);
+        ESP_LOGD(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
+                 total_udp_rx, received, src_ip, src_port, pkt_type,
+                 buffer[0], buffer[1], buffer[2], buffer[3],
+                 buffer[4], buffer[5], buffer[6], buffer[7]);
 
-      // Route packet to appropriate handler based on magic bytes
-      this->route_incoming_packet_(buffer, received, &sender_addr);
-    } else if (received < 0) {
-      // DEBUG: Log all errno values (including EAGAIN/EWOULDBLOCK) periodically
-      static uint32_t last_errno_log = 0;
-      static int last_logged_errno = 0;
-      if ((errno != EAGAIN && errno != EWOULDBLOCK) ||
-          (millis() - last_errno_log >= 60000 && errno != last_logged_errno)) {
-        ESP_LOGI(TAG, "🔍 recvfrom returned %zd, errno=%d (%s)",
-                 received, errno, strerror(errno));
-        last_errno_log = millis();
-        last_logged_errno = errno;
+        // Route packet to appropriate handler based on magic bytes
+        this->route_incoming_packet_(buffer, received, &sender_addr);
+      } else if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // No more packets available - socket buffer drained
+          break;
+        }
+
+        // DEBUG: Log unexpected errno values periodically
+        static uint32_t last_errno_log = 0;
+        static int last_logged_errno = 0;
+        if (millis() - last_errno_log >= 60000 && errno != last_logged_errno) {
+          ESP_LOGI(TAG, "🔍 recvfrom returned %zd, errno=%d (%s)",
+                   received, errno, strerror(errno));
+          last_errno_log = millis();
+          last_logged_errno = errno;
+        }
+        break;  // Stop on error
+      } else {
+        // received == 0 should not happen with UDP, but handle it
+        break;
       }
+    }
+
+    // Log if we hit the packet processing limit (might indicate backlog)
+    if (packets_processed >= MAX_PACKETS_PER_CALL) {
+      ESP_LOGW(TAG, "⚠️ Hit max packet processing limit (%d packets) - socket may have backlog",
+               MAX_PACKETS_PER_CALL);
     }
   }
 }
@@ -4275,39 +4315,21 @@ bool TailscaleComponent::send_map_keepalive_() {
     return false;
   }
 
-  // CRITICAL: Keepalives MUST be sent on the persistent stream (stream 3)
-  // Creating new streams causes conflicts with the persistent stream that's receiving server keepalives
-  // DON'T use http2_post_json() which creates new streams - instead we need to send on persistent stream
-  // For now, skip sending client keepalives to avoid stream conflicts
-  // The server's keepalives to us are sufficient to maintain "online" status
-  ESP_LOGW(TAG, "⚠️ Skipping client keepalive send - would conflict with persistent stream");
-  ESP_LOGW(TAG, "   Server keepalives maintain our online status, so this is safe");
-  return true;  // Return success to avoid error logs
+  // CRITICAL: Send keepalive on the persistent stream (stream 3) instead of creating new streams
+  // The persistent stream was opened with the initial MapRequest (Stream=true)
+  // We must send subsequent keepalives ON THE SAME STREAM to keep the connection alive
+  // The server will respond with {"KeepAlive":true} on the same stream
+  ESP_LOGI(TAG, "→ Sending keepalive on persistent stream...");
 
-  // TODO: Implement sending on persistent stream 3 instead of creating new streams
-  /*
-  if (!this->ts2021_transport_->http2_post_json(scheme, this->control_authority_,
-                                                 "/machine/map", payload_json,
-                                                 response_ptr, response_size, status, 5000, true, true)) {
-    ESP_LOGE(TAG, "Failed to send keepalive map request");
-    return false;
-  }
-  */
-
-  ESP_LOGI(TAG, "DEBUG: Keepalive response - HTTP %u, size: %zu bytes", status, response_size);
-
-  if (status < 200 || status >= 300) {
-    ESP_LOGW(TAG, "Keepalive returned HTTP %u", status);
+  if (!this->ts2021_transport_->http2_send_on_persistent_stream(payload_json)) {
+    ESP_LOGE(TAG, "Failed to send keepalive on persistent stream");
     return false;
   }
 
-  // Log response content for debugging endpoint acknowledgment
-  if (response_ptr && response_size > 0) {
-    std::string response_snippet(response_ptr, std::min(response_size, (size_t)500));
-    ESP_LOGI(TAG, "DEBUG: Keepalive response snippet: %s", response_snippet.c_str());
-  }
+  ESP_LOGI(TAG, "✓ Keepalive sent on persistent stream (%zu bytes)", payload_json.length());
 
-  ESP_LOGI(TAG, "✓ Keepalive sent successfully (HTTP %u, response %zu bytes)", status, response_size);
+  // The response will be received asynchronously via check_server_keepalive_()
+  // which calls http2_read_next_message() and will see the server's {"KeepAlive":true} response
 
   // Note: We don't need to parse the keepalive response - the server acknowledges with HTTP 200
   // and may send an empty or minimal response since OmitPeers=true
