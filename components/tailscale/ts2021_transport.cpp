@@ -509,5 +509,21 @@ bool Ts2021Transport::http2_read_next_message(const char *&response_ptr, size_t 
   return this->http2_session_->read_next_message(this->persistent_stream_id_, response_ptr, response_size, timeout_ms);
 }
 
+bool Ts2021Transport::http2_send_on_persistent_stream(const std::string &data) {
+  if (!this->http2_session_) {
+    ESP_LOGW(TAG, "HTTP/2 session not ready");
+    return false;
+  }
+
+  if (this->persistent_stream_id_ == 0) {
+    ESP_LOGW(TAG, "No persistent stream established");
+    return false;
+  }
+
+  ESP_LOGD(TAG, "Sending %zu bytes on persistent stream %u", data.size(), this->persistent_stream_id_);
+
+  return this->http2_session_->send_data_on_stream(this->persistent_stream_id_, data);
+}
+
 }  // namespace tailscale
 }  // namespace esphome

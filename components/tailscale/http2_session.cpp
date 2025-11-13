@@ -1112,5 +1112,38 @@ bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_p
   return false;
 }
 
+bool Http2Session::send_data_on_stream(uint32_t stream_id, const std::string &data) {
+  ESP_LOGD(TAG, "Sending %zu bytes on stream %u", data.size(), stream_id);
+
+  // Tailscale wire format: 4-byte big-endian length prefix + JSON payload
+  std::vector<uint8_t> wire_format_data;
+  uint32_t json_length = data.size();
+
+  // Add 4-byte big-endian length prefix
+  wire_format_data.push_back((json_length >> 24) & 0xFF);
+  wire_format_data.push_back((json_length >> 16) & 0xFF);
+  wire_format_data.push_back((json_length >> 8) & 0xFF);
+  wire_format_data.push_back(json_length & 0xFF);
+
+  // Add JSON payload
+  wire_format_data.insert(wire_format_data.end(), data.begin(), data.end());
+
+  // Create DATA frame (no END_STREAM flag - keep connection open)
+  Frame data_frame;
+  data_frame.type = kFrameTypeData;
+  data_frame.flags = 0;  // No flags - stream stays open for bidirectional communication
+  data_frame.stream_id = stream_id;
+  data_frame.length = wire_format_data.size();
+  data_frame.payload = wire_format_data;
+
+  if (!this->send_frame_(data_frame)) {
+    ESP_LOGE(TAG, "Failed to send DATA frame on stream %u", stream_id);
+    return false;
+  }
+
+  ESP_LOGD(TAG, "✓ Sent DATA frame on stream %u (%zu bytes with wire format)", stream_id, wire_format_data.size());
+  return true;
+}
+
 }  // namespace tailscale
 }  // namespace esphome

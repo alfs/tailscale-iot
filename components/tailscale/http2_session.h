@@ -28,6 +28,10 @@ class Http2Session {
   // Returns true if message received, false on timeout or error
   bool read_next_message(uint32_t stream_id, const char *&response_ptr, size_t &response_size, uint32_t timeout_ms);
 
+  // Send DATA frame on existing stream (for keepalives on persistent connection)
+  // Does NOT close the stream - used for bidirectional communication
+  bool send_data_on_stream(uint32_t stream_id, const std::string &data);
+
  private:
   struct Frame {
     uint32_t length{0};

@@ -48,6 +48,9 @@ class Ts2021Transport {
   // Read next message from persistent streaming connection (for server keepalives)
   bool http2_read_next_message(const char *&response_ptr, size_t &response_size, uint32_t timeout_ms);
 
+  // Send data on persistent stream (for client keepalives)
+  bool http2_send_on_persistent_stream(const std::string &data);
+
   bool handshake_complete() const { return this->stage_ == Stage::kTransportReady; }
   bool failed() const { return this->stage_ == Stage::kFailed; }
 
