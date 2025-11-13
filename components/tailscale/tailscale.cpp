@@ -288,6 +288,22 @@ void TailscaleComponent::update() {
   // - Maintain the node's "online" status without periodic reconnections
   //
   // No periodic reconnection needed - the stream stays open until network interruption.
+
+  // Check for Disco PONG timeout regardless of current state
+  // This check runs continuously in the update loop so it triggers even if the ESP32
+  // is cycling through ERROR states due to transport watchdog or other issues
+  uint32_t now = millis();
+  if (!this->derp_fallback_enabled_ && !this->direct_path_confirmed_ &&
+      this->first_disco_ping_time_ > 0) {
+    uint32_t time_since_first_ping = now - this->first_disco_ping_time_;
+    if (time_since_first_ping >= DISCO_PONG_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "⚠️ No Disco PONG received after %d seconds - peer may not support bidirectional Disco",
+               DISCO_PONG_TIMEOUT_MS / 1000);
+      ESP_LOGW(TAG, "   Enabling DERP-only fallback mode and switching to initiator mode");
+      this->derp_fallback_enabled_ = true;
+      this->wg_handshake_sent_ = false;  // Reset to allow initiator mode
+    }
+  }
 }
 
 void TailscaleComponent::dump_config() {
@@ -502,8 +518,12 @@ void TailscaleComponent::handle_fetching_map_state_() {
           if (!this->node_config_.peers.empty()) {
             const auto& peer = this->node_config_.peers[0];
 
-            // Use direct UDP only if user enabled it AND path is confirmed via Disco PONG
-            if (this->prefer_direct_udp_ && this->direct_path_confirmed_ && !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
+            // Use direct UDP only if:
+            // 1. User enabled it (prefer_direct_udp_)
+            // 2. Path is confirmed via Disco PONG (direct_path_confirmed_)
+            // 3. DERP fallback is NOT enabled (derp_fallback_enabled_)
+            if (this->prefer_direct_udp_ && this->direct_path_confirmed_ && !this->derp_fallback_enabled_ &&
+                !peer.endpoint.empty() && peer.port > 0 && this->unified_socket_ >= 0) {
               struct sockaddr_in dest_addr;
               dest_addr.sin_family = AF_INET;
               dest_addr.sin_port = htons(peer.port);
@@ -723,6 +743,8 @@ void TailscaleComponent::handle_connected_state_() {
     last_connected_log = now;
   }
 
+  // Disco timeout check moved to update() loop so it runs regardless of state
+
   // Start echo server on first entry to CONNECTED state
   if (this->echo_server_socket_ == -1) {
     this->setup_echo_server_();
@@ -810,23 +832,27 @@ void TailscaleComponent::handle_connected_state_() {
       // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
       // Must wait for DERP handshake to complete before sending WireGuard packets
       if (this->derp_client_->is_ready() && !this->wg_handshake_sent_) {
-        // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
-        // Auto-initiation is DISABLED to avoid racing initiators crash
-        // The WireGuard library doesn't handle transitioning from initiator to responder
-        ESP_LOGI(TAG, "DERP ready - waiting for peer to initiate (responder-only mode)");
-        this->wg_handshake_sent_ = true;  // Prevent repeated logging
-
         // Start UDP relay for WireGuard → DERP packet forwarding
         this->start_udp_relay_();
 
-        // DISABLED: Auto-initiation causes crash with racing initiators
-        // if (this->wg_session_) {
-        //   if (this->wg_session_->start_handshake()) {
-        //     ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP");
-        //     this->wg_handshake_sent_ = true;
-        //     this->start_udp_relay_();
-        //   }
-        // }
+        // DERP FALLBACK MODE: Enable initiator mode for non-responsive peers
+        // When Disco PONG timeout occurs (peer doesn't respond to our PINGs),
+        // switch from responder-only to initiator mode to establish WireGuard via DERP
+        if (this->derp_fallback_enabled_ && this->wg_session_) {
+          ESP_LOGI(TAG, "🔄 DERP fallback mode - initiating WireGuard handshake via DERP");
+          if (this->wg_session_->start_handshake()) {
+            ESP_LOGI(TAG, "✓ WireGuard handshake sent via DERP (initiator mode)");
+            this->wg_handshake_sent_ = true;
+          } else {
+            ESP_LOGW(TAG, "Failed to initiate WireGuard handshake");
+          }
+        } else {
+          // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
+          // Auto-initiation is DISABLED to avoid racing initiators crash
+          // The WireGuard library doesn't handle transitioning from initiator to responder
+          ESP_LOGI(TAG, "DERP ready - waiting for peer to initiate (responder-only mode)");
+          this->wg_handshake_sent_ = true;  // Prevent repeated logging
+        }
 
         // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
         // Server already knows ESP32 prefers DERP 28 from initial map request
@@ -3067,10 +3093,19 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
   ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
 
+  // Record PONG receipt time
+  this->disco_pong_received_time_ = millis();
+
   // Enable direct UDP path for WireGuard packets (instead of routing via DERP)
   if (!this->direct_path_confirmed_) {
     this->direct_path_confirmed_ = true;
     ESP_LOGW(TAG, "🎯 Direct path confirmed! WireGuard will now use direct UDP instead of DERP relay");
+
+    // Disable DERP fallback if it was enabled (peer is now responding)
+    if (this->derp_fallback_enabled_) {
+      this->derp_fallback_enabled_ = false;
+      ESP_LOGI(TAG, "✓ Disabling DERP fallback - direct UDP path now working");
+    }
   }
 }
 
@@ -3256,6 +3291,13 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
   if (peer_disco_key.empty()) {
     ESP_LOGD(TAG, "Peer has no disco key, skipping disco ping");
     return;
+  }
+
+  // Track first Disco PING time for timeout detection
+  if (this->first_disco_ping_time_ == 0) {
+    this->first_disco_ping_time_ = millis();
+    ESP_LOGI(TAG, "⏱️ Started Disco PING timer - will enable DERP fallback if no PONG in %d seconds",
+             DISCO_PONG_TIMEOUT_MS / 1000);
   }
 
   ESP_LOGD(TAG, "→ Sending Disco ping to %s:%u", endpoint.c_str(), port);

@@ -268,6 +268,10 @@ class TailscaleComponent : public PollingComponent {
   bool wg_peer_node_key_valid_{false};  // Whether we have a valid peer node key
   bool wg_handshake_sent_{false};  // Track if WireGuard handshake has been sent (only send once per session)
   bool direct_path_confirmed_{false};  // Track if direct UDP path is confirmed via Disco PONG
+  uint32_t first_disco_ping_time_{0};  // Timestamp when first Disco PING was sent
+  uint32_t disco_pong_received_time_{0};  // Timestamp when last Disco PONG was received
+  bool derp_fallback_enabled_{false};  // Enable DERP-only fallback for non-responsive peers
+  static const uint32_t DISCO_PONG_TIMEOUT_MS = 180000;  // Wait 3 minutes (3 PING attempts) for PONG
   void start_udp_relay_();  // Initialize UDP relay socket
   void process_udp_relay_();  // Check for and forward packets (non-blocking)
   void stop_udp_relay_();  // Clean up UDP relay resources
