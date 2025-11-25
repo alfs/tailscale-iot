@@ -1,0 +1,27 @@
+diff --git a/library.json b/library.json
+index a0e80a3..41a8e9f 100644
+--- a/library.json
++++ b/library.json
+@@ -14,7 +14,21 @@
+     ],
+     "build": {
+         "includeDir": "include",
+-        "srcDir": "src"
++        "srcDir": "src",
++        "srcFilter": [
++            "+<*>",
++            "-<backend/ref/cipher-chachapoly.c>",
++            "-<backend/ref/dh-curve25519.c>",
++            "-<backend/ref/hash-sha256.c>",
++            "-<backend/ref/hash-sha512.c>",
++            "-<backend/ref/cipher-aesgcm.c>",
++            "+<backend/ref/hash-blake2s.c>",
++            "+<backend/ref/hash-blake2b.c>",
++            "-<backend/openssl/>",
++            "-<crypto/chacha/>",
++            "-<crypto/donna/>",
++            "-<protocol/rand_sodium.c>"
++        ]
+     },
+     "dependencies": [
+         {
