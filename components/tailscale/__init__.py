@@ -1,8 +1,6 @@
 """ESPHome Tailscale Component for ESP32-C3."""
 from pathlib import Path
 import logging
-import subprocess
-import sys
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -52,25 +50,6 @@ CONFIG_SCHEMA = cv.Schema(
 ).extend(cv.polling_component_schema("60s"))
 
 
-def ensure_noise_c_patched(repo_root: Path) -> None:
-    """Apply noise-c patch files before compiling."""
-    patch_script = repo_root / "scripts" / "apply_noise_c_patches.py"
-    if not patch_script.exists():
-        logging.warning("noise-c patch script missing at %s", patch_script)
-        return
-
-    python = sys.executable or "python3"
-    logging.warning("Ensuring noise-c patches are applied via %s", patch_script)
-    try:
-        subprocess.run([python, str(patch_script)], cwd=str(repo_root), check=True)
-    except FileNotFoundError as err:
-        raise cv.Invalid(f"Failed to execute {patch_script}: {err}") from err
-    except subprocess.CalledProcessError as err:
-        raise cv.Invalid(
-            "noise-c patches could not be applied; see logs above for details"
-        ) from err
-
-
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -85,52 +64,24 @@ async def to_code(config):
 
     # Use linker wrapping to replace libsodium's sodium_init with our ESP32-C3 safe version
     cg.add_build_flag("-Wl,--wrap=sodium_init")
-    
-    # Add noise-c library from local directory
-    repo_root = Path(__file__).resolve().parents[2]  # Up to tailscale-iot root (components/tailscale/__init__.py -> components -> tailscale-iot)
-    ensure_noise_c_patched(repo_root)
-    noise_dir = repo_root / "external" / "required" / "noise-c"
-    logging.warning(f"Noise-c path: {noise_dir}, exists: {noise_dir.exists()}")
-    if noise_dir.exists():
-        # Add noise-c directory to library search paths
-        lib_extra_dir = str(noise_dir.parent.resolve())
-        logging.warning(f"Adding lib_extra_dirs: {lib_extra_dir}")
-        cg.add_platformio_option("lib_extra_dirs", [lib_extra_dir])
-        # Add noise-c as a library with version matching library.json
-        file_url = f"file://{noise_dir.resolve()}"
-        logging.warning(f"Adding noise-c library: {file_url}")
-        cg.add_library("noise-c", "0.1.10", file_url)
-        # Add include paths for noise-c headers
-        src_include = f"-I{noise_dir.resolve()}/src"
-        logging.warning(f"Adding build flag: {src_include}")
-        cg.add_build_flag(src_include)
-        
-        # Enable noise-c features with preprocessor defines
-        # These must be set BEFORE noise-c headers are included to configure the library
-        cg.add_build_flag("-DNOISE_USE_BLAKE2S=1")           # Required for Tailscale TS2021
-        cg.add_build_flag("-DNOISE_USE_REFERENCE_BACKEND=1")  # Required for BLAKE2s (not in libsodium)
-        cg.add_build_flag("-DNOISE_USE_LIBSODIUM=1")         # Use libsodium for Curve25519 & ChaCha20-Poly1305
 
-        # Selectively disable reference backend implementations to avoid conflicts with libsodium
-        cg.add_build_flag("-DNOISE_USE_REFERENCE_CHACHA=0")     # Use libsodium ChaCha20 instead
-        cg.add_build_flag("-DNOISE_USE_REFERENCE_POLY1305=0")   # Use libsodium Poly1305 instead
-        cg.add_build_flag("-DNOISE_USE_REFERENCE_SHA256=0")     # Use libsodium SHA256 instead
-        cg.add_build_flag("-DNOISE_USE_REFERENCE_BLAKE2S=1")    # Only use reference BLAKE2s (not in libsodium)
-        cg.add_build_flag("-DNOISE_USE_CUSTOM_RAND=1")          # Use custom esp_fill_random implementation
+    # Add vendored noise-c library (minimal subset for Noise_IK_25519_ChaChaPoly_BLAKE2s)
+    component_dir = Path(__file__).resolve().parent
+    noise_dir = component_dir / "noise"
+    logging.warning(f"Using vendored noise-c from: {noise_dir}")
 
-        # Legacy defines for compatibility
-        cg.add_build_flag("-DUSE_LIBSODIUM=1")
-        cg.add_build_flag("-DUSE_SODIUM=1")
-        
-        # Add reference backend include path
-        ref_backend = noise_dir / "src" / "backend" / "ref"
-        if ref_backend.exists():
-            cg.add_build_flag(f"-I{ref_backend.resolve()}")
-            logging.warning(f"Added reference backend include: {ref_backend}")
-        
-        logging.warning("Enabled noise-c: BLAKE2s=1, REFERENCE_BACKEND=1, LIBSODIUM=1")
-    else:
-        logging.error(f"noise-c directory not found at {noise_dir}")
+    # Add noise-c as a library from the vendored directory
+    file_url = f"file://{noise_dir.resolve()}"
+    cg.add_library("noise-c-vendored", "0.1.10", file_url)
+
+    # Add include paths for noise-c headers
+    cg.add_build_flag(f"-I{noise_dir.resolve()}/include")
+    cg.add_build_flag(f"-I{noise_dir.resolve()}/src")
+    cg.add_build_flag(f"-I{noise_dir.resolve()}/src/crypto/blake2")
+
+    # Legacy defines for compatibility (configuration is now in defines.h)
+    cg.add_build_flag("-DUSE_LIBSODIUM=1")
+    cg.add_build_flag("-DUSE_SODIUM=1")
     
     # Enable certificate bundle for HTTPS
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)

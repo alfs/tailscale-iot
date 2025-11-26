@@ -1,7 +1,3 @@
-[submodule "external/required/noise-c"]
-	path = external/required/noise-c
-	url = https://github.com/esphome/noise-c.git
-
 [submodule "external/required/esphome"]
 	path = external/required/esphome
 	url = https://github.com/esphome/esphome.git

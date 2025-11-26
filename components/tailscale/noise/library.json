@@ -1,0 +1,34 @@
+{
+    "name": "noise-c-vendored",
+    "version": "0.1.10",
+    "description": "Minimal vendored noise-c for Tailscale ESP32 (Noise_IK_25519_ChaChaPoly_BLAKE2s only)",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Southern Storm Software, Pty Ltd",
+            "maintainer": false
+        }
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/rweather/noise-c.git"
+    },
+    "frameworks": "*",
+    "platforms": "*",
+    "build": {
+        "includeDir": "include",
+        "srcDir": "src",
+        "srcFilter": [
+            "+<protocol/*.c>",
+            "+<backend/sodium/*.c>",
+            "+<backend/ref/hash-blake2s.c>",
+            "+<crypto/blake2/blake2s.c>"
+        ]
+    },
+    "dependencies": [
+        {
+            "name": "esphome/libsodium",
+            "version": "1.10020.7"
+        }
+    ]
+}

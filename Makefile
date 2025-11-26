@@ -100,12 +100,8 @@ check-python-packages: ## Check if required Python packages are installed
 
 check-submodules: ## Check if required submodules are initialized
 	@echo "$(BLUE)Checking submodules...$(NC)"
-	@if [ ! -f external/required/noise-c/library.json ]; then \
-		echo "  $(YELLOW)✗ Required submodule noise-c not initialized$(NC)"; \
-		echo "$(YELLOW)Run 'make init-submodules' to initialize them$(NC)"; \
-		exit 1; \
-	fi
-	@echo "$(GREEN)✓ Required submodules initialized$(NC)"
+	@# noise-c is now vendored in components/tailscale/noise/ - no submodule needed
+	@echo "$(GREEN)✓ No required submodules (noise-c is vendored)$(NC)"
 
 install-deps: ## Install all required Python dependencies
 	@echo "$(BLUE)Installing Python dependencies...$(NC)"
@@ -154,8 +150,8 @@ install-espidf-deps: ## Install ESP-IDF Python packages in PlatformIO venv
 
 init-submodules: ## Initialize required git submodules (excludes optional ones)
 	@echo "$(BLUE)Initializing required submodules...$(NC)"
-	@git submodule update --init external/required/noise-c
-	@echo "$(GREEN)✓ Required submodules initialized$(NC)"
+	@# noise-c is now vendored in components/tailscale/noise/ - no submodule needed
+	@echo "$(GREEN)✓ No required submodules to initialize (noise-c is vendored)$(NC)"
 	@echo "$(YELLOW)Note: Optional submodules for protocol debugging were not initialized$(NC)"
 	@echo "      Run 'git submodule update --init --recursive' to get all submodules"
 
