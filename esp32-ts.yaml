@@ -53,6 +53,9 @@ logger:
 time:
   - platform: sntp
     id: sntp_time
+    # Can probably be removed in your config.
+    # tz is needed docker build environment
+    timezone: Europe/Stockholm
 
 external_components:
   - source:

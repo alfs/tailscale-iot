@@ -1,7 +1,6 @@
 #include "tailscale.h"
 #include "derp_client.h"
 #include "crypto_box_simple.h"
-#include "crypto_test.h"
 #include "local_server_cert.h"
 #include "echo_socket.h"
 #include "http_server.h"
@@ -140,9 +139,6 @@ void TailscaleComponent::setup() {
   ESP_LOGI(TAG, "Control URL: %s", this->control_url_.c_str());
   ESP_LOGD(TAG, "Auth key: %s", this->auth_key_.substr(0, 16).c_str());  // Show only first 16 chars
 
-  // Run crypto test vectors to verify libsodium implementation
-  run_crypto_tests();
-
   // Initialize NVS for key persistence
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -262,7 +258,6 @@ void TailscaleComponent::loop() {
              (this->last_wg_direct_tx_time_ > 0) ? ((now - this->last_wg_direct_tx_time_) / 1000) : 999,
              (this->last_wg_direct_rx_time_ > 0) ? ((now - this->last_wg_direct_rx_time_) / 1000) : 999,
              (this->last_wg_derp_rx_time_ > 0) ? ((now - this->last_wg_derp_rx_time_) / 1000) : 999);
-    ESP_LOGI(TAG, "  Path Status: %s", this->direct_path_confirmed_ ? "✅ Direct UDP Active" : "⚠️  DERP Relay Only");
     last_wg_stats_log = now;
   }
 
@@ -305,22 +300,6 @@ void TailscaleComponent::update() {
   // - Maintain the node's "online" status without periodic reconnections
   //
   // No periodic reconnection needed - the stream stays open until network interruption.
-
-  // Check for Disco PONG timeout regardless of current state
-  // This check runs continuously in the update loop so it triggers even if the ESP32
-  // is cycling through ERROR states due to transport watchdog or other issues
-  uint32_t now = millis();
-  if (!this->derp_fallback_enabled_ && !this->direct_path_confirmed_ &&
-      this->first_disco_ping_time_ > 0) {
-    uint32_t time_since_first_ping = now - this->first_disco_ping_time_;
-    if (time_since_first_ping >= DISCO_PONG_TIMEOUT_MS) {
-      ESP_LOGW(TAG, "⚠️ No Disco PONG received after %d seconds - peer may not support bidirectional Disco",
-               DISCO_PONG_TIMEOUT_MS / 1000);
-      ESP_LOGW(TAG, "   Enabling DERP-only fallback mode and switching to initiator mode");
-      this->derp_fallback_enabled_ = true;
-      this->wg_handshake_sent_ = false;  // Reset to allow initiator mode
-    }
-  }
 }
 
 void TailscaleComponent::dump_config() {
@@ -973,55 +952,40 @@ void TailscaleComponent::handle_connected_state_() {
       // Step 2: Check if DERP is fully READY before sending WireGuard handshakes
       // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
       // Must wait for DERP handshake to complete before sending WireGuard packets
-      if (this->derp_client_->is_ready() && !this->wg_handshake_sent_) {
-        // Start UDP relay for WireGuard → DERP packet forwarding
-        this->start_udp_relay_();
+      static bool derp_was_ready = false;
+      if (this->derp_client_->is_ready()) {
+        if (!derp_was_ready) {
+          // DERP just became ready - initiate handshakes
+          ESP_LOGI(TAG, "⚡ DERP client ready - initiating peer handshakes");
 
-        // MULTI-PEER HANDSHAKE: Initiate handshakes for peers that need DERP fallback
-        // DERP FALLBACK MODE: When Disco PONG timeout occurs (peer doesn't respond to PINGs),
-        // switch from responder-only to initiator mode to establish WireGuard via DERP
-        for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
-          auto& peer = this->peer_sessions_[i];
+          // MULTI-PEER HANDSHAKE: Initiate handshakes for peers that need DERP fallback
+          // DERP FALLBACK MODE: When Disco PONG timeout occurs (peer doesn't respond to PINGs),
+          // switch from responder-only to initiator mode to establish WireGuard via DERP
+          for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+            auto& peer = this->peer_sessions_[i];
 
-          if (peer.derp_fallback_enabled) {
-            ESP_LOGI(TAG, "🔄 Peer[%zu] %s: DERP fallback mode - initiating WireGuard handshake via DERP",
-                     i, peer.hostname.c_str());
-            if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
-              ESP_LOGI(TAG, "✓ Peer[%zu] %s: WireGuard handshake sent via DERP (initiator mode)",
+            if (peer.derp_fallback_enabled) {
+              ESP_LOGI(TAG, "🔄 Peer[%zu] %s: DERP fallback mode - initiating WireGuard handshake via DERP",
                        i, peer.hostname.c_str());
+              if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
+                ESP_LOGI(TAG, "✓ Peer[%zu] %s: WireGuard handshake sent via DERP (initiator mode)",
+                         i, peer.hostname.c_str());
+              } else {
+                ESP_LOGW(TAG, "✗ Peer[%zu] %s: Failed to initiate WireGuard handshake",
+                         i, peer.hostname.c_str());
+              }
             } else {
-              ESP_LOGW(TAG, "✗ Peer[%zu] %s: Failed to initiate WireGuard handshake",
+              // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
+              // Auto-initiation is DISABLED to avoid racing initiators crash
+              // The WireGuard library doesn't handle transitioning from initiator to responder
+              ESP_LOGD(TAG, "Peer[%zu] %s: DERP ready - waiting for peer to initiate (responder-only mode)",
                        i, peer.hostname.c_str());
             }
-          } else {
-            // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
-            // Auto-initiation is DISABLED to avoid racing initiators crash
-            // The WireGuard library doesn't handle transitioning from initiator to responder
-            ESP_LOGD(TAG, "Peer[%zu] %s: DERP ready - waiting for peer to initiate (responder-only mode)",
-                     i, peer.hostname.c_str());
           }
+          derp_was_ready = true;
         }
-
-        this->wg_handshake_sent_ = true;  // Prevent repeated logging
-
-        // NOTE: Endpoint update disabled to prevent control plane reconnection OOM
-        // Server already knows ESP32 prefers DERP 28 from initial map request
-        // Peers can reach ESP32 via DERP without additional endpoint updates
-        //
-        // Original code tried to reconnect control plane here but caused OOM:
-        // - Control plane reconnection needs ~70KB for TLS + HTTP/2
-        // - DERP connection already uses memory
-        // - Not enough free memory for both simultaneously
-        //
-        // if (!this->initial_endpoint_sent_ && !this->discovered_endpoint_.empty()) {
-        //   ESP_LOGI(TAG, "→ Sending initial endpoint update to server...");
-        //   if (this->send_map_keepalive_()) {
-        //     ESP_LOGI(TAG, "✓ Initial endpoint update sent successfully");
-        //     this->initial_endpoint_sent_ = true;
-        //   } else {
-        //     ESP_LOGW(TAG, "Failed to send initial endpoint update - will retry later");
-        //   }
-        // }
+      } else {
+        derp_was_ready = false;
       }
     }
   } else {
@@ -1074,8 +1038,8 @@ void TailscaleComponent::handle_connected_state_() {
   static uint32_t last_socket_status_log = 0;
   now = millis();  // Reuse existing 'now' variable from line 392
   if (now - last_socket_status_log >= 30000) {
-    ESP_LOGI(TAG, "🔍 Socket status: unified_socket=%d (port %u), disco_socket=%d, icmp_socket=%d",
-             this->unified_socket_, this->unified_port_, this->disco_socket_, this->icmp_socket_);
+    ESP_LOGI(TAG, "🔍 Socket status: unified_socket=%d (port %u), icmp_socket=%d",
+             this->unified_socket_, this->unified_port_, this->icmp_socket_);
     last_socket_status_log = now;
   }
 
@@ -2404,53 +2368,6 @@ bool TailscaleComponent::save_keys_to_nvs_() {
   return success;
 }
 
-void TailscaleComponent::setup_disco_socket_() {
-  if (this->disco_socket_ != -1) {
-    return;  // Already set up
-  }
-
-  ESP_LOGI(TAG, "→ Setting up Disco UDP socket...");
-
-  this->disco_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (this->disco_socket_ < 0) {
-    ESP_LOGE(TAG, "Failed to create Disco UDP socket: errno %d", errno);
-    return;
-  }
-
-  // Set socket to non-blocking
-  int flags = fcntl(this->disco_socket_, F_GETFL, 0);
-  fcntl(this->disco_socket_, F_SETFL, flags | O_NONBLOCK);
-
-  // Bind to port 41641 (standard Tailscale disco port)
-  // CRITICAL: On ESP32/LWIP, binding to port 0 causes the send port to differ from receive port!
-  // We must bind to a specific port to ensure sendto() uses the same port.
-  struct sockaddr_in local_addr{};
-  local_addr.sin_family = AF_INET;
-  local_addr.sin_addr.s_addr = INADDR_ANY;
-  local_addr.sin_port = htons(41641);  // Tailscale disco port
-
-  if (bind(this->disco_socket_, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-    ESP_LOGE(TAG, "Failed to bind Disco socket: errno %d", errno);
-    close(this->disco_socket_);
-    this->disco_socket_ = -1;
-    return;
-  }
-
-  // Get the actual port that was assigned
-  struct sockaddr_in bound_addr{};
-  socklen_t bound_len = sizeof(bound_addr);
-  if (getsockname(this->disco_socket_, (struct sockaddr *)&bound_addr, &bound_len) == 0) {
-    uint16_t bound_port = ntohs(bound_addr.sin_port);
-    char bound_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &bound_addr.sin_addr, bound_ip, sizeof(bound_ip));
-    ESP_LOGI(TAG, "✓ Disco UDP socket bound to %s:%u (socket fd=%d, non-blocking=YES)",
-             bound_ip, bound_port, this->disco_socket_);
-  } else {
-    ESP_LOGW(TAG, "✓ Disco UDP socket ready (couldn't determine port, socket fd=%d)",
-             this->disco_socket_);
-  }
-}
-
 // ========================================
 // UNIFIED SOCKET SETUP
 // ========================================
@@ -3272,21 +3189,7 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 // Handle incoming disco PONG responses
 void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
   ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
-
-  // Record PONG receipt time
-  this->disco_pong_received_time_ = millis();
-
-  // Enable direct UDP path for WireGuard packets (instead of routing via DERP)
-  if (!this->direct_path_confirmed_) {
-    this->direct_path_confirmed_ = true;
-    ESP_LOGW(TAG, "🎯 Direct path confirmed! WireGuard will now use direct UDP instead of DERP relay");
-
-    // Disable DERP fallback if it was enabled (peer is now responding)
-    if (this->derp_fallback_enabled_) {
-      this->derp_fallback_enabled_ = false;
-      ESP_LOGI(TAG, "✓ Disabling DERP fallback - direct UDP path now working");
-    }
-  }
+  // TODO: Update per-peer direct path status here
 }
 
 // Handle STUN response packets (endpoint discovery)
@@ -3562,13 +3465,6 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
     return;
   }
 
-  // Track first Disco PING time for timeout detection
-  if (this->first_disco_ping_time_ == 0) {
-    this->first_disco_ping_time_ = millis();
-    ESP_LOGI(TAG, "⏱️ Started Disco PING timer - will enable DERP fallback if no PONG in %d seconds",
-             DISCO_PONG_TIMEOUT_MS / 1000);
-  }
-
   ESP_LOGD(TAG, "→ Sending Disco ping to %s:%u", endpoint.c_str(), port);
   ESP_LOGD(TAG, "  Peer disco key (%d chars): %s", peer_disco_key.length(), peer_disco_key.c_str());
 
@@ -3838,195 +3734,6 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   }
 }
 
-void TailscaleComponent::check_disco_responses_() {
-  // Debug: Log periodically to confirm function is being called
-  static uint32_t last_debug_log = 0;
-  static uint32_t check_count = 0;
-  check_count++;
-
-  uint32_t now = millis();
-  if (now - last_debug_log >= 30000) {  // Every 30 seconds
-    ESP_LOGD(TAG, "🔍 check_disco_responses_ called %u times in last 30s (socket=%d)",
-             check_count, this->disco_socket_);
-    check_count = 0;
-    last_debug_log = now;
-  }
-
-  if (this->disco_socket_ < 0) {
-    return;
-  }
-
-  // Check for incoming UDP packets (non-blocking)
-  uint8_t buffer[512];
-  struct sockaddr_in sender_addr{};
-  socklen_t sender_len = sizeof(sender_addr);
-
-  ssize_t received = recvfrom(this->disco_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                               (struct sockaddr *)&sender_addr, &sender_len);
-
-  if (received < 0) {
-    // No data available (EAGAIN/EWOULDBLOCK is normal for non-blocking socket)
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      ESP_LOGW(TAG, "⚠️ Disco recvfrom error: errno %d (%s)", errno, strerror(errno));
-    }
-    return;
-  }
-
-  if (received == 0) {
-    return;  // No data
-  }
-
-  // Log the reception
-  char sender_ip[INET_ADDRSTRLEN];
-  inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
-  uint16_t sender_port = ntohs(sender_addr.sin_port);
-
-  ESP_LOGI(TAG, "← Received Disco packet (%d bytes) from %s:%u", received, sender_ip, sender_port);
-
-  // Official Tailscale disco format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version + data)
-  // Minimum packet size: 6 + 32 + 24 + 18 (2 bytes plaintext + 16 bytes MAC) = 80 bytes
-  const size_t MIN_DISCO_PACKET_SIZE = 6 + 32 + 24 + 2 + CRYPTO_BOX_MACBYTES;
-
-  if (received < MIN_DISCO_PACKET_SIZE) {
-    ESP_LOGW(TAG, "  Disco packet too short (%d bytes, minimum %d)", received, MIN_DISCO_PACKET_SIZE);
-    return;
-  }
-
-  // Check magic header: "TS💬" (0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac)
-  const uint8_t disco_magic[] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};
-  if (memcmp(buffer, disco_magic, 6) != 0) {
-    ESP_LOGW(TAG, "  Invalid Disco magic header");
-    ESP_LOGD(TAG, "  Got: %02x %02x %02x %02x %02x %02x",
-             buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5]);
-    return;
-  }
-
-  // Extract sender's disco public key (32 bytes at offset 6)
-  const uint8_t* sender_disco_pubkey = &buffer[6];
-
-  // Extract nonce (24 bytes at offset 38)
-  const uint8_t* nonce = &buffer[38];
-
-  // Extract encrypted payload (from offset 62 to end)
-  const uint8_t* encrypted_payload = &buffer[62];
-  size_t encrypted_len = received - 62;
-
-  // Decode our disco private key
-  std::string our_priv_raw = this->base64_decode(this->disco_key_private_);
-  if (our_priv_raw.size() != 32) {
-    ESP_LOGE(TAG, "Invalid our disco private key size: %d", our_priv_raw.size());
-    return;
-  }
-
-  // Decrypt the payload using NaCl box
-  uint8_t plaintext[64];  // Should be enough for disco messages
-  if (crypto_box_open_easy_simple(plaintext, encrypted_payload, encrypted_len,
-                                   nonce, sender_disco_pubkey,
-                                   (const uint8_t*)our_priv_raw.data()) != 0) {
-    ESP_LOGW(TAG, "  Failed to decrypt disco packet (MAC verification failed)");
-    return;
-  }
-
-  // Extract msg_type and version from decrypted payload
-  uint8_t msg_type = plaintext[0];
-  uint8_t version = plaintext[1];
-
-  ESP_LOGI(TAG, "  ✓ Valid Disco message - Type: %u, Version: %u", msg_type, version);
-
-  // Message types:
-  // 1 = PING
-  // 2 = PONG
-  // 3 = CALL_ME_MAYBE
-  switch (msg_type) {
-    case 1: {
-      ESP_LOGI(TAG, "  Message type: PING");
-
-      // Find the peer by matching their disco public key
-      std::string peer_disco_key;
-      std::string peer_hostname;
-
-      for (const auto& peer : this->node_config_.peers) {
-        // Decode peer's disco key to compare with sender
-        std::string peer_key_str = peer.disco_key;
-        std::string peer_pub_raw;
-
-        // Strip "discokey:" prefix if present and convert from hex
-        if (peer_key_str.substr(0, 9) == "discokey:") {
-          peer_key_str = peer_key_str.substr(9);
-
-          if (peer_key_str.size() == 64) {  // 32 bytes = 64 hex chars
-            peer_pub_raw.resize(32);
-            for (size_t i = 0; i < 32; i++) {
-              char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
-              peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
-            }
-          }
-        } else {
-          peer_pub_raw = this->base64_decode(peer_key_str);
-        }
-
-        // Compare with sender's public key
-        if (peer_pub_raw.size() == 32 &&
-            memcmp(sender_disco_pubkey, peer_pub_raw.data(), 32) == 0) {
-          peer_disco_key = peer.disco_key;
-          peer_hostname = peer.hostname;
-          ESP_LOGD(TAG, "  Found peer: %s", peer_hostname.c_str());
-          break;
-        }
-      }
-
-      if (peer_disco_key.empty()) {
-        ESP_LOGW(TAG, "  Cannot respond to PING - peer disco key not recognized");
-      } else {
-        // Send PONG response
-        this->send_disco_pong_(sender_ip, sender_port, peer_disco_key);
-      }
-      break;
-    }
-    case 2: {
-      ESP_LOGI(TAG, "  ✓ Message type: PONG (peer received our PING!)");
-
-      // Find peer by their disco public key to get hostname
-      std::string peer_hostname;
-
-      for (const auto& peer : this->node_config_.peers) {
-        std::string peer_key_str = peer.disco_key;
-        std::string peer_pub_raw;
-
-        if (peer_key_str.substr(0, 9) == "discokey:") {
-          peer_key_str = peer_key_str.substr(9);
-          if (peer_key_str.size() == 64) {
-            peer_pub_raw.resize(32);
-            for (size_t i = 0; i < 32; i++) {
-              char hex_byte[3] = {peer_key_str[i*2], peer_key_str[i*2+1], '\0'};
-              peer_pub_raw[i] = (char)strtoul(hex_byte, nullptr, 16);
-            }
-          }
-        } else {
-          peer_pub_raw = this->base64_decode(peer_key_str);
-        }
-
-        if (peer_pub_raw.size() == 32 &&
-            memcmp(sender_disco_pubkey, peer_pub_raw.data(), 32) == 0) {
-          peer_hostname = peer.hostname;
-          break;
-        }
-      }
-
-      ESP_LOGI(TAG, "  ✓ PONG decrypted and validated successfully!");
-      ESP_LOGI(TAG, "  ✓ Direct UDP connectivity confirmed with %s at %s:%u",
-               peer_hostname.empty() ? "peer" : peer_hostname.c_str(), sender_ip, sender_port);
-
-      break;
-    }
-    case 3:
-      ESP_LOGI(TAG, "  Message type: CALL_ME_MAYBE");
-      break;
-    default:
-      ESP_LOGW(TAG, "  Unknown message type: %u", msg_type);
-      break;
-  }
-}
 
 // Simple STUN query to discover our public endpoint
 bool TailscaleComponent::perform_stun_query_() {
@@ -5002,102 +4709,7 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
 #endif
 }
 
-// UDP Relay for WireGuard → DERP forwarding
-// Creates a UDP socket listening on port 51821 that WireGuard will send packets to
-void TailscaleComponent::start_udp_relay_() {
-#ifdef USE_WIREGUARD
-  if (this->udp_relay_socket_ >= 0) {
-    ESP_LOGD(TAG, "UDP relay already started");
-    return;
-  }
-
-  // Create UDP socket
-  this->udp_relay_socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (this->udp_relay_socket_ < 0) {
-    ESP_LOGE(TAG, "Failed to create UDP relay socket: %d", errno);
-    return;
-  }
-
-  // Set non-blocking
-  int flags = fcntl(this->udp_relay_socket_, F_GETFL, 0);
-  fcntl(this->udp_relay_socket_, F_SETFL, flags | O_NONBLOCK);
-
-  // Bind to all interfaces on port 51821
-  // We use INADDR_ANY instead of localhost because WireGuard will send from WiFi interface
-  struct sockaddr_in bind_addr = {};
-  bind_addr.sin_family = AF_INET;
-  bind_addr.sin_port = htons(51821);  // WireGuard will send packets here
-  bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);  // Listen on all interfaces
-
-  if (bind(this->udp_relay_socket_, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
-    ESP_LOGE(TAG, "Failed to bind UDP relay socket to port 51821: %d", errno);
-    close(this->udp_relay_socket_);
-    this->udp_relay_socket_ = -1;
-    return;
-  }
-
-  // Get WiFi IP for logging
-  esp_netif_ip_info_t ip_info;
-  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-  esp_netif_get_ip_info(netif, &ip_info);
-  char ip_str[16];
-  snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", IP2STR(&ip_info.ip));
-  ESP_LOGI(TAG, "✓ UDP relay started on %s:51821 (WireGuard → DERP)", ip_str);
-#endif
-}
-
-// Check for WireGuard packets and forward them to DERP (non-blocking)
-void TailscaleComponent::process_udp_relay_() {
-#ifdef USE_WIREGUARD
-  if (this->udp_relay_socket_ < 0 || !this->wg_peer_node_key_valid_) {
-    return;  // Relay not started or no peer configured
-  }
-
-  if (!this->derp_client_ || !this->derp_client_->is_ready()) {
-    return;  // DERP not ready
-  }
-
-  // Try to receive packet (non-blocking)
-  uint8_t buffer[2048];  // WireGuard packets are typically < 1500 bytes
-  struct sockaddr_in src_addr;
-  socklen_t addr_len = sizeof(src_addr);
-
-  ssize_t len = recvfrom(this->udp_relay_socket_, buffer, sizeof(buffer), 0,
-                         (struct sockaddr*)&src_addr, &addr_len);
-
-  if (len < 0) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      ESP_LOGW(TAG, "UDP relay recvfrom error: %d", errno);
-    }
-    return;  // No packet available or error
-  }
-
-  if (len == 0) {
-    return;  // Empty packet
-  }
-
-  // Forward packet to DERP
-  ESP_LOGD(TAG, "→ Relaying WireGuard packet to DERP (%d bytes)", len);
-
-  if (!this->derp_client_->send_packet(this->wg_peer_node_key_, buffer, len)) {
-    ESP_LOGE(TAG, "Failed to send packet via DERP relay");
-  } else {
-    ESP_LOGD(TAG, "✓ Packet forwarded to DERP");
-  }
-#endif
-}
-
-// Clean up UDP relay resources
-void TailscaleComponent::stop_udp_relay_() {
-#ifdef USE_WIREGUARD
-  if (this->udp_relay_socket_ >= 0) {
-    close(this->udp_relay_socket_);
-    this->udp_relay_socket_ = -1;
-    ESP_LOGI(TAG, "UDP relay stopped");
-  }
-  this->wg_peer_node_key_valid_ = false;
-#endif
-}
+// UDP Relay for WireGuard → DERP forwarding (REMOVED - Legacy)
 
 // Process WireGuard packets that were buffered before session was ready
 void TailscaleComponent::process_buffered_wg_packets_() {

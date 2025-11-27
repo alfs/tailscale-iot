@@ -247,9 +247,7 @@ class TailscaleComponent : public PollingComponent {
   void handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src); // Forward to WireGuard
 
   // Disco protocol (DEPRECATED - migrating to unified socket)
-  int disco_socket_{-1};                      // UDP socket for Disco protocol (to be removed)
   std::vector<std::string> disco_ping_targets_;  // Hostnames to send Disco pings to (configured by user)
-  void setup_disco_socket_();
   void send_disco_ping_(const std::string& endpoint, uint16_t port, const std::string& peer_disco_key);
 
   // TTL-based NAT port discovery for symmetric NAT environments
@@ -272,7 +270,6 @@ class TailscaleComponent : public PollingComponent {
   NatDiscoveryState nat_discovery_state_;
   void send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
                         const std::string& peer_disco_key);
-  void check_disco_responses_();              // Check for incoming Disco messages
   bool decrypt_disco_payload_(const uint8_t* encrypted, size_t enc_len,
                                const uint8_t* nonce, const std::string& peer_disco_key,
                                uint8_t* plaintext, size_t* plain_len);
@@ -331,19 +328,7 @@ class TailscaleComponent : public PollingComponent {
   bool perform_natpmp_mapping_();    // Request port mapping via NAT-PMP
   bool check_natpmp_response_();     // Check for NAT-PMP response (non-blocking)
 
-  // UDP Relay for WireGuard → DERP forwarding
-  int udp_relay_socket_{-1};  // Socket listening on port 51821 for WireGuard packets
-  uint8_t wg_peer_node_key_[32]{};  // Binary node key of the WireGuard peer (for DERP send_packet)
-  bool wg_peer_node_key_valid_{false};  // Whether we have a valid peer node key
-  bool wg_handshake_sent_{false};  // Track if WireGuard handshake has been sent (only send once per session)
-  bool direct_path_confirmed_{false};  // Track if direct UDP path is confirmed via Disco PONG
-  uint32_t first_disco_ping_time_{0};  // Timestamp when first Disco PING was sent
-  uint32_t disco_pong_received_time_{0};  // Timestamp when last Disco PONG was received
-  bool derp_fallback_enabled_{false};  // Enable DERP-only fallback for non-responsive peers
-  static const uint32_t DISCO_PONG_TIMEOUT_MS = 180000;  // Wait 3 minutes (3 PING attempts) for PONG
-  void start_udp_relay_();  // Initialize UDP relay socket
-  void process_udp_relay_();  // Check for and forward packets (non-blocking)
-  void stop_udp_relay_();  // Clean up UDP relay resources
+  // UDP Relay for WireGuard → DERP forwarding (REMOVED - Legacy)
 
   // WireGuard send/receive diagnostics (to debug direct UDP vs DERP performance)
   uint32_t wg_direct_udp_tx_{0};       // Count of WireGuard packets sent via direct UDP
