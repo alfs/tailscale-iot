@@ -1,9 +1,6 @@
 # Tailscale IoT ESP32 Build System
-#
-# This Makefile automates dependency checking, installation, and building
-# of the Tailscale IoT firmware for ESP32 devices.
 
-.PHONY: help setup check-deps install-deps init-submodules config build clean flash monitor logs all
+.PHONY: help setup config build clean clean-all flash monitor logs run validate all install-espidf-deps
 
 # Default target
 .DEFAULT_GOAL := help
@@ -30,141 +27,41 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(BLUE)%-20s$(NC) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(GREEN)Quick start:$(NC)"
-	@echo "  make setup              # Install all dependencies and initialize submodules"
+	@echo "  make setup              # Install ESPHome"
 	@echo "  make config             # Copy example configuration files"
 	@echo "  # Edit $(SECRETS_FILE) with your credentials"
-	@echo "  make build              # Build the firmware (first build sets up ESP-IDF)"
-	@echo "  make install-espidf-deps # Install ESP-IDF Python packages (if build fails)"
-	@echo ""
+	@echo "  make build              # Build the firmware"
+	@echo "  make flash              # Flash to device"
+	@echo "  make monitor            # Monitor serial logs"
 
-all: check-deps init-submodules build ## Run full build pipeline (check deps, init submodules, build)
+all: build ## Build the firmware
 
-setup: install-deps init-submodules ## Install dependencies and initialize submodules
-	@echo "$(GREEN)✓ Setup complete!$(NC)"
-	@echo "$(YELLOW)Next steps:$(NC)"
-	@echo "  1. Run 'make config' to copy example configuration files"
-	@echo "  2. Edit $(SECRETS_FILE) with your credentials"
-	@echo "  3. Run 'make build' to build the firmware"
-	@echo "  4. If build fails with missing packages, run 'make install-espidf-deps'"
-
-check-deps: ## Check if all required dependencies are installed
-	@echo "$(BLUE)Checking dependencies...$(NC)"
-	@$(MAKE) -s check-python
-	@$(MAKE) -s check-esphome
-	@$(MAKE) -s check-python-packages
-	@$(MAKE) -s check-submodules
-	@echo "$(GREEN)✓ All dependencies are installed$(NC)"
-
-check-python: ## Check if Python 3 is installed
-	@if ! command -v $(PYTHON) >/dev/null 2>&1; then \
-		echo "$(RED)✗ Python 3 not found$(NC)"; \
-		echo "  Install: apt-get install python3 (Debian/Ubuntu)"; \
-		echo "           brew install python3 (macOS)"; \
-		exit 1; \
-	fi
-	@echo "$(GREEN)✓ Python 3 found:$(NC) $$($(PYTHON) --version)"
-
-check-esphome: ## Check if ESPHome is installed
-	@if ! command -v esphome >/dev/null 2>&1; then \
-		echo "$(RED)✗ ESPHome not found$(NC)"; \
-		echo "  Install: pip install esphome"; \
-		echo "           brew install esphome (macOS)"; \
-		echo "           pipx install esphome"; \
-		exit 1; \
-	fi
-	@echo "$(GREEN)✓ ESPHome found:$(NC) $$(esphome version)"
-
-check-python-packages: ## Check if required Python packages are installed
-	@echo "$(BLUE)Checking Python packages...$(NC)"
-	@if [ -f ~/.platformio/penv/.espidf-*/bin/python ]; then \
-		ESPIDF_PYTHON=$$(ls -t ~/.platformio/penv/.espidf-*/bin/python 2>/dev/null | head -1); \
-		if [ -n "$$ESPIDF_PYTHON" ]; then \
-			missing_packages=""; \
-			for package in idf_component_manager esp_idf_kconfig cryptography; do \
-				if ! $$ESPIDF_PYTHON -c "import $$package" >/dev/null 2>&1; then \
-					echo "  $(YELLOW)✗ $$package not found in ESP-IDF venv$(NC)"; \
-					missing_packages="$$missing_packages $$package"; \
-				else \
-					echo "  $(GREEN)✓ $$package$(NC)"; \
-				fi; \
-			done; \
-			if [ -n "$$missing_packages" ]; then \
-				echo "$(YELLOW)Missing ESP-IDF packages:$$missing_packages$(NC)"; \
-				echo "$(YELLOW)Run 'make install-espidf-deps' to install them$(NC)"; \
-				exit 1; \
-			fi; \
-		fi; \
-	else \
-		echo "  $(YELLOW)⚠ ESP-IDF venv not found yet (will be created on first build)$(NC)"; \
-	fi
-
-check-submodules: ## Check if required submodules are initialized
-	@echo "$(BLUE)Checking submodules...$(NC)"
-	@# noise-c is now vendored in components/tailscale/noise/ - no submodule needed
-	@echo "$(GREEN)✓ No required submodules (noise-c is vendored)$(NC)"
-
-install-deps: ## Install all required Python dependencies
-	@echo "$(BLUE)Installing Python dependencies...$(NC)"
+setup: ## Install ESPHome dependency
+	@echo "$(BLUE)Installing dependencies...$(NC)"
 	@if ! command -v esphome >/dev/null 2>&1; then \
 		echo "$(YELLOW)Installing ESPHome...$(NC)"; \
 		$(PIP) install esphome || exit 1; \
+	else \
+		echo "$(GREEN)✓ ESPHome is already installed$(NC)"; \
 	fi
-	@echo "$(GREEN)✓ ESPHome installed$(NC)"
-	@echo "$(YELLOW)Note: Run 'make install-espidf-deps' after first build to install ESP-IDF packages$(NC)"
+	@echo "$(GREEN)✓ Setup complete$(NC)"
 
-install-espidf-deps: ## Install ESP-IDF Python packages in PlatformIO venv
+install-espidf-deps: ## Install ESP-IDF Python packages (run if build fails)
 	@echo "$(BLUE)Installing ESP-IDF Python packages...$(NC)"
 	@ESPIDF_PYTHON=$$(ls -t ~/.platformio/penv/.espidf-*/bin/python 2>/dev/null | head -1); \
 	if [ -z "$$ESPIDF_PYTHON" ]; then \
 		echo "$(RED)✗ ESP-IDF virtual environment not found$(NC)"; \
-		echo "  The ESP-IDF venv is created during the first build."; \
-		echo "  Try running 'make build' first (it may fail), then run this command again."; \
+		echo "  Try running 'make build' first to create it."; \
 		exit 1; \
 	fi; \
 	echo "  Using Python: $$ESPIDF_PYTHON"; \
-	if ! $$ESPIDF_PYTHON -m pip --version >/dev/null 2>&1; then \
-		echo "  $(YELLOW)pip not found in ESP-IDF venv, installing...$(NC)"; \
-		if command -v pip3 >/dev/null 2>&1; then \
-			echo "  Using system pip3 to install packages..."; \
-			VENV_SITE=$$($$ESPIDF_PYTHON -c "import site; print(site.getsitepackages()[0])" 2>/dev/null); \
-			if [ -n "$$VENV_SITE" ]; then \
-				pip3 install --target="$$VENV_SITE" idf-component-manager esp-idf-kconfig cryptography || exit 1; \
-			else \
-				echo "  $(RED)✗ Could not determine venv site-packages location$(NC)"; \
-				echo "  Try installing pip manually: curl -sS https://bootstrap.pypa.io/get-pip.py | $$ESPIDF_PYTHON"; \
-				exit 1; \
-			fi; \
-		else \
-			echo "  $(RED)✗ pip not available$(NC)"; \
-			echo "  Install pip in ESP-IDF venv manually:"; \
-			echo "    curl -sS https://bootstrap.pypa.io/get-pip.py | $$ESPIDF_PYTHON"; \
-			exit 1; \
-		fi; \
-	else \
-		$$ESPIDF_PYTHON -m pip install -q idf-component-manager esp-idf-kconfig cryptography || exit 1; \
-	fi; \
-	echo "$(GREEN)✓ ESP-IDF packages installed:$(NC)"; \
-	echo "  • idf-component-manager (for ESP-IDF components)"; \
-	echo "  • esp-idf-kconfig (for menuconfig)"; \
-	echo "  • cryptography (for certificate bundle generation)"
-
-init-submodules: ## Initialize required git submodules (excludes optional ones)
-	@echo "$(BLUE)Initializing required submodules...$(NC)"
-	@# noise-c is now vendored in components/tailscale/noise/ - no submodule needed
-	@echo "$(GREEN)✓ No required submodules to initialize (noise-c is vendored)$(NC)"
-	@echo "$(YELLOW)Note: Optional submodules for protocol debugging were not initialized$(NC)"
-	@echo "      Run 'git submodule update --init --recursive' to get all submodules"
-
-init-submodules-all: ## Initialize ALL git submodules including optional ones
-	@echo "$(BLUE)Initializing all submodules (including optional)...$(NC)"
-	@git submodule update --init --recursive
-	@echo "$(GREEN)✓ All submodules initialized$(NC)"
+	$$ESPIDF_PYTHON -m pip install -q idf-component-manager esp-idf-kconfig cryptography || exit 1; \
+	echo "$(GREEN)✓ ESP-IDF packages installed$(NC)"
 
 config: ## Copy example configuration files
 	@echo "$(BLUE)Setting up configuration files...$(NC)"
 	@if [ ! -f $(CONFIG_FILE) ]; then \
 		if [ -f $(EXAMPLE_CONFIG) ]; then \
-			echo "  Copying $(EXAMPLE_CONFIG) to $(CONFIG_FILE)"; \
 			cp $(EXAMPLE_CONFIG) $(CONFIG_FILE); \
 			echo "  $(GREEN)✓ Created $(CONFIG_FILE)$(NC)"; \
 		else \
@@ -176,7 +73,6 @@ config: ## Copy example configuration files
 	fi
 	@if [ ! -f $(SECRETS_FILE) ]; then \
 		if [ -f $(SECRETS_TEMPLATE) ]; then \
-			echo "  Copying $(SECRETS_TEMPLATE) to $(SECRETS_FILE)"; \
 			cp $(SECRETS_TEMPLATE) $(SECRETS_FILE); \
 			echo "  $(GREEN)✓ Created $(SECRETS_FILE)$(NC)"; \
 			echo "  $(YELLOW)⚠ Remember to edit $(SECRETS_FILE) with your credentials!$(NC)"; \
@@ -188,28 +84,35 @@ config: ## Copy example configuration files
 		echo "  $(YELLOW)⚠ $(SECRETS_FILE) already exists, skipping$(NC)"; \
 	fi
 
-build: check-deps ## Build the firmware
+build: ## Build the firmware
 	@echo "$(BLUE)Building firmware...$(NC)"
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(RED)✗ Configuration file $(CONFIG_FILE) not found$(NC)"; \
-		echo "  Run 'make config' to create it"; \
-		exit 1; \
-	fi
-	@if [ ! -f $(SECRETS_FILE) ]; then \
-		echo "$(RED)✗ Secrets file $(SECRETS_FILE) not found$(NC)"; \
-		echo "  Run 'make config' to create it, then edit with your credentials"; \
+	@if [ ! -f $(CONFIG_FILE) ] || [ ! -f $(SECRETS_FILE) ]; then \
+		echo "$(RED)✗ Config or secrets file missing. Run 'make config' first.$(NC)"; \
 		exit 1; \
 	fi
 	@esphome compile $(CONFIG_FILE)
 	@echo "$(GREEN)✓ Build complete!$(NC)"
 	@echo "$(YELLOW)Firmware location:$(NC) .esphome/build/*/firmware.bin"
 
+flash: ## Flash firmware to device
+	@echo "$(BLUE)Flashing firmware...$(NC)"
+	@esphome upload $(CONFIG_FILE)
+
+monitor: ## Show device logs
+	@echo "$(BLUE)Showing logs...$(NC)"
+	@esphome logs $(CONFIG_FILE)
+
+logs: monitor ## Alias for 'monitor'
+
+run: ## Build, flash, and monitor logs
+	@echo "$(BLUE)Building, flashing, and monitoring...$(NC)"
+	@esphome run $(CONFIG_FILE)
+
 clean: ## Clean build artifacts
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
 	@if [ -f $(CONFIG_FILE) ]; then \
 		esphome clean $(CONFIG_FILE); \
 	else \
-		echo "$(YELLOW)No config file found, removing .esphome directory$(NC)"; \
 		rm -rf .esphome; \
 	fi
 	@echo "$(GREEN)✓ Clean complete$(NC)"
@@ -219,37 +122,7 @@ clean-all: clean ## Clean build artifacts and configuration files
 	@rm -f $(CONFIG_FILE) $(SECRETS_FILE)
 	@echo "$(GREEN)✓ All generated files removed$(NC)"
 
-flash: ## Flash firmware to device (will prompt for device selection)
-	@echo "$(BLUE)Flashing firmware...$(NC)"
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(RED)✗ Configuration file $(CONFIG_FILE) not found$(NC)"; \
-		exit 1; \
-	fi
-	@esphome upload $(CONFIG_FILE)
-
-run: ## Build, flash, and monitor logs
-	@echo "$(BLUE)Building, flashing, and monitoring...$(NC)"
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(RED)✗ Configuration file $(CONFIG_FILE) not found$(NC)"; \
-		exit 1; \
-	fi
-	@esphome run $(CONFIG_FILE)
-
-logs: ## Show device logs
-	@echo "$(BLUE)Showing logs...$(NC)"
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(RED)✗ Configuration file $(CONFIG_FILE) not found$(NC)"; \
-		exit 1; \
-	fi
-	@esphome logs $(CONFIG_FILE)
-
 validate: ## Validate configuration without building
 	@echo "$(BLUE)Validating configuration...$(NC)"
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(RED)✗ Configuration file $(CONFIG_FILE) not found$(NC)"; \
-		exit 1; \
-	fi
 	@esphome config $(CONFIG_FILE)
 	@echo "$(GREEN)✓ Configuration is valid$(NC)"
-
-monitor: logs ## Alias for 'logs' target
