@@ -9,13 +9,17 @@ So here it is. The Frankenstein proof-of-concept. Slashed and stitched by many h
 
 You probably don't want to touch this code by hand. But it works, with some quirks. I hope it will give inspiration to a clean, optimized, smaller, implementation.
 
-Current status: Connects to self-hosted headscale servers (probably also tailscale servers - haven't tested), registers successfully, gets IP address, gets peer names and addresses. External STUN via google works and records the external NAT address and port in the headscale database. STUN via DERP does not work.
+Current status: Connects to self-hosted headscale servers, registers successfully, gets IP address, and establishes connectivity.
+- **Direct UDP:** Works! STUN discovery, NAT traversal, and direct WireGuard peering are functional.
+- **Ping/Pong:** Disco protocol (Encrypted PING/PONG) is working bidirectionally.
+- **Stability:** Fixed Watchdog Timeouts by optimizing crypto intervals.
+- **Limitations:** DERP relaying is currently disabled to prioritize Direct UDP and save memory. IPv6 endpoints are ignored to save memory.
 
-What does not (even if Claude claims it's fixed in the git logs!): DERP tunneling of wireguard packets, or DISCO nat punching. Some packets get through, as evident by tcpdump, but there is no ping/pong despite many hours of troubleshooting and flipping back and forth between crypto implementations.
+## Future Improvements
 
-TODO: go from peer, stun and registration with the server to gain wireguard connectivity and test of echo application.
-
-Current problem: Claude doesn't progress in solving the more intricate protocol issues with DERP and DISCO and goes back and forth among tests and adjustments. Dumping the esp32 wifi traffic towards DERP and peers can give more insights.
+- **Endpoint Probing:** Refine endpoint selection by actively probing candidates. Currently, the parser statically prioritizes public IPv4 addresses to avoid 'black hole' private IPs (like VPN ranges). However, a reachable private/internal IP on the same LAN/VLAN might offer better latency and privacy. A probing mechanism (sending test packets to all candidates) would allow dynamic selection of the best path.
+- **Re-enable DERP:** Re-enable DERP fallback for networks where UDP is completely blocked, managing memory carefully.
+- **IPv6 Support:** Re-add IPv6 endpoint parsing if memory permits.
 
 
 ## Build & Flash Instructions
