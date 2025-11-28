@@ -922,7 +922,7 @@ void TailscaleComponent::handle_connected_state_() {
   // 2. Next loop iteration → retry DERP → fails again
   // 3. Keepalives never execute because code stuck in DERP retry loop
 
-  bool skip_derp_for_keepalives = false;  // WireGuard removed - 24KB freed, DERP can now run
+  bool skip_derp_for_keepalives = true;  // FORCE DISABLE DERP FOR TESTING DIRECT UDP
   static bool logged_skip_derp = false;  // Only log once
 
   // Debug: Log DERP state check
@@ -948,51 +948,46 @@ void TailscaleComponent::handle_connected_state_() {
           ESP_LOGW(TAG, "Failed to initiate DERP connection");
         }
       }
-
-      // Step 2: Check if DERP is fully READY before sending WireGuard handshakes
-      // CRITICAL: connect() returns true before READY state (during WAIT_SERVER_KEY)
-      // Must wait for DERP handshake to complete before sending WireGuard packets
-      static bool derp_was_ready = false;
-      if (this->derp_client_->is_ready()) {
-        if (!derp_was_ready) {
-          // DERP just became ready - initiate handshakes
-          ESP_LOGI(TAG, "⚡ DERP client ready - initiating peer handshakes");
-
-          // MULTI-PEER HANDSHAKE: Initiate handshakes for peers that need DERP fallback
-          // DERP FALLBACK MODE: When Disco PONG timeout occurs (peer doesn't respond to PINGs),
-          // switch from responder-only to initiator mode to establish WireGuard via DERP
-          for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
-            auto& peer = this->peer_sessions_[i];
-
-            if (peer.derp_fallback_enabled) {
-              ESP_LOGI(TAG, "🔄 Peer[%zu] %s: DERP fallback mode - initiating WireGuard handshake via DERP",
-                       i, peer.hostname.c_str());
-              if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
-                ESP_LOGI(TAG, "✓ Peer[%zu] %s: WireGuard handshake sent via DERP (initiator mode)",
-                         i, peer.hostname.c_str());
-              } else {
-                ESP_LOGW(TAG, "✗ Peer[%zu] %s: Failed to initiate WireGuard handshake",
-                         i, peer.hostname.c_str());
-              }
-            } else {
-              // RESPONDER-ONLY MODE: ESP32 waits for peer to initiate
-              // Auto-initiation is DISABLED to avoid racing initiators crash
-              // The WireGuard library doesn't handle transitioning from initiator to responder
-              ESP_LOGD(TAG, "Peer[%zu] %s: DERP ready - waiting for peer to initiate (responder-only mode)",
-                       i, peer.hostname.c_str());
-            }
-          }
-          derp_was_ready = true;
-        }
-      } else {
-        derp_was_ready = false;
-      }
     }
   } else {
     if (!logged_skip_derp) {
       ESP_LOGI(TAG, "KEEPALIVE MODE: Skipping DERP connection to avoid OOM - using direct LAN connectivity");
       logged_skip_derp = true;
     }
+  }
+
+  // Step 2: Periodic WireGuard handshake maintenance
+  // Ensures active peers have a valid WireGuard session, especially for Direct UDP
+  // INCREASED INTERVAL: 5s -> 60s to avoid WDT crashes caused by frequent Curve25519 re-keying
+  static uint32_t last_handshake_check = 0;
+  if (now - last_handshake_check >= 60000) {  // Check every 60 seconds
+    bool derp_ready = (this->derp_client_ && this->derp_client_->is_ready());
+    bool direct_mode = skip_derp_for_keepalives;
+
+    if (direct_mode || derp_ready) {
+      for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+        auto& peer = this->peer_sessions_[i];
+
+        // CRITICAL OPTIMIZATION: Only handshake peers that are ALREADY active in the device manager
+        // This prevents thrashing the LRU cache and causing watchdog timeouts by trying to wake up
+        // all peers simultaneously. We only want to maintain the session for the peer we are
+        // actually talking to.
+        
+        ::wireguard_peer* wg_peer = this->wg_device_manager_->get_peer(peer.tailscale_ip);
+        
+        if (wg_peer != nullptr) {
+          // Peer is active - check if we need to re-initiate handshake
+          // For now, we just blindly re-initiate if active to ensure connectivity
+          // The WireGuard library handles rate limiting internally
+          ESP_LOGD(TAG, "🔄 Peer[%zu] %s: Handshake maintenance for active peer", i, peer.hostname.c_str());
+          
+          if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
+             ESP_LOGD(TAG, "✓ Peer[%zu] %s: Handshake initiation sent", i, peer.hostname.c_str());
+          }
+        }
+      }
+    }
+    last_handshake_check = now;
   }
 
   // NOTE: DERP client processing moved to loop() for frequent polling
@@ -2074,6 +2069,16 @@ bool TailscaleComponent::fetch_map_response_() {
     peer.hostname = static_peer->hostname;
     peer.endpoint = "";
     peer.port = 0;
+
+    // Use initial endpoint from map if available (critical for direct connections)
+    if (static_peer->endpoint[0] != '\0') {
+      std::string ep_str = static_peer->endpoint;
+      size_t colon_pos = ep_str.rfind(':');
+      if (colon_pos != std::string::npos) {
+        peer.endpoint = ep_str.substr(0, colon_pos);
+        peer.port = atoi(ep_str.substr(colon_pos + 1).c_str());
+      }
+    }
 
     if (static_peer->tailscale_ip[0] != '\0') {
       peer.allowed_ips.push_back(std::string(static_peer->tailscale_ip) + "/32");

@@ -42,12 +42,15 @@ esp32:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  power_save_mode: NONE
 
 # Enable logging
 logger:
   #level: INFO
   #level: DEBUG
   level: VERBOSE
+  logs:
+    tailscale.wireguard: VERBOSE
 
 # Time source (required)
 time:

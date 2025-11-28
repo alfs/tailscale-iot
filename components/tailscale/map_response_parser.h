@@ -20,7 +20,8 @@ struct MinimalPeerInfo {
   uint8_t disco_key[32];      // Binary disco key for O(1) lookup on incoming disco packets
   uint8_t node_key[32];       // Binary node key for WireGuard handshake
   char tailscale_ip[16];      // e.g. "100.64.0.17" (for routing)
-  char hostname[32];          // For logging/debugging only
+  char hostname[64];          // For logging/debugging only
+  char endpoint[64];          // Best initial endpoint from map response
   bool valid;
 
   MinimalPeerInfo() : valid(false) {
@@ -28,6 +29,7 @@ struct MinimalPeerInfo {
     memset(node_key, 0, sizeof(node_key));
     memset(tailscale_ip, 0, sizeof(tailscale_ip));
     memset(hostname, 0, sizeof(hostname));
+    memset(endpoint, 0, sizeof(endpoint));
   }
 };
 

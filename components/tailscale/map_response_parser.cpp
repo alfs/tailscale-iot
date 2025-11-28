@@ -445,6 +445,39 @@ static size_t hex_decode_to_bytes(const char *hex_str, size_t hex_len, uint8_t *
   return byte_count;
 }
 
+// Helper: Check if IPv4 string is private (RFC1918) or Loopback
+static bool is_private_ipv4(const char* ip_str, size_t len) {
+  if (!ip_str || len == 0) return false;
+
+  // Copy to temp buffer to ensure null termination for sscanf
+  char ip[16];
+  size_t copy_len = (len < 15) ? len : 15;
+  memcpy(ip, ip_str, copy_len);
+  ip[copy_len] = '\0';
+
+  unsigned int a, b, c, d;
+  if (sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+    return false; // Not a valid IPv4 address
+  }
+
+  // 10.0.0.0/8
+  if (a == 10) return true;
+
+  // 172.16.0.0/12 (172.16.0.0 - 172.31.255.255)
+  if (a == 172 && b >= 16 && b <= 31) return true;
+
+  // 192.168.0.0/16
+  if (a == 192 && b == 168) return true;
+
+  // 127.0.0.0/8 (Loopback)
+  if (a == 127) return true;
+  
+  // 169.254.0.0/16 (Link-local)
+  if (a == 169 && b == 254) return true;
+
+  return false;
+}
+
 // STATIC BUFFER PARSER - Absolutely NO heap allocations
 bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
                       const std::vector<std::string> *allowed_peers) {
@@ -635,6 +668,8 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
       }
 
       // Apply filtering if enabled
+
+      // Apply filtering if enabled
       peers_processed++;
       if (allowed_peers && !allowed_peers->empty()) {
         bool is_allowed = false;
@@ -655,10 +690,56 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
         }
       }
 
-      // Extract first AllowedIP as tailscale_ip (strip CIDR suffix)
-      const char* allowed_field = find_str(peer_obj_start, peer_obj_end, "\"AllowedIPs\":[");
-      if (allowed_field) {
-        const char* ip_p = allowed_field + 14;
+      // Extract Endpoints (prioritize public IPs)
+      const char* endpoints_field = find_str(peer_obj_start, peer_obj_end, "\"Endpoints\":[");
+      if (endpoints_field) {
+        const char* ep_p = endpoints_field + 13;
+        bool found_public = false;
+        bool found_private = false;
+
+        while (ep_p < peer_obj_end) {
+          size_t ep_len;
+          const char* ep_val = extract_quoted_value(ep_p, peer_obj_end, &ep_len);
+          if (!ep_val) break;
+
+          // Skip IPv6 (contains brackets or multiple colons)
+          bool is_ipv6 = false;
+          for (size_t i = 0; i < ep_len; i++) {
+            if (ep_val[i] == '[') { is_ipv6 = true; break; }
+          }
+          
+          if (!is_ipv6) {
+            // Extract just the IP part (strip port)
+            size_t ip_len = ep_len;
+            for (size_t i = 0; i < ep_len; i++) {
+              if (ep_val[i] == ']') break;
+              if (ep_val[i] == ':') { ip_len = i; break; }
+            }
+
+            bool is_private = is_private_ipv4(ep_val, ip_len);
+
+            if (!is_private) {
+              // Found public IPv4! This is preferred.
+              safe_strncpy(peer->endpoint, ep_val, sizeof(peer->endpoint), ep_len);
+              found_public = true;
+              break; // Stop searching, we found the best one
+            } else if (!found_private) {
+              // Found private IPv4, store it as backup but keep looking for public
+              safe_strncpy(peer->endpoint, ep_val, sizeof(peer->endpoint), ep_len);
+              found_private = true;
+            }
+          }
+
+          ep_p = ep_val + ep_len + 1;
+          if (ep_p >= peer_obj_end || *ep_p == ']') break;
+        }
+      }
+
+      // Extract Tailscale IP from Addresses field (preferred over AllowedIPs)
+      // Addresses contains the interface IPs (e.g. 100.64.0.x), whereas AllowedIPs includes subnets
+      const char* addresses_field = find_str(peer_obj_start, peer_obj_end, "\"Addresses\":[");
+      if (addresses_field) {
+        const char* ip_p = addresses_field + 13;
         size_t ip_len;
         const char* ip_val = extract_quoted_value(ip_p, peer_obj_end, &ip_len);
         if (ip_val) {
@@ -671,6 +752,30 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
             }
           }
           safe_strncpy(peer->tailscale_ip, ip_val, sizeof(peer->tailscale_ip), ip_only_len);
+        }
+      } else {
+        // Fallback to AllowedIPs if Addresses is missing (unlikely)
+        const char* allowed_field = find_str(peer_obj_start, peer_obj_end, "\"AllowedIPs\":[");
+        if (allowed_field) {
+          const char* ip_p = allowed_field + 14;
+          size_t ip_len;
+          const char* ip_val = extract_quoted_value(ip_p, peer_obj_end, &ip_len);
+          if (ip_val) {
+            size_t ip_only_len = ip_len;
+            for (size_t i = 0; i < ip_len; i++) {
+              if (ip_val[i] == '/') {
+                ip_only_len = i;
+                break;
+              }
+            }
+            // Avoid 0.0.0.0/0 or ::/0 (default routes)
+            bool is_default_route = (ip_only_len == 7 && memcmp(ip_val, "0.0.0.0", 7) == 0) ||
+                                    (ip_only_len == 2 && memcmp(ip_val, "::", 2) == 0);
+            
+            if (!is_default_route) {
+               safe_strncpy(peer->tailscale_ip, ip_val, sizeof(peer->tailscale_ip), ip_only_len);
+            }
+          }
         }
       }
 
