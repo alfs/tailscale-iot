@@ -570,6 +570,8 @@ bool Ts2021Upgrade::write_raw(const uint8_t *data, size_t len) {
 
   size_t written = 0;
   while (written < send_len) {
+    // Feed watchdog before TLS write which can block during encryption
+    App.feed_wdt();
     int ret = esp_tls_conn_write(this->tls_, send_ptr + written, send_len - written);
     if (ret <= 0) {
       ESP_LOGE(TAG, "esp_tls_conn_write failed (%d)", ret);
@@ -640,6 +642,8 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
       return false;
     }
 
+    // Feed watchdog before TLS read which can block during crypto operations
+    App.feed_wdt();
     int ret = esp_tls_conn_read(this->tls_, temp.data(), temp.size());
     if (ret > 0) {
       size_t received = static_cast<size_t>(ret);

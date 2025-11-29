@@ -124,8 +124,10 @@ bool DerpClient::connect() {
     int flags = fcntl(this->sock_, F_GETFL, 0);
     fcntl(this->sock_, F_SETFL, flags | O_NONBLOCK);
 
-    // Resolve hostname
+    // Resolve hostname (can block for extended periods)
+    App.feed_wdt();  // Feed watchdog before DNS resolution
     struct hostent *server = gethostbyname(this->server_host_.c_str());
+    App.feed_wdt();  // Feed watchdog after DNS resolution
     if (server == nullptr) {
       ESP_LOGE(TAG, "Failed to resolve hostname %s", this->server_host_.c_str());
       close(this->sock_);
@@ -155,7 +157,9 @@ bool DerpClient::connect() {
     FD_SET(this->sock_, &writefds);
 
     struct timeval timeout = {5, 0}; // 5 second timeout
+    App.feed_wdt();  // Feed watchdog before blocking select
     ret = select(this->sock_ + 1, nullptr, &writefds, nullptr, &timeout);
+    App.feed_wdt();  // Feed watchdog after select
 
     if (ret <= 0) {
       ESP_LOGE(TAG, "Connection timeout");
@@ -298,8 +302,9 @@ bool DerpClient::do_tls_handshake_() {
   // The certificate bundle includes root CAs like ISRG Root X1 (Let's Encrypt)
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
 
-  // Set timeouts for TLS connection (30 seconds for handshake)
-  cfg.timeout_ms = 30000;
+  // Set timeouts for TLS connection (20 seconds for handshake)
+  // Must be less than watchdog timeout (30s) to prevent WDT crashes
+  cfg.timeout_ms = 20000;
 
   // Enable non-blocking mode for better control
   cfg.non_block = false;  // Use blocking for initial handshake

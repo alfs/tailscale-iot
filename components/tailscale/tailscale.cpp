@@ -922,7 +922,7 @@ void TailscaleComponent::handle_connected_state_() {
   // 2. Next loop iteration → retry DERP → fails again
   // 3. Keepalives never execute because code stuck in DERP retry loop
 
-  bool skip_derp_for_keepalives = true;  // FORCE DISABLE DERP FOR TESTING DIRECT UDP
+  bool skip_derp_for_keepalives = false;  // DERP enabled to bootstrap endpoint learning
   static bool logged_skip_derp = false;  // Only log once
 
   // Debug: Log DERP state check
@@ -977,12 +977,18 @@ void TailscaleComponent::handle_connected_state_() {
         
         if (wg_peer != nullptr) {
           // Peer is active - check if we need to re-initiate handshake
-          // For now, we just blindly re-initiate if active to ensure connectivity
-          // The WireGuard library handles rate limiting internally
-          ESP_LOGD(TAG, "🔄 Peer[%zu] %s: Handshake maintenance for active peer", i, peer.hostname.c_str());
-          
-          if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
-             ESP_LOGD(TAG, "✓ Peer[%zu] %s: Handshake initiation sent", i, peer.hostname.c_str());
+          // CRITICAL FIX: Only re-initiate if handshake NOT established
+          // Re-keying while session is active causes 30+ second crypto blocking
+          if (this->wg_device_manager_->is_handshake_established(peer.tailscale_ip)) {
+            // Session established - just send keepalive
+            ESP_LOGD(TAG, "🔄 Peer[%zu] %s: Session active, sending keepalive", i, peer.hostname.c_str());
+            this->wg_device_manager_->send_peer_keepalive(peer.tailscale_ip);
+          } else {
+            // Session not established - initiate handshake
+            ESP_LOGD(TAG, "🔄 Peer[%zu] %s: Session not established, initiating handshake", i, peer.hostname.c_str());
+            if (this->wg_device_manager_->start_peer_handshake(peer.tailscale_ip)) {
+               ESP_LOGD(TAG, "✓ Peer[%zu] %s: Handshake initiation sent", i, peer.hostname.c_str());
+            }
           }
         }
       }
@@ -1101,7 +1107,7 @@ void TailscaleComponent::handle_connected_state_() {
         if (!this->nat_discovery_state_.active) {
           this->send_disco_ping_(peer.endpoint, peer.port, peer.disco_key);
         }
-        break;  // Only send to first peer
+        // Continue to send to all peers, not just first one
       }
     }
 
@@ -3194,7 +3200,40 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 // Handle incoming disco PONG responses
 void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
   ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
-  // TODO: Update per-peer direct path status here
+
+  // Find the peer by endpoint and mark direct path as confirmed
+  for (auto& peer : this->node_config_.peers) {
+    if (peer.endpoint == sender_ip && peer.port == sender_port) {
+      // Find the corresponding peer session and mark direct path confirmed
+      for (auto& session : this->peer_sessions_) {
+        if (session.hostname == peer.hostname) {
+          bool endpoint_changed = (session.endpoint != sender_ip || session.endpoint_port != sender_port);
+
+          // Always update endpoint in peer_sessions_ (critical for direct UDP routing)
+          if (endpoint_changed || session.endpoint.empty()) {
+            ESP_LOGI(TAG, "🔄 Updating peer_sessions_ endpoint for %s: %s:%u → %s:%u",
+                     peer.hostname.c_str(),
+                     session.endpoint.empty() ? "(empty)" : session.endpoint.c_str(),
+                     session.endpoint_port,
+                     sender_ip.c_str(), sender_port);
+            session.endpoint = sender_ip;
+            session.endpoint_port = sender_port;
+            session.last_endpoint_update = millis();
+          }
+
+          if (!session.direct_path_confirmed) {
+            ESP_LOGW(TAG, "🎯 DIRECT PATH CONFIRMED for %s at %s:%u - will prefer direct UDP over DERP",
+                     peer.hostname.c_str(), sender_ip.c_str(), sender_port);
+            session.direct_path_confirmed = true;
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  // Peer not found by endpoint match - try to find by disco key in incoming PING
+  ESP_LOGD(TAG, "  Disco PONG from unknown endpoint %s:%u - peer may not be in node_config_", sender_ip.c_str(), sender_port);
 }
 
 // Handle STUN response packets (endpoint discovery)
@@ -3743,6 +3782,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
 // Simple STUN query to discover our public endpoint
 bool TailscaleComponent::perform_stun_query_() {
   ESP_LOGD(TAG, "→ Performing STUN query to discover endpoint...");
+  App.feed_wdt();  // Feed watchdog before potentially blocking operations
 
   // Use the existing unified socket for STUN to ensure NAT mapping matches
   // CRITICAL: Using a temporary socket would create a different NAT port mapping!
@@ -3779,7 +3819,9 @@ bool TailscaleComponent::perform_stun_query_() {
 
   stun_addr.sin_port = htons(stun_port);
 
+  App.feed_wdt();  // Feed watchdog before DNS resolution (can block)
   struct hostent *server = gethostbyname(stun_server);
+  App.feed_wdt();  // Feed watchdog after DNS resolution
   if (server == nullptr) {
     ESP_LOGE(TAG, "Failed to resolve STUN server %s", stun_server);
     // Don't close sock - it's the persistent unified socket
@@ -3835,6 +3877,7 @@ bool TailscaleComponent::perform_stun_query_() {
 
   struct timeval timeout = {2, 0};  // 2 second timeout
   int ret = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+  App.feed_wdt();  // Feed watchdog after blocking select()
 
   if (ret <= 0) {
     ESP_LOGW(TAG, "STUN query timeout - no response from server");
@@ -3896,7 +3939,9 @@ bool TailscaleComponent::perform_stun_query_() {
       stun_port = 19302;
       stun_addr.sin_port = htons(stun_port);
 
+      App.feed_wdt();  // Feed watchdog before fallback DNS resolution
       server = gethostbyname(stun_server);
+      App.feed_wdt();  // Feed watchdog after fallback DNS resolution
       if (server == nullptr) {
         ESP_LOGE(TAG, "Failed to resolve fallback STUN server %s", stun_server);
         return false;
@@ -3934,6 +3979,7 @@ bool TailscaleComponent::perform_stun_query_() {
       timeout.tv_sec = 2;
       timeout.tv_usec = 0;
       ret = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+      App.feed_wdt();  // Feed watchdog after fallback select()
 
       if (ret <= 0) {
         ESP_LOGW(TAG, "Fallback STUN query timeout");
@@ -4152,6 +4198,7 @@ bool TailscaleComponent::check_natpmp_response_() {
 // Send periodic keepalive map request with updated endpoints
 bool TailscaleComponent::send_map_keepalive_() {
   ESP_LOGD(TAG, "→ Sending endpoint update on separate stream...");
+  App.feed_wdt();  // Feed watchdog at start of keepalive
 
   // With persistent connection model, transport should ALWAYS be ready
   // If it's not, the watchdog will trigger reconnection

@@ -668,8 +668,6 @@ bool parse_map_static(const char *json, size_t len, StaticMapResponse &out,
       }
 
       // Apply filtering if enabled
-
-      // Apply filtering if enabled
       peers_processed++;
       if (allowed_peers && !allowed_peers->empty()) {
         bool is_allowed = false;

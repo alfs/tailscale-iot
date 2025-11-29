@@ -129,6 +129,14 @@ class WireGuardDeviceManager {
    */
   bool is_initialized() const { return this->wg_device_ != nullptr; }
 
+  /**
+   * @brief Check if handshake is established for a specific peer
+   */
+  bool is_handshake_established(const std::string& peer_tailscale_ip) const {
+    auto it = this->peers_.find(peer_tailscale_ip);
+    return it != this->peers_.end() && it->second.handshake_established;
+  }
+
  protected:
   // Internal peer tracking structure
   struct PeerContext {
