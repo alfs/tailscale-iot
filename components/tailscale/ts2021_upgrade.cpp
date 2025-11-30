@@ -19,6 +19,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cstring>
+#include <fcntl.h>
 
 namespace esphome {
 namespace tailscale {
@@ -341,13 +342,18 @@ bool Ts2021Upgrade::ensure_connection_() {
   }
 
   ESP_LOGD(TAG, "Connecting to: %s", uri.c_str());
+  ESP_LOGD(TAG, "Free heap before esp_tls_init: %u bytes", esp_get_free_heap_size());
 
   this->tls_ = esp_tls_init();
   if (this->tls_ == nullptr) {
     ESP_LOGE(TAG, "esp_tls_init failed");
     return false;
   }
+  
+  ESP_LOGD(TAG, "Free heap before esp_tls_conn_http_new_sync: %u bytes", esp_get_free_heap_size());
   int ret = esp_tls_conn_http_new_sync(uri.c_str(), &cfg, this->tls_);
+  ESP_LOGD(TAG, "Free heap after esp_tls_conn_http_new_sync: %u bytes", esp_get_free_heap_size());
+  
   if (ret != 1) {
     ESP_LOGE(TAG, "esp_tls_conn_http_new_sync failed for %s (ret=%d)", uri.c_str(), ret);
     esp_tls_conn_destroy(this->tls_);
@@ -370,6 +376,18 @@ bool Ts2021Upgrade::ensure_connection_() {
     }
   } else {
     ESP_LOGI(TAG, "TLS connection established");
+  }
+
+  // CRITICAL: Switch socket to non-blocking mode NOW that handshake is complete.
+  // We couldn't do this in cfg.non_block because esp_tls_conn_http_new_sync
+  // expects a blocking socket for the synchronous handshake.
+  int fd = -1;
+  if (esp_tls_get_conn_sockfd(this->tls_, &fd) == ESP_OK) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      ESP_LOGD(TAG, "Switched TLS socket %d to non-blocking mode", fd);
+    }
   }
 
   return true;
@@ -674,8 +692,8 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
     }
 
     if (ret == ESP_TLS_ERR_SSL_WANT_READ || ret == ESP_TLS_ERR_SSL_WANT_WRITE) {
-      if (deadline_ms >= 0 && deadline_expired()) {
-        ESP_LOGD(TAG, "TS2021 read timeout while waiting for data");
+      if (timeout_ms <= 5 || (deadline_ms >= 0 && deadline_expired())) {
+        // In event-driven mode (timeout <= 5ms), return immediately to yield
         return false;
       }
       // Reset watchdog to prevent timeout during long network waits
@@ -694,6 +712,17 @@ void Ts2021Upgrade::clear_receive_buffer() {
     ESP_LOGI(TAG, "Clearing receive buffer (%zu bytes of stale data)", this->recv_buffer_.size());
     this->recv_buffer_.clear();
   }
+}
+
+int Ts2021Upgrade::get_socket_fd() const {
+  if (this->tls_ == nullptr) {
+    return -1;
+  }
+  int fd = -1;
+  if (esp_tls_get_conn_sockfd(this->tls_, &fd) != ESP_OK) {
+    return -1;
+  }
+  return fd;
 }
 
 }  // namespace tailscale

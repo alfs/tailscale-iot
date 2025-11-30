@@ -216,11 +216,10 @@ void TailscaleComponent::loop() {
   // Update LED blink timing
   this->led_status_.update();
 
-  // CRITICAL: Check unified socket on EVERY loop iteration for low-latency packet reception
-  // This was moved here from handle_connected_state_() to restore frequent polling
-  // like the working commit (6dbe871) had with dedicated disco_socket checking.
-  // Without this, recvfrom() was only called once every ~5 seconds, missing all packets.
-  this->check_unified_socket_();
+  // CRITICAL: Check packet queue on EVERY loop iteration for low-latency packet reception
+  // The IO task pushes packets to this queue, and we process them here.
+  // This replaces the old polling mechanism.
+  this->process_packet_queue_();
 
   // CRITICAL: Process DERP client on EVERY loop iteration for low-latency peer packet reception
   // Previously called from handle_connected_state_() AFTER check_server_keepalive_() which
@@ -959,27 +958,65 @@ void TailscaleComponent::handle_connected_state_() {
   // 2. Next loop iteration → retry DERP → fails again
   // 3. Keepalives never execute because code stuck in DERP retry loop
 
-  // DERP connection control: Skip when prefer_direct_udp is enabled
-  // This avoids OOM when trying to run 2 TLS connections concurrently
-  bool skip_derp = this->prefer_direct_udp_;
+  // DERP connection control: Enable DERP if ANY peer needs it (no direct path)
+  // Skip DERP only if ALL peers have confirmed direct path
+  // This handles hairpin NAT situations where some peers on same NAT need DERP
+  bool all_direct_paths_confirmed = true;
+  bool any_direct_path_confirmed = false;
+  static uint32_t direct_mode_start_time = 0;
+  static const uint32_t DIRECT_MODE_FALLBACK_TIMEOUT = 30000;  // 30s to confirm direct path
+
+  if (this->prefer_direct_udp_) {
+    // Check direct path status for all peers
+    for (const auto& peer : this->peer_sessions_) {
+      if (peer.direct_path_confirmed) {
+        any_direct_path_confirmed = true;
+      } else {
+        all_direct_paths_confirmed = false;
+      }
+    }
+    // If no peers exist yet, consider all paths not confirmed
+    if (this->peer_sessions_.empty()) {
+      all_direct_paths_confirmed = false;
+    }
+
+    // Track when we started trying direct mode
+    if (direct_mode_start_time == 0) {
+      direct_mode_start_time = now;
+    }
+  }
+
+  // Skip DERP only if ALL peers have direct path confirmed OR we're within initial timeout
+  // This enables DERP for hairpin NAT scenarios where peers share same external IP
+  bool skip_derp = this->prefer_direct_udp_ &&
+                   (all_direct_paths_confirmed || (now - direct_mode_start_time < DIRECT_MODE_FALLBACK_TIMEOUT));
   static bool logged_skip_derp = false;  // Only log once
+  static bool logged_derp_fallback = false;
   static uint32_t derp_backoff_until = 0;  // Backoff timestamp for failed connections
   static int derp_consecutive_failures = 0;  // Track consecutive failures
 
   // Debug: Log DERP state check
   static uint32_t last_derp_check_log = 0;
   if (now - last_derp_check_log > 10000) {  // Every 10 seconds
-    ESP_LOGD(TAG, "🔍 DERP check: skip=%d (prefer_direct_udp=%d), client=%p, ready=%d, state=%d, backoff=%d",
+    uint32_t elapsed_since_start = direct_mode_start_time > 0 ? (now - direct_mode_start_time) : 0;
+    ESP_LOGD(TAG, "🔍 DERP check: skip=%d (all_confirmed=%d, any_confirmed=%d, elapsed=%ds/%ds)",
              skip_derp,
-             this->prefer_direct_udp_,
-             this->derp_client_.get(),
-             this->derp_client_ ? this->derp_client_->is_ready() : -1,
-             this->derp_client_ ? (int)this->derp_client_->get_state() : -1,
-             now < derp_backoff_until ? (int)(derp_backoff_until - now) / 1000 : 0);
+             all_direct_paths_confirmed,
+             any_direct_path_confirmed,
+             elapsed_since_start / 1000,
+             DIRECT_MODE_FALLBACK_TIMEOUT / 1000);
     last_derp_check_log = now;
   }
 
   if (!skip_derp) {
+    // Log when DERP fallback activates (either timeout or some peers missing direct path)
+    if (this->prefer_direct_udp_ && !all_direct_paths_confirmed && !logged_derp_fallback) {
+      ESP_LOGW(TAG, "⚠️ DERP FALLBACK: Not all peers have direct path (all=%d, any=%d), enabling DERP relay",
+               all_direct_paths_confirmed, any_direct_path_confirmed);
+      logged_derp_fallback = true;
+      logged_skip_derp = false;  // Reset for when we might switch back to direct
+    }
+
     // DERP connection with exponential backoff for failures
     if (this->derp_client_) {
       // Step 1: Initiate connection if disconnected and not in backoff
@@ -1001,8 +1038,14 @@ void TailscaleComponent::handle_connected_state_() {
       }
     }
   } else {
+    // skip_derp is true here, so DERP is being skipped
     if (!logged_skip_derp) {
-      ESP_LOGI(TAG, "DIRECT UDP MODE: Skipping DERP relay (prefer_direct_udp enabled) - using direct LAN connectivity");
+      if (all_direct_paths_confirmed) {
+        ESP_LOGI(TAG, "DIRECT UDP MODE: All peers have direct path, skipping DERP");
+      } else {
+        uint32_t remaining = DIRECT_MODE_FALLBACK_TIMEOUT - (now - direct_mode_start_time);
+        ESP_LOGI(TAG, "DIRECT UDP MODE: Waiting for direct paths (%ds until DERP fallback)", remaining / 1000);
+      }
       logged_skip_derp = true;
     }
   }
@@ -1081,9 +1124,10 @@ void TailscaleComponent::handle_connected_state_() {
 
   // Check for incoming ICMP messages (TTL-based NAT port discovery)
   // Only needed if NAT-PMP fails or times out
-  if (natpmp_requested && (natpmp_success || (millis() - natpmp_request_time >= 5000))) {
-    this->check_icmp_responses_();
-  }
+  // NOTE: Now handled by io_task and process_packet_queue_
+  // if (natpmp_requested && (natpmp_success || (millis() - natpmp_request_time >= 5000))) {
+  //   this->check_icmp_responses_();
+  // }
 
   // Log socket status periodically (every 30 seconds)
   // UDP statistics are now logged in check_unified_socket_()
@@ -2495,242 +2539,277 @@ void TailscaleComponent::setup_unified_socket_() {
              this->unified_socket_);
   }
 
-  // Start the dedicated UDP receiver task for energy efficiency
-  this->start_udp_rx_task_();
-}
+  // Initialize packet pool and queues for Zero-Copy IO
+  // Create queues first
+  this->free_buffer_queue_ = xQueueCreate(PACKET_POOL_SIZE, sizeof(PacketBuffer*));
+  this->ready_packet_queue_ = xQueueCreate(PACKET_POOL_SIZE, sizeof(PacketBuffer*));
 
-// Start the dedicated UDP receiver task that blocks on select()
-void TailscaleComponent::start_udp_rx_task_() {
-  if (this->udp_rx_task_ != nullptr) {
-    return;  // Already running
-  }
-
-  // Create the packet queue
-  this->udp_rx_queue_ = xQueueCreate(UDP_QUEUE_SIZE, sizeof(UdpPacket));
-  if (this->udp_rx_queue_ == nullptr) {
-    ESP_LOGE(TAG, "❌ Failed to create UDP RX queue");
+  if (this->free_buffer_queue_ == nullptr || this->ready_packet_queue_ == nullptr) {
+    ESP_LOGE(TAG, "❌ Failed to create packet queues");
     return;
   }
 
-  this->udp_task_running_ = true;
+  // Allocate buffers individually to avoid large contiguous heap requirements
+  ESP_LOGD(TAG, "Allocating %d packet buffers (%d bytes each)...", PACKET_POOL_SIZE, sizeof(PacketBuffer));
+  for (size_t i = 0; i < PACKET_POOL_SIZE; i++) {
+    // Dynamic allocation of small chunks avoids heap fragmentation issues
+    this->packet_pool_[i] = new PacketBuffer();
+    
+    // Verify allocation
+    if (this->packet_pool_[i] == nullptr) {
+      ESP_LOGE(TAG, "❌ OOM: Failed to allocate packet buffer %d", i);
+      // Continue with whatever we managed to allocate (robustness)
+      continue;
+    }
 
-  // Create the receiver task with 4KB stack (enough for select + packet handling)
+    PacketBuffer* buf = this->packet_pool_[i];
+    if (xQueueSend(this->free_buffer_queue_, &buf, 0) != pdTRUE) {
+      ESP_LOGE(TAG, "❌ Failed to populate free buffer queue");
+    }
+  }
+
+  // Start the generic IO task
+  this->start_io_task_();
+}
+
+// Start the generic IO task that blocks on select()
+void TailscaleComponent::start_io_task_() {
+  if (this->io_task_handle_ != nullptr) {
+    return;  // Already running
+  }
+
+  this->io_task_running_ = true;
+
+  // Create the IO task with 4KB stack
   BaseType_t result = xTaskCreatePinnedToCore(
-      udp_rx_task_func_,        // Task function
-      "udp_rx",                 // Task name
+      io_task_func_,            // Task function
+      "ts_io",                  // Task name
       4096,                     // Stack size (bytes)
       this,                     // Parameter (pointer to this)
       5,                        // Priority (above idle, below critical)
-      &this->udp_rx_task_,      // Task handle
+      &this->io_task_handle_,   // Task handle
       0                         // Core 0 (same as main loop for cache efficiency)
   );
 
   if (result != pdPASS) {
-    ESP_LOGE(TAG, "❌ Failed to create UDP RX task");
-    vQueueDelete(this->udp_rx_queue_);
-    this->udp_rx_queue_ = nullptr;
-    this->udp_task_running_ = false;
+    ESP_LOGE(TAG, "❌ Failed to create IO task");
+    this->io_task_running_ = false;
     return;
   }
 
-  ESP_LOGI(TAG, "✅ Started UDP RX task (energy-efficient select() mode)");
+  ESP_LOGI(TAG, "✅ Started IO task (Zero-Copy Select Mode)");
 }
 
-// Stop the dedicated UDP receiver task
-void TailscaleComponent::stop_udp_rx_task_() {
-  if (this->udp_rx_task_ == nullptr) {
+// Stop the IO task
+void TailscaleComponent::stop_io_task_() {
+  if (this->io_task_handle_ == nullptr) {
     return;
   }
 
   // Signal task to stop
-  this->udp_task_running_ = false;
+  this->io_task_running_ = false;
 
   // Wait for task to finish (up to 1 second)
-  for (int i = 0; i < 100 && eTaskGetState(this->udp_rx_task_) != eDeleted; i++) {
+  for (int i = 0; i < 100 && eTaskGetState(this->io_task_handle_) != eDeleted; i++) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  // Clean up
-  if (this->udp_rx_queue_ != nullptr) {
-    vQueueDelete(this->udp_rx_queue_);
-    this->udp_rx_queue_ = nullptr;
+  // Clean up queues
+  if (this->free_buffer_queue_ != nullptr) {
+    vQueueDelete(this->free_buffer_queue_);
+    this->free_buffer_queue_ = nullptr;
   }
-  this->udp_rx_task_ = nullptr;
+  if (this->ready_packet_queue_ != nullptr) {
+    vQueueDelete(this->ready_packet_queue_);
+    this->ready_packet_queue_ = nullptr;
+  }
+  this->io_task_handle_ = nullptr;
 
-  ESP_LOGI(TAG, "✓ Stopped UDP RX task");
+  ESP_LOGI(TAG, "✓ Stopped IO task");
 }
 
 // Static task function that blocks on select() for energy efficiency
-void TailscaleComponent::udp_rx_task_func_(void* arg) {
+void TailscaleComponent::io_task_func_(void* arg) {
   TailscaleComponent* self = static_cast<TailscaleComponent*>(arg);
 
-  ESP_LOGI(TAG, "UDP RX task started (blocking select mode)");
+  ESP_LOGI(TAG, "IO Task started (monitoring UDP/ICMP)");
 
-  while (self->udp_task_running_) {
-    // Wait for socket to be valid
-    if (self->unified_socket_ < 0) {
+  while (self->io_task_running_) {
+    // Build readfds for select
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    int max_fd = -1;
+
+    // Monitor Unified UDP Socket (WireGuard, Disco, STUN)
+    if (self->unified_socket_ >= 0) {
+      FD_SET(self->unified_socket_, &readfds);
+      max_fd = std::max(max_fd, self->unified_socket_);
+    }
+
+    // Monitor ICMP Socket (NAT Discovery)
+    if (self->icmp_socket_ >= 0) {
+      FD_SET(self->icmp_socket_, &readfds);
+      max_fd = std::max(max_fd, self->icmp_socket_);
+    }
+
+    // Monitor TCP Control Plane Socket (HTTP/2)
+    int tcp_fd = -1;
+    if (self->upgrade_channel_ && self->upgrade_channel_->is_connected()) {
+      tcp_fd = self->upgrade_channel_->get_socket_fd();
+      // Only monitor if allowed (prevent task spinning on unread data)
+      if (tcp_fd >= 0 && self->monitor_tcp_) {
+        FD_SET(tcp_fd, &readfds);
+        max_fd = std::max(max_fd, tcp_fd);
+      }
+    }
+
+    // If no sockets active, wait and retry
+    if (max_fd < 0) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
 
-    // Use select() to block until data arrives (with 100ms timeout for task control)
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(self->unified_socket_, &readfds);
-
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 100000;  // 100ms timeout - allows task to check running flag
+    tv.tv_usec = 100000;  // 100ms timeout
 
-    int result = select(self->unified_socket_ + 1, &readfds, nullptr, nullptr, &tv);
+    int result = select(max_fd + 1, &readfds, nullptr, nullptr, &tv);
 
     if (result < 0) {
       if (errno != EINTR) {
-        ESP_LOGW(TAG, "UDP select error: %d", errno);
+        ESP_LOGW(TAG, "Select error: %d", errno);
         vTaskDelay(pdMS_TO_TICKS(100));
       }
       continue;
     }
 
     if (result == 0) {
-      // Timeout - no data, loop will check running flag
-      continue;
+      continue; // Timeout
     }
 
-    // Data available - read all packets and queue them
-    while (self->udp_task_running_) {
-      UdpPacket pkt;
-      socklen_t addr_len = sizeof(pkt.src_addr);
+    // Check TCP Control Plane Socket
+    if (tcp_fd >= 0 && FD_ISSET(tcp_fd, &readfds)) {
+      // Signal main loop that data is available
+      self->control_plane_data_available_ = true;
+      // Stop monitoring TCP until main loop reads the data
+      // This prevents this high-priority task from spinning and starving the main loop
+      self->monitor_tcp_ = false;
+    }
 
-      ssize_t received = recvfrom(self->unified_socket_, pkt.data, sizeof(pkt.data),
-                                   MSG_DONTWAIT, (struct sockaddr*)&pkt.src_addr, &addr_len);
+    // Check UDP/ICMP sockets for data
+    int sockets_to_check[] = {self->unified_socket_, self->icmp_socket_};
+    
+    for (int sock : sockets_to_check) {
+      if (sock >= 0 && FD_ISSET(sock, &readfds)) {
+        // Drain all packets from this socket
+        while (self->io_task_running_) {
+          // Get a free buffer from the pool (Zero-Copy)
+          PacketBuffer* buf = nullptr;
+          if (xQueueReceive(self->free_buffer_queue_, &buf, 0) != pdTRUE) {
+            static uint32_t last_drop_log = 0;
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_drop_log > 5000) {
+              ESP_LOGW(TAG, "⚠️ Packet pool exhausted - dropping packet");
+              last_drop_log = now;
+            }
+            
+            // We must still read the packet to clear the socket buffer, 
+            // otherwise select() will immediately return again (busy loop).
+            // Read into a dummy stack buffer.
+            uint8_t dummy[64]; 
+            recvfrom(sock, dummy, sizeof(dummy), MSG_DONTWAIT, nullptr, nullptr);
+            break; // Stop draining to let main loop process existing packets
+          }
 
-      if (received <= 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          break;  // No more data available
-        }
-        break;  // Error
-      }
+          socklen_t addr_len = sizeof(buf->src_addr);
+          ssize_t received = recvfrom(sock, buf->data, MAX_PACKET_SIZE,
+                                       MSG_DONTWAIT, (struct sockaddr*)&buf->src_addr, &addr_len);
 
-      pkt.len = received;
+          if (received <= 0) {
+            // Return buffer to pool
+            xQueueSend(self->free_buffer_queue_, &buf, 0);
+            
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              break; // No more data
+            }
+            break; // Error
+          }
 
-      // Try to queue the packet (don't block if queue is full - drop packet)
-      if (xQueueSend(self->udp_rx_queue_, &pkt, 0) != pdTRUE) {
-        static uint32_t last_drop_log = 0;
-        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (now - last_drop_log > 5000) {
-          ESP_LOGW(TAG, "UDP RX queue full - packet dropped");
-          last_drop_log = now;
+          // Fill metadata
+          buf->len = received;
+          buf->source_socket = sock;
+
+          // Send pointer to Ready Queue (Zero-Copy)
+          if (xQueueSend(self->ready_packet_queue_, &buf, 0) != pdTRUE) {
+             // Should not happen if queues are sized same as pool, but just in case
+             xQueueSend(self->free_buffer_queue_, &buf, 0);
+          }
         }
       }
     }
   }
 
-  ESP_LOGI(TAG, "UDP RX task exiting");
+  ESP_LOGI(TAG, "IO Task exiting");
   vTaskDelete(nullptr);
 }
 
-// Check unified socket for incoming packets (called from loop() on every iteration)
-// This was moved out of handle_connected_state_() to enable frequent polling
-void TailscaleComponent::check_unified_socket_() {
-  // Packet counters for statistics (shared across receive and stats logging)
-  static uint32_t total_udp_rx = 0;
-  static uint32_t wireguard_rx = 0;
-  static uint32_t disco_rx = 0;
-  static uint32_t stun_rx = 0;
-  static uint32_t other_rx = 0;
-  static uint32_t last_rx_time = 0;
+// Process packets from the Zero-Copy queue (called from loop())
+void TailscaleComponent::process_packet_queue_() {
+  if (this->ready_packet_queue_ == nullptr) return;
 
-  // Log UDP statistics periodically (every 30 seconds)
-  static uint32_t last_stats_log = 0;
-  uint32_t now = millis();
-  if (now - last_stats_log >= 30000) {
-    ESP_LOGI(TAG, "📊 UDP RX Statistics: Total=%u, WireGuard=%u, Disco=%u, STUN=%u, Other=%u",
-             total_udp_rx, wireguard_rx, disco_rx, stun_rx, other_rx);
-    if (last_rx_time > 0) {
-      uint32_t time_since_last_rx = now - last_rx_time;
-      ESP_LOGI(TAG, "  UDP Last RX: %u seconds ago", time_since_last_rx / 1000);
-    } else {
-      ESP_LOGI(TAG, "  UDP Last RX: NEVER");
-    }
-    last_stats_log = now;
-  }
+  PacketBuffer* buf = nullptr;
+  const int MAX_PACKETS_PER_LOOP = 20; // Limit processing time
+  int processed_count = 0;
 
-  // Validate unified socket before use (prevents EBADF errors after state transitions)
-  if (this->unified_socket_ >= 0) {
-    // Check if socket fd is actually valid in the kernel
-    if (fcntl(this->unified_socket_, F_GETFD) == -1 && errno == EBADF) {
-      ESP_LOGE(TAG, "❌ Socket fd %d is invalid (EBADF) - recreating unified socket", this->unified_socket_);
-      // Close stale fd and recreate socket
-      close(this->unified_socket_);
-      this->unified_socket_ = -1;
-      this->setup_unified_socket_();
+  while (processed_count < MAX_PACKETS_PER_LOOP && 
+         xQueueReceive(this->ready_packet_queue_, &buf, 0) == pdTRUE) {
+    
+    processed_count++;
 
-      if (this->unified_socket_ < 0) {
-        ESP_LOGE(TAG, "❌ Failed to recreate unified socket");
-      } else {
-        ESP_LOGI(TAG, "✅ Unified socket recreated successfully (fd=%d)", this->unified_socket_);
-      }
-    }
-  }
-
-  // Process packets from the queue (filled by dedicated UDP RX task)
-  // This replaces busy-polling with energy-efficient event-driven reception
-  if (this->udp_rx_queue_ == nullptr) {
-    return;  // Queue not initialized yet
-  }
-
-  // Process all available packets from queue (non-blocking)
-  const int MAX_PACKETS_PER_CALL = 100;
-  int packets_processed = 0;
-  UdpPacket pkt;
-
-  while (packets_processed < MAX_PACKETS_PER_CALL) {
-    // Try to receive from queue without blocking
-    if (xQueueReceive(this->udp_rx_queue_, &pkt, 0) != pdTRUE) {
-      break;  // Queue empty
-    }
-
-    packets_processed++;
-    total_udp_rx++;
-    last_rx_time = millis();
-
-    // Log every received UDP datagram for debugging
-    char src_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &pkt.src_addr.sin_addr, src_ip, sizeof(src_ip));
-    uint16_t src_port = ntohs(pkt.src_addr.sin_port);
-
-    // Identify packet type for counters
-    const char* pkt_type = "UNKNOWN";
-    if (pkt.len >= 1) {
-      if (pkt.data[0] >= 1 && pkt.data[0] <= 4) {
-        pkt_type = "WireGuard";
-        wireguard_rx++;
-      } else if (pkt.len >= 6 && pkt.data[0] == 'T' && pkt.data[1] == 'S' &&
-                 pkt.data[2] == 0xf0 && pkt.data[3] == 0x9f && pkt.data[4] == 0x92 && pkt.data[5] == 0xac) {
-        pkt_type = "Disco";
-        disco_rx++;
-      } else if (pkt.len >= 20 && (pkt.data[0] & 0xC0) == 0x00) {
-        pkt_type = "STUN";
-        stun_rx++;
-      } else {
-        other_rx++;
+    if (buf->source_socket == this->unified_socket_) {
+      // Handle UDP (WireGuard/Disco/STUN)
+      // Stats logging is handled by unified_socket_ logic but we can update counters here if needed
+      // For now, just route it
+      this->route_incoming_packet_(buf->data, buf->len, &buf->src_addr);
+      
+    } else if (buf->source_socket == this->icmp_socket_) {
+      // Handle ICMP (NAT Discovery)
+      // We need to manually inject this into the ICMP handler
+      // Since check_icmp_responses_() calls recvfrom(), we need a new handler that takes data
+      // For now, I will call a new helper: handle_raw_icmp_packet_
+      // Or just parse it directly here since it's short
+      
+      // Log ICMP packet
+      char src_ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &buf->src_addr.sin_addr, src_ip, sizeof(src_ip));
+      ESP_LOGD(TAG, "📨 ICMP RX: %zu bytes from %s", buf->len, src_ip);
+      
+      // Reuse the parsing logic
+      uint16_t nat_port = 0;
+      uint32_t dummy_ip = 0;
+      
+      // Skip IP header for RAW socket (assuming standard IPv4 header length logic)
+      // Similar logic to check_icmp_responses_
+      if (buf->len >= 20) {
+        uint8_t ip_ihl = buf->data[0] & 0x0F;
+        size_t ip_len = ip_ihl * 4;
+        if (buf->len >= ip_len + 8) {
+          if (this->parse_icmp_time_exceeded_(buf->data + ip_len, buf->len - ip_len, &nat_port, &dummy_ip)) {
+             if (this->nat_discovery_state_.active && this->nat_discovery_state_.current_ttl == 1) {
+                ESP_LOGI(TAG, "✅ Zero-Copy: Got NAT port %u", nat_port);
+                this->nat_discovery_state_.discovered_port = nat_port;
+                this->nat_discovery_state_.active = false;
+                this->send_disco_ping_(this->nat_discovery_state_.peer_ip,
+                                       this->nat_discovery_state_.peer_port,
+                                       this->nat_discovery_state_.peer_disco_key);
+             }
+          }
+        }
       }
     }
 
-    ESP_LOGD(TAG, "📨 UDP RX #%u: %zu bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
-             total_udp_rx, pkt.len, src_ip, src_port, pkt_type,
-             pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3],
-             pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]);
-
-    // Route packet to appropriate handler based on magic bytes
-    this->route_incoming_packet_(pkt.data, pkt.len, &pkt.src_addr);
-  }
-
-  // Log if we hit the packet processing limit (might indicate backlog)
-  if (packets_processed >= MAX_PACKETS_PER_CALL) {
-    ESP_LOGW(TAG, "⚠️ Hit max packet processing limit (%d packets) - queue may have backlog",
-             MAX_PACKETS_PER_CALL);
+    // Return buffer to pool
+    xQueueSend(this->free_buffer_queue_, &buf, 0);
   }
 }
 
@@ -2764,150 +2843,8 @@ void TailscaleComponent::setup_icmp_socket_() {
 }
 
 void TailscaleComponent::check_icmp_responses_() {
-  if (this->icmp_socket_ < 0) {
-    return;  // ICMP socket not available
-  }
-
-  uint8_t buffer[576];  // Min MTU for IPv4 is 576 bytes
-  struct sockaddr_in sender_addr{};
-  socklen_t sender_len = sizeof(sender_addr);
-
-  ssize_t received = recvfrom(this->icmp_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                               (struct sockaddr *)&sender_addr, &sender_len);
-
-  if (received > 0) {
-    char src_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
-
-    // RAW ICMP socket receives full IP packet, skip IP header
-    // IP header: version(4 bits) + IHL(4 bits) in first byte
-    // IHL is in 32-bit words, so header length = IHL * 4
-    if (received < 20) {
-      ESP_LOGD(TAG, "ICMP packet too short: %zd bytes", received);
-      return;
-    }
-
-    uint8_t ip_ihl = buffer[0] & 0x0F;
-    size_t ip_header_len = ip_ihl * 4;
-
-    if (received < ip_header_len + 8) {  // Need IP header + min ICMP (8 bytes)
-      ESP_LOGD(TAG, "Packet too short for ICMP: %zd bytes (IP header: %zu)", received, ip_header_len);
-      return;
-    }
-
-    // Skip IP header to get to ICMP message
-    const uint8_t* icmp_msg = buffer + ip_header_len;
-    size_t icmp_len = received - ip_header_len;
-
-    // ICMP packet statistics (shared with stats logging)
-    static uint32_t icmp_total_rx = 0;
-    static uint32_t icmp_echo_request = 0;  // Type 8 (ping from others)
-    static uint32_t icmp_echo_reply = 0;    // Type 0 (ping responses)
-    static uint32_t icmp_time_exceeded = 0; // Type 11 (TTL discovery)
-    static uint32_t icmp_other = 0;
-    static uint32_t last_icmp_rx_time = 0;
-
-    icmp_total_rx++;
-    last_icmp_rx_time = millis();
-
-    uint8_t icmp_type = icmp_msg[0];
-    uint8_t icmp_code = icmp_msg[1];
-    const char* icmp_type_name = "UNKNOWN";
-
-    // Classify ICMP type
-    if (icmp_type == 0) {
-      icmp_type_name = "Echo Reply";
-      icmp_echo_reply++;
-    } else if (icmp_type == 8) {
-      icmp_type_name = "Echo Request (PING)";
-      icmp_echo_request++;
-    } else if (icmp_type == 11) {
-      icmp_type_name = "Time Exceeded";
-      icmp_time_exceeded++;
-    } else {
-      icmp_other++;
-    }
-
-    // LOG ALL ICMP PACKETS AT INFO LEVEL FOR VISIBILITY
-    ESP_LOGI(TAG, "📨 ICMP RX #%u: %zd bytes from %s, type=%u (%s), code=%u",
-             icmp_total_rx, received, src_ip, icmp_type, icmp_type_name, icmp_code);
-
-    // Periodic ICMP statistics summary (every 30 seconds)
-    static uint32_t last_icmp_stats_log = 0;
-    uint32_t now = millis();
-    if (now - last_icmp_stats_log >= 30000) {
-      ESP_LOGI(TAG, "📊 ICMP RX Statistics: Total=%u, Echo-Req=%u, Echo-Reply=%u, Time-Exceeded=%u, Other=%u",
-               icmp_total_rx, icmp_echo_request, icmp_echo_reply, icmp_time_exceeded, icmp_other);
-      if (last_icmp_rx_time > 0) {
-        ESP_LOGI(TAG, "  ICMP Last RX: %u seconds ago", (now - last_icmp_rx_time) / 1000);
-      }
-      last_icmp_stats_log = now;
-    }
-
-    // Parse ICMP Time Exceeded messages (type=11)
-    uint16_t nat_port = 0;
-    uint32_t dummy_ip = 0;
-    if (parse_icmp_time_exceeded_(icmp_msg, icmp_len, &nat_port, &dummy_ip)) {
-      // Check if this is part of an active NAT discovery process
-      if (!this->nat_discovery_state_.active) {
-        ESP_LOGD(TAG, "Received ICMP Time Exceeded but no active NAT discovery");
-        return;
-      }
-
-      // Get STUN-discovered external IP for comparison
-      std::string stun_ip_str = this->discovered_endpoint_;
-      size_t colon_pos = stun_ip_str.find(':');
-      if (colon_pos != std::string::npos) {
-        stun_ip_str = stun_ip_str.substr(0, colon_pos);  // Strip port
-      }
-
-      // The router IP is the ICMP response source (already in src_ip from recvfrom)
-      ESP_LOGI(TAG, "🔍 TTL=%u probe: ICMP from %s, NAT port=%u",
-               this->nat_discovery_state_.current_ttl, src_ip, nat_port);
-
-      // For TTL=1, we get ICMP from the NAT router's INTERNAL interface
-      // But STUN gives us the EXTERNAL IP. They won't match!
-      // Strategy: Use TTL=1 port + STUN external IP
-      if (this->nat_discovery_state_.current_ttl == 1) {
-        ESP_LOGI(TAG, "✅ Got NAT port from first hop (NAT router internal: %s)", src_ip);
-        ESP_LOGI(TAG, "  NAT-assigned port: %u", nat_port);
-
-        // Only create TTL-discovered endpoint if we have a valid STUN IP
-        if (!stun_ip_str.empty()) {
-          ESP_LOGI(TAG, "  Complete endpoint: %s:%u (STUN IP + TTL=1 port)",
-                   stun_ip_str.c_str(), nat_port);
-
-          // Store the TTL-discovered endpoint for use in keepalive advertisements
-          char endpoint_str[64];
-          snprintf(endpoint_str, sizeof(endpoint_str), "%s:%u", stun_ip_str.c_str(), nat_port);
-          this->ttl_discovered_endpoint_ = std::string(endpoint_str);
-          ESP_LOGI(TAG, "✅ Stored TTL-discovered endpoint: %s", this->ttl_discovered_endpoint_.c_str());
-        } else {
-          ESP_LOGW(TAG, "⚠️ Cannot create TTL endpoint - STUN IP not yet discovered");
-        }
-
-        // Discovery complete! Send disco ping with discovered port knowledge
-        this->nat_discovery_state_.discovered_port = nat_port;
-        this->nat_discovery_state_.active = false;
-
-        // ALWAYS send disco ping after NAT discovery, even if STUN failed
-        // The disco ping is critical for NAT traversal - STUN IP is only for endpoint advertisement
-        ESP_LOGI(TAG, "→ Sending disco PING to %s:%u (NAT port: %u, STUN IP: %s)",
-                 this->nat_discovery_state_.peer_ip.c_str(),
-                 this->nat_discovery_state_.peer_port,
-                 nat_port,
-                 stun_ip_str.empty() ? "unknown" : stun_ip_str.c_str());
-        this->send_disco_ping_(this->nat_discovery_state_.peer_ip,
-                               this->nat_discovery_state_.peer_port,
-                               this->nat_discovery_state_.peer_disco_key);
-      } else {
-        ESP_LOGD(TAG, "  Skipping TTL=%u (using TTL=1 for NAT port)", this->nat_discovery_state_.current_ttl);
-        this->nat_discovery_state_.active = false;  // Stop after TTL=1
-      }
-    }
-  } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-    ESP_LOGD(TAG, "ICMP socket recvfrom error: errno %d (%s)", errno, strerror(errno));
-  }
+  // DEPRECATED: Handled by io_task_func_ and process_packet_queue_
+  // Kept for ABI compatibility if needed, but does nothing.
 }
 
 bool TailscaleComponent::parse_icmp_time_exceeded_(const uint8_t* icmp_packet, size_t len,
@@ -4008,6 +3945,16 @@ bool TailscaleComponent::perform_stun_query_() {
     return false;
   }
 
+  // CRITICAL: Pause IO task during STUN query to avoid race condition
+  // Both STUN and IO task do select()/recvfrom() on the same socket (Unified UDP)
+  // Pausing prevents the IO task from consuming the STUN response before this function can.
+  bool task_was_running = this->io_task_running_;
+  if (task_was_running) {
+    ESP_LOGD(TAG, "Pausing IO task for STUN query");
+    this->stop_io_task_();
+    vTaskDelay(pdMS_TO_TICKS(50));  // Give task time to stop
+  }
+
   int sock = this->unified_socket_;  // Use existing unified socket
 
   // Socket is already non-blocking from setup_unified_socket_()
@@ -4097,10 +4044,54 @@ bool TailscaleComponent::perform_stun_query_() {
   App.feed_wdt();  // Feed watchdog after blocking select()
 
   if (ret <= 0) {
-    ESP_LOGW(TAG, "STUN query timeout - no response from server");
-    // Don't close sock - it's the persistent unified socket
-    // Not a fatal error - we can still use DERP
-    return false;
+    // DERP STUN timed out - try Google STUN as fallback
+    if (this->static_map_.derp_host[0] != '\0' && strcmp(stun_server, this->static_map_.derp_host) == 0) {
+      ESP_LOGW(TAG, "DERP STUN timeout, trying Google STUN fallback...");
+
+      // Retry with Google STUN
+      stun_server = "stun.l.google.com";
+      stun_port = 19302;
+      stun_addr.sin_port = htons(stun_port);
+
+      App.feed_wdt();
+      server = gethostbyname(stun_server);
+      App.feed_wdt();
+      if (server == nullptr) {
+        ESP_LOGE(TAG, "Failed to resolve Google STUN server");
+        if (task_was_running) this->start_io_task_();
+        return false;
+      }
+      memcpy(&stun_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+      // Build new STUN request with new transaction ID
+      for (int i = 8; i < 20; i++) stun_request[i] = esp_random() & 0xFF;
+
+      ESP_LOGI(TAG, "Fallback STUN request to %s:%d", stun_server, stun_port);
+      if (sendto(sock, stun_request, sizeof(stun_request), 0,
+                 (struct sockaddr *)&stun_addr, sizeof(stun_addr)) < 0) {
+        ESP_LOGE(TAG, "Failed to send fallback STUN request");
+        if (task_was_running) this->start_io_task_();
+        return false;
+      }
+
+      // Wait for fallback response
+      FD_ZERO(&readfds);
+      FD_SET(sock, &readfds);
+      timeout = {2, 0};
+      ret = select(sock + 1, &readfds, nullptr, nullptr, &timeout);
+      App.feed_wdt();
+
+      if (ret <= 0) {
+        ESP_LOGW(TAG, "Google STUN also timed out - STUN unavailable");
+        if (task_was_running) this->start_io_task_();
+        return false;
+      }
+      // Fall through to process the Google STUN response below
+    } else {
+      ESP_LOGW(TAG, "STUN query timeout - no response from server");
+      if (task_was_running) this->start_io_task_();
+      return false;
+    }
   }
 
   // Read STUN response
@@ -4110,12 +4101,11 @@ bool TailscaleComponent::perform_stun_query_() {
 
   ssize_t received = recvfrom(sock, response, sizeof(response), 0,
                               (struct sockaddr *)&response_addr, &addr_len);
-  if (received < 20) {
-    ESP_LOGE(TAG, "Invalid STUN response (too short)");
-    close(sock);
-    return false;
-  }
-
+      if (received < 20) {
+        ESP_LOGE(TAG, "Invalid STUN response (too short)");
+        if (task_was_running) this->start_io_task_(); // Restart task even on error
+        return false;
+      }
   ESP_LOGI(TAG, "✓ STUN response received (%d bytes from %s:%d):",
            (int)received,
            inet_ntoa(response_addr.sin_addr),
@@ -4161,6 +4151,7 @@ bool TailscaleComponent::perform_stun_query_() {
       App.feed_wdt();  // Feed watchdog after fallback DNS resolution
       if (server == nullptr) {
         ESP_LOGE(TAG, "Failed to resolve fallback STUN server %s", stun_server);
+        if (task_was_running) this->start_io_task_();
         return false;
       }
 
@@ -4187,6 +4178,7 @@ bool TailscaleComponent::perform_stun_query_() {
                     (struct sockaddr *)&stun_addr, sizeof(stun_addr));
       if (sent < 0) {
         ESP_LOGE(TAG, "Failed to send fallback STUN request: %d", errno);
+        if (task_was_running) this->start_io_task_();
         return false;
       }
 
@@ -4200,6 +4192,7 @@ bool TailscaleComponent::perform_stun_query_() {
 
       if (ret <= 0) {
         ESP_LOGW(TAG, "Fallback STUN query timeout");
+        if (task_was_running) this->start_io_task_();
         return false;
       }
 
@@ -4208,6 +4201,7 @@ bool TailscaleComponent::perform_stun_query_() {
                          (struct sockaddr *)&response_addr, &addr_len);
       if (received < 20) {
         ESP_LOGE(TAG, "Invalid fallback STUN response (too short)");
+        if (task_was_running) this->start_io_task_();
         return false;
       }
 
@@ -4284,10 +4278,26 @@ bool TailscaleComponent::perform_stun_query_() {
 
     // Move to next attribute (with padding to 4-byte boundary)
     offset += 4 + ((attr_len + 3) & ~3);
-  }
+  } // End of while loop for attributes
 
   // Don't close sock - it's the persistent unified socket that stays open
-  return found_endpoint;
+
+  // If no endpoint was found in STUN response, return false
+  if (!found_endpoint) {
+    ESP_LOGW(TAG, "⚠️ No endpoint found in STUN response");
+    // Restart IO task if it was running before STUN query
+    if (task_was_running) {
+      this->start_io_task_();
+    }
+    return false;
+  }
+
+  // Restart IO task if it was running before STUN query
+  if (task_was_running) {
+    this->start_io_task_();
+  }
+
+  return true;
 }
 
 // Request port mapping via NAT-PMP to automatically configure router
@@ -4561,7 +4571,7 @@ bool TailscaleComponent::send_map_keepalive_() {
   // }
 
   return true;
-}
+} // Correct closing brace for send_map_keepalive_
 
 // Check for incoming server keepalive messages on persistent streaming connection
 // Server sends {"KeepAlive":true} every ~50 seconds to keep connection alive
@@ -4636,17 +4646,17 @@ bool TailscaleComponent::check_server_keepalive_() {
     }
   }
 
-  // Try to read next message from persistent stream with 1000ms timeout
-  //
-  // MEMORY MANAGEMENT CRITICAL:
-  // The 1000ms timeout serves as a natural memory guard preventing OOM when DERP connects.
-  // With 0ms timeout (non-blocking), control plane and DERP TLS connections overlap in memory.
-  // ESP32-C3 has only 320KB RAM: Control plane TLS (~70KB) + DERP TLS (~70KB) = ~140KB = OOM
-  // The 1-second blocking window allows mbedTLS to free buffers before DERP connects.
-  //
-  // Reduced timeout to 5ms for low-latency packet processing (was 1000ms → 50ms → 5ms)
-  // This allows UDP packets to be processed more frequently
-  // Note: Memory warning in comments above - 0ms causes OOM during TLS overlap
+  // Event-Driven Read: Only attempt to read if IO task signaled data
+  if (!this->control_plane_data_available_) {
+    return false;
+  }
+  
+  // Clear flag and read
+  this->control_plane_data_available_ = false;
+
+  // Try to read next message from persistent stream with 5ms timeout
+  // Note: Even with event flag, we keep a small timeout to avoid blocking main loop
+  // if the socket buffer doesn't contain a full frame yet.
   const char *response_ptr = nullptr;
   size_t response_size = 0;
 
@@ -4669,12 +4679,12 @@ bool TailscaleComponent::check_server_keepalive_() {
         // TODO: Parse and process server updates (peer changes, network map updates, etc.)
       }
     }
-
-    return true;
   }
+  
+  // Re-enable TCP monitoring in IO task now that we've drained the buffer
+  this->monitor_tcp_ = true;
 
-  // No message available (timeout) - this is normal, server sends keepalives every ~50s
-  return false;
+  return true;
 }
 
 // DEPRECATED: This function sends a minimal endpoint update which doesn't work properly

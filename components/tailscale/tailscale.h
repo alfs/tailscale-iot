@@ -246,25 +246,41 @@ class TailscaleComponent : public PollingComponent {
   int unified_socket_{-1};                    // Single UDP socket for all traffic
   uint16_t unified_port_{41642};              // Port for unified socket (TESTING: changed from 41641 to diagnose WireGuard conflict)
   void setup_unified_socket_();               // Initialize unified socket
-  void check_unified_socket_();               // Process packets from queue (called from loop())
+  void process_packet_queue_();               // Process packets from queue (called from loop())
   void route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);  // Demultiplex packets
 
-  // Dedicated UDP receiver task for energy efficiency
-  // Uses select() to block until data arrives instead of busy-polling
-  // Memory: 4 * ~1520 bytes = ~6KB (reduced from 16 * 2060 = 33KB)
-  static constexpr size_t UDP_PACKET_MAX_SIZE = 1500;  // WireGuard MTU
-  static constexpr int UDP_QUEUE_SIZE = 4;  // Queue depth for packets
-  struct UdpPacket {
-    uint8_t data[UDP_PACKET_MAX_SIZE];
+  // Zero-Copy Packet IO Task
+  // Uses a static buffer pool and queues of pointers to avoid memory fragmentation and copying.
+  // Handles UDP (WireGuard/Disco/STUN) and ICMP (NAT Discovery) via select().
+  
+  // Optimization: Allocate 1536 bytes (1.5KB) for data to align with allocator blocks.
+  // IP MTU is 1500, so this provides safety margin and alignment.
+  static constexpr size_t MAX_PACKET_SIZE = 1536; 
+  static constexpr size_t PACKET_POOL_SIZE = 8;   // Number of static buffers
+  
+  struct PacketBuffer {
+    uint8_t data[MAX_PACKET_SIZE];
     size_t len;
     struct sockaddr_in src_addr;
+    int source_socket; // To identify origin (UDP vs ICMP vs TCP)
   };
-  TaskHandle_t udp_rx_task_{nullptr};         // FreeRTOS task handle
-  QueueHandle_t udp_rx_queue_{nullptr};       // Queue for received packets
-  volatile bool udp_task_running_{false};     // Flag to stop task
-  void start_udp_rx_task_();                  // Start the receiver task
-  void stop_udp_rx_task_();                   // Stop the receiver task
-  static void udp_rx_task_func_(void* arg);   // Static task function
+
+  // Array of pointers to buffers (allocated individually to reduce heap fragmentation)
+  // Allocating 8 x 1.6KB blocks is much safer than one contiguous 13KB block.
+  PacketBuffer* packet_pool_[PACKET_POOL_SIZE];
+  
+  TaskHandle_t io_task_handle_{nullptr};      // FreeRTOS task handle
+  QueueHandle_t free_buffer_queue_{nullptr};  // Queue of pointers to available buffers
+  QueueHandle_t ready_packet_queue_{nullptr}; // Queue of pointers to filled packets
+  
+  volatile bool io_task_running_{false};      // Flag to stop task
+  volatile bool control_plane_data_available_{false}; // Flag for TCP data availability
+  volatile bool monitor_tcp_{true};           // Control flag to pause/resume TCP monitoring
+  
+  void start_io_task_();                      // Start the IO task
+  void stop_io_task_();                       // Stop the IO task
+  static void io_task_func_(void* arg);       // Static task function
+  
   void handle_disco_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);    // Handle Disco protocol
   void handle_stun_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);     // Handle STUN responses
   void handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src); // Forward to WireGuard

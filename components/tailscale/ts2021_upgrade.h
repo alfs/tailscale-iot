@@ -26,6 +26,9 @@ class Ts2021Upgrade {
   // Clear receive buffer - use when resetting HTTP/2 session to avoid stale data
   void clear_receive_buffer();
 
+  // Get underlying TCP socket file descriptor for select()
+  int get_socket_fd() const;
+
   bool is_connected() const { return this->tls_ != nullptr; }
   bool http2_negotiated() const { return this->http2_negotiated_; }
   const std::string &authority() const { return this->authority_; }
