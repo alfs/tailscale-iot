@@ -17,6 +17,7 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -2487,12 +2488,146 @@ void TailscaleComponent::setup_unified_socket_() {
     uint16_t bound_port = ntohs(bound_addr.sin_port);
     char bound_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &bound_addr.sin_addr, bound_ip, sizeof(bound_ip));
-    ESP_LOGI(TAG, "✅ Unified UDP socket bound to %s:%u (fd=%d, non-blocking=YES)",
+    ESP_LOGI(TAG, "✅ Unified UDP socket bound to %s:%u (fd=%d)",
              bound_ip, bound_port, this->unified_socket_);
   } else {
     ESP_LOGW(TAG, "✓ Unified UDP socket ready (couldn't determine port, fd=%d)",
              this->unified_socket_);
   }
+
+  // Start the dedicated UDP receiver task for energy efficiency
+  this->start_udp_rx_task_();
+}
+
+// Start the dedicated UDP receiver task that blocks on select()
+void TailscaleComponent::start_udp_rx_task_() {
+  if (this->udp_rx_task_ != nullptr) {
+    return;  // Already running
+  }
+
+  // Create the packet queue
+  this->udp_rx_queue_ = xQueueCreate(UDP_QUEUE_SIZE, sizeof(UdpPacket));
+  if (this->udp_rx_queue_ == nullptr) {
+    ESP_LOGE(TAG, "❌ Failed to create UDP RX queue");
+    return;
+  }
+
+  this->udp_task_running_ = true;
+
+  // Create the receiver task with 4KB stack (enough for select + packet handling)
+  BaseType_t result = xTaskCreatePinnedToCore(
+      udp_rx_task_func_,        // Task function
+      "udp_rx",                 // Task name
+      4096,                     // Stack size (bytes)
+      this,                     // Parameter (pointer to this)
+      5,                        // Priority (above idle, below critical)
+      &this->udp_rx_task_,      // Task handle
+      0                         // Core 0 (same as main loop for cache efficiency)
+  );
+
+  if (result != pdPASS) {
+    ESP_LOGE(TAG, "❌ Failed to create UDP RX task");
+    vQueueDelete(this->udp_rx_queue_);
+    this->udp_rx_queue_ = nullptr;
+    this->udp_task_running_ = false;
+    return;
+  }
+
+  ESP_LOGI(TAG, "✅ Started UDP RX task (energy-efficient select() mode)");
+}
+
+// Stop the dedicated UDP receiver task
+void TailscaleComponent::stop_udp_rx_task_() {
+  if (this->udp_rx_task_ == nullptr) {
+    return;
+  }
+
+  // Signal task to stop
+  this->udp_task_running_ = false;
+
+  // Wait for task to finish (up to 1 second)
+  for (int i = 0; i < 100 && eTaskGetState(this->udp_rx_task_) != eDeleted; i++) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  // Clean up
+  if (this->udp_rx_queue_ != nullptr) {
+    vQueueDelete(this->udp_rx_queue_);
+    this->udp_rx_queue_ = nullptr;
+  }
+  this->udp_rx_task_ = nullptr;
+
+  ESP_LOGI(TAG, "✓ Stopped UDP RX task");
+}
+
+// Static task function that blocks on select() for energy efficiency
+void TailscaleComponent::udp_rx_task_func_(void* arg) {
+  TailscaleComponent* self = static_cast<TailscaleComponent*>(arg);
+
+  ESP_LOGI(TAG, "UDP RX task started (blocking select mode)");
+
+  while (self->udp_task_running_) {
+    // Wait for socket to be valid
+    if (self->unified_socket_ < 0) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // Use select() to block until data arrives (with 100ms timeout for task control)
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(self->unified_socket_, &readfds);
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;  // 100ms timeout - allows task to check running flag
+
+    int result = select(self->unified_socket_ + 1, &readfds, nullptr, nullptr, &tv);
+
+    if (result < 0) {
+      if (errno != EINTR) {
+        ESP_LOGW(TAG, "UDP select error: %d", errno);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+      continue;
+    }
+
+    if (result == 0) {
+      // Timeout - no data, loop will check running flag
+      continue;
+    }
+
+    // Data available - read all packets and queue them
+    while (self->udp_task_running_) {
+      UdpPacket pkt;
+      socklen_t addr_len = sizeof(pkt.src_addr);
+
+      ssize_t received = recvfrom(self->unified_socket_, pkt.data, sizeof(pkt.data),
+                                   MSG_DONTWAIT, (struct sockaddr*)&pkt.src_addr, &addr_len);
+
+      if (received <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          break;  // No more data available
+        }
+        break;  // Error
+      }
+
+      pkt.len = received;
+
+      // Try to queue the packet (don't block if queue is full - drop packet)
+      if (xQueueSend(self->udp_rx_queue_, &pkt, 0) != pdTRUE) {
+        static uint32_t last_drop_log = 0;
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now - last_drop_log > 5000) {
+          ESP_LOGW(TAG, "UDP RX queue full - packet dropped");
+          last_drop_log = now;
+        }
+      }
+    }
+  }
+
+  ESP_LOGI(TAG, "UDP RX task exiting");
+  vTaskDelete(nullptr);
 }
 
 // Check unified socket for incoming packets (called from loop() on every iteration)
@@ -2539,95 +2674,63 @@ void TailscaleComponent::check_unified_socket_() {
     }
   }
 
-  // Check for incoming packets on unified socket (Disco, STUN, WireGuard)
-  // This replaces the old check_disco_responses_() which only checked disco socket
-  // CRITICAL: Drain ALL available packets in a loop to prevent socket buffer overflow
-  if (this->unified_socket_ >= 0) {
-    // DEBUG: Log that we're about to call recvfrom
-    static uint32_t recvfrom_call_count = 0;
-    static uint32_t last_debug_log = 0;
-    recvfrom_call_count++;
-    if (millis() - last_debug_log >= 30000) {
-      ESP_LOGD(TAG, "🔍 recvfrom() called %u times (socket fd=%d, port=%u)",
-               recvfrom_call_count, this->unified_socket_, this->unified_port_);
-      last_debug_log = millis();
+  // Process packets from the queue (filled by dedicated UDP RX task)
+  // This replaces busy-polling with energy-efficient event-driven reception
+  if (this->udp_rx_queue_ == nullptr) {
+    return;  // Queue not initialized yet
+  }
+
+  // Process all available packets from queue (non-blocking)
+  const int MAX_PACKETS_PER_CALL = 100;
+  int packets_processed = 0;
+  UdpPacket pkt;
+
+  while (packets_processed < MAX_PACKETS_PER_CALL) {
+    // Try to receive from queue without blocking
+    if (xQueueReceive(this->udp_rx_queue_, &pkt, 0) != pdTRUE) {
+      break;  // Queue empty
     }
 
-    // Loop to drain all available packets from socket buffer
-    // Limit iterations to prevent starving other components (100 packets = ~128KB max processing)
-    const int MAX_PACKETS_PER_CALL = 100;
-    int packets_processed = 0;
+    packets_processed++;
+    total_udp_rx++;
+    last_rx_time = millis();
 
-    while (packets_processed < MAX_PACKETS_PER_CALL) {
-      uint8_t buffer[2048];  // Large enough for WireGuard packets
-      struct sockaddr_in sender_addr{};
-      socklen_t sender_len = sizeof(sender_addr);
+    // Log every received UDP datagram for debugging
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &pkt.src_addr.sin_addr, src_ip, sizeof(src_ip));
+    uint16_t src_port = ntohs(pkt.src_addr.sin_port);
 
-      ssize_t received = recvfrom(this->unified_socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                                   (struct sockaddr *)&sender_addr, &sender_len);
-
-      if (received > 0) {
-        packets_processed++;
-        total_udp_rx++;
-        last_rx_time = millis();
-
-        // Log every received UDP datagram for debugging
-        char src_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sender_addr.sin_addr, src_ip, sizeof(src_ip));
-        uint16_t src_port = ntohs(sender_addr.sin_port);
-
-        // Identify packet type for counters
-        const char* pkt_type = "UNKNOWN";
-        if (received >= 1) {
-          if (buffer[0] >= 1 && buffer[0] <= 4) {
-            pkt_type = "WireGuard";
-            wireguard_rx++;
-          } else if (received >= 6 && buffer[0] == 'T' && buffer[1] == 'S' &&
-                     buffer[2] == 0xf0 && buffer[3] == 0x9f && buffer[4] == 0x92 && buffer[5] == 0xac) {
-            pkt_type = "Disco";
-            disco_rx++;
-          } else if (received >= 20 && (buffer[0] & 0xC0) == 0x00) {
-            pkt_type = "STUN";
-            stun_rx++;
-          } else {
-            other_rx++;
-          }
-        }
-
-        ESP_LOGD(TAG, "📨 UDP RX #%u: %zd bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
-                 total_udp_rx, received, src_ip, src_port, pkt_type,
-                 buffer[0], buffer[1], buffer[2], buffer[3],
-                 buffer[4], buffer[5], buffer[6], buffer[7]);
-
-        // Route packet to appropriate handler based on magic bytes
-        this->route_incoming_packet_(buffer, received, &sender_addr);
-      } else if (received < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // No more packets available - socket buffer drained
-          break;
-        }
-
-        // DEBUG: Log unexpected errno values periodically
-        static uint32_t last_errno_log = 0;
-        static int last_logged_errno = 0;
-        if (millis() - last_errno_log >= 60000 && errno != last_logged_errno) {
-          ESP_LOGI(TAG, "🔍 recvfrom returned %zd, errno=%d (%s)",
-                   received, errno, strerror(errno));
-          last_errno_log = millis();
-          last_logged_errno = errno;
-        }
-        break;  // Stop on error
+    // Identify packet type for counters
+    const char* pkt_type = "UNKNOWN";
+    if (pkt.len >= 1) {
+      if (pkt.data[0] >= 1 && pkt.data[0] <= 4) {
+        pkt_type = "WireGuard";
+        wireguard_rx++;
+      } else if (pkt.len >= 6 && pkt.data[0] == 'T' && pkt.data[1] == 'S' &&
+                 pkt.data[2] == 0xf0 && pkt.data[3] == 0x9f && pkt.data[4] == 0x92 && pkt.data[5] == 0xac) {
+        pkt_type = "Disco";
+        disco_rx++;
+      } else if (pkt.len >= 20 && (pkt.data[0] & 0xC0) == 0x00) {
+        pkt_type = "STUN";
+        stun_rx++;
       } else {
-        // received == 0 should not happen with UDP, but handle it
-        break;
+        other_rx++;
       }
     }
 
-    // Log if we hit the packet processing limit (might indicate backlog)
-    if (packets_processed >= MAX_PACKETS_PER_CALL) {
-      ESP_LOGW(TAG, "⚠️ Hit max packet processing limit (%d packets) - socket may have backlog",
-               MAX_PACKETS_PER_CALL);
-    }
+    ESP_LOGD(TAG, "📨 UDP RX #%u: %zu bytes from %s:%u [%s] (hex: %02x %02x %02x %02x %02x %02x %02x %02x)",
+             total_udp_rx, pkt.len, src_ip, src_port, pkt_type,
+             pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3],
+             pkt.data[4], pkt.data[5], pkt.data[6], pkt.data[7]);
+
+    // Route packet to appropriate handler based on magic bytes
+    this->route_incoming_packet_(pkt.data, pkt.len, &pkt.src_addr);
+  }
+
+  // Log if we hit the packet processing limit (might indicate backlog)
+  if (packets_processed >= MAX_PACKETS_PER_CALL) {
+    ESP_LOGW(TAG, "⚠️ Hit max packet processing limit (%d packets) - queue may have backlog",
+             MAX_PACKETS_PER_CALL);
   }
 }
 

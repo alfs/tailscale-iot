@@ -21,6 +21,9 @@
 #include <cstring>  // for memset
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 // WireGuardSession adapter: Uses esp_wireguard library WITHOUT creating netif
 // Avoids NULL pointer crashes by routing packets through unified socket/DERP
@@ -243,8 +246,25 @@ class TailscaleComponent : public PollingComponent {
   int unified_socket_{-1};                    // Single UDP socket for all traffic
   uint16_t unified_port_{41642};              // Port for unified socket (TESTING: changed from 41641 to diagnose WireGuard conflict)
   void setup_unified_socket_();               // Initialize unified socket
-  void check_unified_socket_();               // Check for incoming packets (called from loop())
+  void check_unified_socket_();               // Process packets from queue (called from loop())
   void route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);  // Demultiplex packets
+
+  // Dedicated UDP receiver task for energy efficiency
+  // Uses select() to block until data arrives instead of busy-polling
+  // Memory: 4 * ~1520 bytes = ~6KB (reduced from 16 * 2060 = 33KB)
+  static constexpr size_t UDP_PACKET_MAX_SIZE = 1500;  // WireGuard MTU
+  static constexpr int UDP_QUEUE_SIZE = 4;  // Queue depth for packets
+  struct UdpPacket {
+    uint8_t data[UDP_PACKET_MAX_SIZE];
+    size_t len;
+    struct sockaddr_in src_addr;
+  };
+  TaskHandle_t udp_rx_task_{nullptr};         // FreeRTOS task handle
+  QueueHandle_t udp_rx_queue_{nullptr};       // Queue for received packets
+  volatile bool udp_task_running_{false};     // Flag to stop task
+  void start_udp_rx_task_();                  // Start the receiver task
+  void stop_udp_rx_task_();                   // Stop the receiver task
+  static void udp_rx_task_func_(void* arg);   // Static task function
   void handle_disco_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);    // Handle Disco protocol
   void handle_stun_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src);     // Handle STUN responses
   void handle_wireguard_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src); // Forward to WireGuard
