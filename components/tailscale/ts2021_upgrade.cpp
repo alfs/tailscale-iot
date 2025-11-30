@@ -607,9 +607,13 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
     return false;
   }
 
-  // Default chunk size if caller passes something very small.
-  size_t chunk_size = std::max<size_t>(max_len, 256);
-  std::vector<uint8_t> temp(chunk_size);
+  // Use static buffer for reading to avoid heap allocation/fragmentation
+  // g_ws_payload_buffer is 8KB, which is plenty for TLS records
+  uint8_t* scratch_buf = g_ws_payload_buffer;
+  size_t chunk_size = sizeof(g_ws_payload_buffer);
+  if (chunk_size > max_len && max_len > 0) {
+    chunk_size = max_len;
+  }
 
   int64_t deadline_ms = (timeout_ms > 0) ? (esp_timer_get_time() / 1000 + timeout_ms) : -1;
 
@@ -662,10 +666,10 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
 
     // Feed watchdog before TLS read which can block during crypto operations
     App.feed_wdt();
-    int ret = esp_tls_conn_read(this->tls_, temp.data(), temp.size());
+    int ret = esp_tls_conn_read(this->tls_, scratch_buf, chunk_size);
     if (ret > 0) {
       size_t received = static_cast<size_t>(ret);
-      this->recv_buffer_.insert(this->recv_buffer_.end(), temp.begin(), temp.begin() + received);
+      this->recv_buffer_.insert(this->recv_buffer_.end(), scratch_buf, scratch_buf + received);
 
       // Log the newly received chunk for debugging (first 64 bytes).
       ESP_LOGV(TAG, "Received %zu raw bytes from server (buffered total: %zu)", received, this->recv_buffer_.size());
@@ -674,7 +678,7 @@ bool Ts2021Upgrade::read_raw(std::vector<uint8_t> &out, size_t max_len, uint32_t
       hex_str.reserve(log_len * 3);
       for (size_t i = 0; i < log_len; i++) {
         char buf[4];
-        snprintf(buf, sizeof(buf), "%02x ", temp[i]);
+        snprintf(buf, sizeof(buf), "%02x ", scratch_buf[i]);
         hex_str += buf;
       }
       if (received > 64) {

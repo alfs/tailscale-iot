@@ -919,8 +919,18 @@ void TailscaleComponent::handle_connected_state_() {
   // Send periodic endpoint updates every 60 seconds
   // These are sent on NEW HTTP/2 streams, not on the persistent receiving stream
   static uint32_t last_keepalive_send_time = 0;
+  static bool first_keepalive_init = true;
   uint32_t current_time = millis();
   const uint32_t KEEPALIVE_SEND_INTERVAL_MS = 60000;  // 60 seconds
+
+  // Initialize timer on first entry to prevent immediate keepalive after initial STUN
+  // Without this, if uptime >= 60s when we enter CONNECTED state, keepalive triggers
+  // immediately, causing a second STUN query that stops the IO task just started
+  if (first_keepalive_init) {
+    last_keepalive_send_time = current_time;
+    first_keepalive_init = false;
+    ESP_LOGD(TAG, "Initialized keepalive timer - first keepalive in 60s");
+  }
 
   if (current_time - last_keepalive_send_time >= KEEPALIVE_SEND_INTERVAL_MS) {
     ESP_LOGI(TAG, "→ Sending periodic keepalive with endpoint update...");
@@ -2600,7 +2610,7 @@ void TailscaleComponent::start_io_task_() {
   ESP_LOGI(TAG, "✅ Started IO task (Zero-Copy Select Mode)");
 }
 
-// Stop the IO task
+// Stop the IO task (keeps queues intact for restart)
 void TailscaleComponent::stop_io_task_() {
   if (this->io_task_handle_ == nullptr) {
     return;
@@ -2614,18 +2624,14 @@ void TailscaleComponent::stop_io_task_() {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  // Clean up queues
-  if (this->free_buffer_queue_ != nullptr) {
-    vQueueDelete(this->free_buffer_queue_);
-    this->free_buffer_queue_ = nullptr;
-  }
-  if (this->ready_packet_queue_ != nullptr) {
-    vQueueDelete(this->ready_packet_queue_);
-    this->ready_packet_queue_ = nullptr;
-  }
+  // DO NOT delete queues here - they need to persist for task restart
+  // Queues are only cleaned up when component is destroyed
+  // The task will be recreated with the same queues by start_io_task_()
+
+  // Reset task handle so start_io_task_() can create a new one
   this->io_task_handle_ = nullptr;
 
-  ESP_LOGI(TAG, "✓ Stopped IO task");
+  ESP_LOGI(TAG, "✓ Stopped IO task (queues preserved for restart)");
 }
 
 // Static task function that blocks on select() for energy efficiency
@@ -4451,11 +4457,25 @@ bool TailscaleComponent::send_map_keepalive_() {
   }
 
   // Re-discover endpoint via STUN in case NAT mapping changed
-  // This is important because NAT mappings can change over time
-  if (this->perform_stun_query_()) {
-    ESP_LOGD(TAG, "Updated endpoint: %s", this->discovered_endpoint_.c_str());
+  // OPTIMIZATION: Skip STUN during keepalive if ALL peers have confirmed direct path
+  // STUN queries stop the IO task, causing ~1-2s latency spikes. If direct path is
+  // already working, we don't need to re-discover our endpoint every 60 seconds.
+  bool all_direct_paths_confirmed = true;
+  for (const auto& peer : this->peer_sessions_) {
+    if (!peer.direct_path_confirmed) {
+      all_direct_paths_confirmed = false;
+      break;
+    }
+  }
+
+  if (all_direct_paths_confirmed && !this->discovered_endpoint_.empty()) {
+    ESP_LOGD(TAG, "Skipping STUN query - all peers have direct path confirmed");
   } else {
-    ESP_LOGD(TAG, "STUN query failed - using previous endpoint");
+    if (this->perform_stun_query_()) {
+      ESP_LOGD(TAG, "Updated endpoint: %s", this->discovered_endpoint_.c_str());
+    } else {
+      ESP_LOGD(TAG, "STUN query failed - using previous endpoint");
+    }
   }
 
   // Refresh endpoint list to pick up TTL-discovered endpoint (if available)

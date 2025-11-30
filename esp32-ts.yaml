@@ -9,31 +9,35 @@ esp32:
     version: recommended
     sdkconfig_options:
       # Increase task watchdog timeout from default 5s to 30s
-      # This allows longer network operations during TS2021 handshake
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
-      # Enable certificate bundle for TLS verification
+      
+      # Aggressive mbedTLS Memory Optimization (The "320KB RAM" survival kit)
+      
+      # 1. Reduce Buffer Sizes: 
+      # Standard TLS requires 16KB. We force 4KB.
+      # This saves ~24KB PER CONNECTION (RX+TX).
+      # Headscale/DERP payloads are small (JSON or <1.5KB WG packets).
+      CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN: "4096"
+      CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN: "4096"
+      CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN: "4096"
+
+      # 2. Dynamic Allocation:
+      # Only allocate buffers when processing records, free immediately after.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA: y
+      CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT: y
+      
+      # 3. Discard Certificate Data:
+      # Don't store the peer certificate after verification. Saves ~2-4KB.
+      CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE: n
+
+      # 4. Certificate Bundle:
       # Use custom bundle with only Let's Encrypt certificates instead of full bundle
       # This saves ~145KB flash and reduces RAM usage during TLS verification
       CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: y
       CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL: n
       CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CUSTOM: y
       CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH: "certs"
-
-      # mbedTLS Memory Optimizations (saves ~48KB total)
-      # Reduce TLS buffer size from 16KB to 3KB per buffer (saves 26KB)
-      # Reduced from 4KB to 3KB to allow two TLS connections (control + DERP)
-      # Most Tailscale control messages are <3KB, and HTTP/2 chunks larger responses
-      CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN: "3072"
-
-      # Enable dynamic buffer allocation (saves ~20KB)
-      # Buffers are allocated only when needed and freed after use
-      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
-      CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA: y
-      CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT: y
-
-      # Disable peer certificate retention (saves 3.6KB)
-      # We don't need to inspect the peer certificate after validation
-      CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE: n
 
       # Enable variable-length buffers (saves 1KB)
       CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH: y
