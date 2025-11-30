@@ -135,6 +135,9 @@ static void print_chunked(const char *tag, const char *label, const char *data, 
 }
 
 void TailscaleComponent::setup() {
+  // Seed standard RNG with hardware entropy
+  srand(esp_random());
+
   ESP_LOGI(TAG, "Setting up Tailscale component for ESP32-C3");
   ESP_LOGI(TAG, "Device name: %s", this->device_name_.c_str());
   ESP_LOGI(TAG, "Control URL: %s", this->control_url_.c_str());
@@ -4469,7 +4472,8 @@ bool TailscaleComponent::send_map_keepalive_() {
   }
 
   if (all_direct_paths_confirmed && !this->discovered_endpoint_.empty()) {
-    ESP_LOGD(TAG, "Skipping STUN query - all peers have direct path confirmed");
+    ESP_LOGD(TAG, "Skipping STUN query - direct paths confirmed (%d peers)",
+             this->peer_sessions_.size());
   } else {
     if (this->perform_stun_query_()) {
       ESP_LOGD(TAG, "Updated endpoint: %s", this->discovered_endpoint_.c_str());
@@ -4617,8 +4621,32 @@ bool TailscaleComponent::check_server_keepalive_() {
     }
 
     // Watchdog: if transport isn't ready for 30 seconds, force reconnection
+    // BUT: Skip reconnection if direct WireGuard path is working (to avoid disrupting ICMP)
     if (current_time - transport_not_ready_since >= 30000) {
-      ESP_LOGE(TAG, "❌ Transport watchdog expired: not ready for 30 seconds");
+      // Check if we have working direct paths - if so, extend timeout significantly
+      bool all_direct_paths_confirmed = true;
+      bool any_direct_path_confirmed = false;
+      for (const auto& peer : this->peer_sessions_) {
+        if (peer.direct_path_confirmed) {
+          any_direct_path_confirmed = true;
+        } else {
+          all_direct_paths_confirmed = false;
+        }
+      }
+
+      // If any peer has direct path working, extend watchdog to 5 minutes
+      // WireGuard traffic works without control plane - reconnect lazily
+      if (any_direct_path_confirmed && current_time - transport_not_ready_since < 300000) {
+        static uint32_t last_direct_path_log = 0;
+        if (current_time - last_direct_path_log >= 60000) {
+          ESP_LOGW(TAG, "Transport not ready but direct path works - deferring reconnection");
+          last_direct_path_log = current_time;
+        }
+        return false;
+      }
+
+      ESP_LOGE(TAG, "❌ Transport watchdog expired: not ready for %u seconds",
+               (current_time - transport_not_ready_since) / 1000);
       ESP_LOGE(TAG, "→ Forcing full reconnection by transitioning to REGISTERING");
 
       // Reset state
