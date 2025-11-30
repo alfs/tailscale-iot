@@ -13,6 +13,7 @@
 #include "hostinfo_builder.h"
 #include "derp_client.h"
 #include "wireguard_device_manager.h"
+#include "led_status.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -149,6 +150,8 @@ class TailscaleComponent : public PollingComponent {
   void add_disco_ping_target(const std::string &hostname) { this->disco_ping_targets_.push_back(hostname); }
   void set_preferred_derp(uint32_t region) { this->preferred_derp_ = region; }
   void set_prefer_direct_udp(bool prefer) { this->prefer_direct_udp_ = prefer; }
+  void set_status_led_enabled(bool enabled) { this->status_led_enabled_ = enabled; }
+  void set_status_led_pin(uint8_t pin) { this->status_led_pin_ = pin; }
 
   // State getters
   TailscaleState get_state() const { return this->state_; }
@@ -339,6 +342,12 @@ class TailscaleComponent : public PollingComponent {
   uint32_t last_wg_direct_tx_time_{0}; // Timestamp of last direct UDP send
   uint32_t last_wg_direct_rx_time_{0}; // Timestamp of last direct UDP receive
   uint32_t last_wg_derp_rx_time_{0};   // Timestamp of last DERP receive
+
+  // LED status indicator
+  LedStatus led_status_;
+  bool status_led_enabled_{true};   // Enable/disable LED (default: enabled)
+  uint8_t status_led_pin_{10};      // GPIO pin for WS2812 LED (default: GPIO10 for ESP32-C3 Zero)
+  void update_led_state_();  // Update LED based on current state
 
   // Timing
   uint32_t last_update_time_{0};

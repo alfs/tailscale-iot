@@ -76,4 +76,13 @@ tailscale:
   allowed_peers: !secret allowed_peers
   preferred_derp: 999
   prefer_direct_udp: true # Prefer direct UDP routing after Disco PONG confirmation, else use DERP
+  # LED status indicator (WS2812 addressable LED)
+  #   Orange (20%) - Connecting
+  #   Green (20%)  - Connected/OK
+  #   Red (20%)    - Error
+  #   Blue blink   - Control packets (disco, wireguard handshake)
+  #   Orange blink - Data packets (ICMP, TCP)
+  status_led:
+    enabled: false
+    pin: 10  # GPIO10 for ESP32-C3 Zero onboard WS2812
 

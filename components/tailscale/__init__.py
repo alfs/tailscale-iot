@@ -27,6 +27,9 @@ CONF_CONTROL_PSK = "control_psk"
 CONF_DISCO_PING_TARGETS = "allowed_peers"
 CONF_PREFERRED_DERP = "preferred_derp"
 CONF_PREFER_DIRECT_UDP = "prefer_direct_udp"
+CONF_STATUS_LED = "status_led"
+CONF_STATUS_LED_PIN = "pin"
+CONF_STATUS_LED_ENABLED = "enabled"
 
 tailscale_ns = cg.esphome_ns.namespace("tailscale")
 TailscaleComponent = tailscale_ns.class_("TailscaleComponent", cg.PollingComponent)
@@ -46,6 +49,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_DISCO_PING_TARGETS): cv.ensure_list(cv.string),
         cv.Optional(CONF_PREFERRED_DERP, default=28): cv.int_range(min=0, max=999),
         cv.Optional(CONF_PREFER_DIRECT_UDP, default=False): cv.boolean,
+        cv.Optional(CONF_STATUS_LED): cv.Schema({
+            cv.Optional(CONF_STATUS_LED_ENABLED, default=True): cv.boolean,
+            cv.Optional(CONF_STATUS_LED_PIN, default=10): cv.int_range(min=0, max=48),
+        }),
     }
 ).extend(cv.polling_component_schema("60s"))
 
@@ -136,3 +143,9 @@ async def to_code(config):
 
     # Set direct UDP preference
     cg.add(var.set_prefer_direct_udp(config[CONF_PREFER_DIRECT_UDP]))
+
+    # Configure status LED
+    if CONF_STATUS_LED in config:
+        led_config = config[CONF_STATUS_LED]
+        cg.add(var.set_status_led_enabled(led_config[CONF_STATUS_LED_ENABLED]))
+        cg.add(var.set_status_led_pin(led_config[CONF_STATUS_LED_PIN]))

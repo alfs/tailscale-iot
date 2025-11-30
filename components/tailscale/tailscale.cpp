@@ -139,6 +139,18 @@ void TailscaleComponent::setup() {
   ESP_LOGI(TAG, "Control URL: %s", this->control_url_.c_str());
   ESP_LOGD(TAG, "Auth key: %s", this->auth_key_.substr(0, 16).c_str());  // Show only first 16 chars
 
+  // Initialize LED status indicator if enabled
+  if (this->status_led_enabled_) {
+    if (this->led_status_.initialize(this->status_led_pin_)) {
+      ESP_LOGI(TAG, "✓ LED status indicator initialized on GPIO%d", this->status_led_pin_);
+      this->led_status_.set_state(LedState::CONNECTING);
+    } else {
+      ESP_LOGW(TAG, "⚠️ Failed to initialize LED status indicator on GPIO%d", this->status_led_pin_);
+    }
+  } else {
+    ESP_LOGI(TAG, "LED status indicator disabled");
+  }
+
   // Initialize NVS for key persistence
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -200,6 +212,9 @@ void TailscaleComponent::setup() {
 }
 
 void TailscaleComponent::loop() {
+  // Update LED blink timing
+  this->led_status_.update();
+
   // CRITICAL: Check unified socket on EVERY loop iteration for low-latency packet reception
   // This was moved here from handle_connected_state_() to restore frequent polling
   // like the working commit (6dbe871) had with dedicated disco_socket checking.
@@ -320,15 +335,36 @@ void TailscaleComponent::transition_to(TailscaleState new_state) {
       "IDLE", "INITIALIZING", "REGISTERING", "REGISTERED",
       "FETCHING_MAP", "CONNECTED", "ERROR"
     };
-    
-    ESP_LOGI(TAG, "State transition: %s -> %s", 
+
+    ESP_LOGI(TAG, "State transition: %s -> %s",
              state_names[static_cast<int>(this->state_)],
              state_names[static_cast<int>(new_state)]);
-    ESP_LOGD(TAG, "Timestamp: %lu ms, Uptime: %lu s", 
+    ESP_LOGD(TAG, "Timestamp: %lu ms, Uptime: %lu s",
              millis(), millis() / 1000);
-    
+
     this->state_ = new_state;
     this->last_update_time_ = millis();
+
+    // Update LED status based on new state
+    this->update_led_state_();
+  }
+}
+
+void TailscaleComponent::update_led_state_() {
+  switch (this->state_) {
+    case TailscaleState::IDLE:
+    case TailscaleState::INITIALIZING:
+    case TailscaleState::REGISTERING:
+    case TailscaleState::REGISTERED:
+    case TailscaleState::FETCHING_MAP:
+      this->led_status_.set_state(LedState::CONNECTING);
+      break;
+    case TailscaleState::CONNECTED:
+      this->led_status_.set_state(LedState::CONNECTED);
+      break;
+    case TailscaleState::ERROR:
+      this->led_status_.set_state(LedState::ERROR);
+      break;
   }
 }
 
@@ -2901,6 +2937,7 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
   const uint8_t disco_magic[6] = {0x54, 0x53, 0xf0, 0x9f, 0x92, 0xac};
   if (len >= 6 && memcmp(buf, disco_magic, 6) == 0) {
     ESP_LOGI(TAG, "📡 Routing to Disco handler (magic: TS💬)");
+    this->led_status_.blink(BlinkType::CONTROL);  // Blue blink for disco
     this->handle_disco_packet_(buf, len, src);
     return;
   }
@@ -2919,6 +2956,12 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     uint16_t src_port = ntohs(src->sin_port);
     ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u",
              buf[0], len, src_ip, src_port);
+    // Blue blink for WireGuard control (handshake types 1-3), orange for data (type 4)
+    if (buf[0] <= 0x03) {
+      this->led_status_.blink(BlinkType::CONTROL);
+    } else {
+      this->led_status_.blink(BlinkType::DATA);
+    }
 
     // Route packet to WireGuard device manager (it handles peer routing internally via receiver_index)
     if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
@@ -4521,6 +4564,20 @@ void TailscaleComponent::handle_derp_packet_(const uint8_t* peer_key, const uint
   ESP_LOGD(TAG, "  From peer: %02x%02x%02x%02x...",
            peer_key[0], peer_key[1], peer_key[2], peer_key[3]);
 
+  // LED blink based on packet type from DERP
+  if (len > 0) {
+    uint8_t msg_type = packet[0];
+    // WireGuard types 1-3 are control (handshake), type 4 is data
+    if (msg_type >= 0x01 && msg_type <= 0x03) {
+      this->led_status_.blink(BlinkType::CONTROL);
+    } else if (msg_type == 0x04) {
+      this->led_status_.blink(BlinkType::DATA);
+    } else if (msg_type == 0x54) {
+      // Disco packet (starts with 'T' from TS💬)
+      this->led_status_.blink(BlinkType::CONTROL);
+    }
+  }
+
   // MINIMAL TEST: Identify packet type
   if (len > 0) {
     uint8_t msg_type = packet[0];
@@ -4979,6 +5036,9 @@ void TailscaleComponent::send_tcp_packet_(const TcpConnection& conn, uint8_t fla
 }
 
 void TailscaleComponent::handle_tcp_packet_(const uint8_t* ip_packet, size_t len) {
+  // Blink orange for TCP data packet
+  this->led_status_.blink(BlinkType::DATA);
+
   // Parse IP header
   uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;
   if (len < ip_ihl + 20) {
