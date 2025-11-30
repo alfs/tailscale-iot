@@ -985,7 +985,7 @@ bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_p
     App.feed_wdt();  // Reset watchdog
 
     Frame frame;
-    if (!this->read_frame_(frame, 100)) {  // 100ms timeout per frame for faster packet processing
+    if (!this->read_frame_(frame, 1)) {  // 1ms timeout per frame for low-latency packet processing
       continue;  // Keep trying until overall timeout
     }
 

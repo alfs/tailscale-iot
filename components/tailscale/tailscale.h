@@ -272,11 +272,11 @@ class TailscaleComponent : public PollingComponent {
   };
   NatDiscoveryState nat_discovery_state_;
   void send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
-                        const std::string& peer_disco_key);
+                        const std::string& peer_disco_key, const uint8_t* txid);
   bool decrypt_disco_payload_(const uint8_t* encrypted, size_t enc_len,
                                const uint8_t* nonce, const std::string& peer_disco_key,
                                uint8_t* plaintext, size_t* plain_len);
-  void handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port);
+  void handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port, const std::string& sender_disco_key);
 
   // Protocol handlers
   std::unique_ptr<NoiseSession> noise_session_;

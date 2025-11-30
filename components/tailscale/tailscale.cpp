@@ -3118,6 +3118,20 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
     case 1: {  // PING
       ESP_LOGI(TAG, "  → Disco PING received, sending PONG...");
 
+      // PING format: msg_type(1) + version(1) + TxID(12) + NodeKey(32) = 46 bytes
+      size_t ping_plaintext_len = encrypted_len - crypto_box_MACBYTES;
+      if (ping_plaintext_len < 14) {  // At least msg_type + version + TxID
+        ESP_LOGW(TAG, "  PING plaintext too short: %zu bytes", ping_plaintext_len);
+        break;
+      }
+
+      // Extract TxID from plaintext[2..14] (12 bytes)
+      uint8_t txid[12];
+      memcpy(txid, &plaintext[2], 12);
+      ESP_LOGD(TAG, "  PING TxID: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+               txid[0], txid[1], txid[2], txid[3], txid[4], txid[5],
+               txid[6], txid[7], txid[8], txid[9], txid[10], txid[11]);
+
       // ENDPOINT LEARNING: Update peer endpoint from source IP of received PING
       // Convert sender's disco key to hex format to find the peer
       char sender_disco_hex[65];
@@ -3149,13 +3163,21 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 
       // Encode sender's disco key to base64 for send_disco_pong_
       std::string sender_disco_key_b64 = this->base64_encode(sender_disco_pubkey, 32);
-      this->send_disco_pong_(src_ip, src_port, sender_disco_key_b64);
+      this->send_disco_pong_(src_ip, src_port, sender_disco_key_b64, txid);
       break;
     }
-    case 2:  // PONG
+    case 2: {  // PONG
       ESP_LOGI(TAG, "  ✓ Disco PONG received from %s:%u", src_ip, src_port);
-      this->handle_disco_pong_(src_ip, src_port);
+      // Convert sender's disco key to hex format to find the peer (same as PING handling)
+      char pong_sender_disco_hex[65];
+      for (int i = 0; i < 32; i++) {
+        snprintf(&pong_sender_disco_hex[i * 2], 3, "%02x", sender_disco_pubkey[i]);
+      }
+      pong_sender_disco_hex[64] = '\0';
+      std::string pong_sender_disco_key_str = std::string("discokey:") + pong_sender_disco_hex;
+      this->handle_disco_pong_(src_ip, src_port, pong_sender_disco_key_str);
       break;
+    }
     case 3: {  // CALL_ME_MAYBE
       ESP_LOGI(TAG, "  → Disco CALL_ME_MAYBE received");
 
@@ -3241,12 +3263,23 @@ void TailscaleComponent::handle_disco_packet_(uint8_t* buf, size_t len, struct s
 }
 
 // Handle incoming disco PONG responses
-void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port) {
+void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16_t sender_port, const std::string& sender_disco_key) {
   ESP_LOGI(TAG, "✓ Disco PONG confirmed from %s:%u - peer is reachable", sender_ip.c_str(), sender_port);
 
-  // Find the peer by endpoint and mark direct path as confirmed
+  // Find the peer by disco key (not endpoint, since endpoint may not be known yet)
   for (auto& peer : this->node_config_.peers) {
-    if (peer.endpoint == sender_ip && peer.port == sender_port) {
+    if (peer.disco_key == sender_disco_key) {
+      ESP_LOGD(TAG, "  Found peer %s by disco key", peer.hostname.c_str());
+
+      // Update peer's endpoint in node_config_ (endpoint learning)
+      if (peer.endpoint != sender_ip || peer.port != sender_port) {
+        ESP_LOGW(TAG, "🎓 ENDPOINT LEARNING (PONG): Updating %s endpoint from %s:%u → %s:%u",
+                 peer.hostname.c_str(), peer.endpoint.c_str(), peer.port,
+                 sender_ip.c_str(), sender_port);
+        peer.endpoint = sender_ip;
+        peer.port = sender_port;
+      }
+
       // Find the corresponding peer session and mark direct path confirmed
       for (auto& session : this->peer_sessions_) {
         if (session.hostname == peer.hostname) {
@@ -3272,11 +3305,14 @@ void TailscaleComponent::handle_disco_pong_(const std::string& sender_ip, uint16
           return;
         }
       }
+      // Found peer in node_config_ but not in peer_sessions_
+      ESP_LOGW(TAG, "  Peer %s found but no session exists yet", peer.hostname.c_str());
+      return;
     }
   }
 
-  // Peer not found by endpoint match - try to find by disco key in incoming PING
-  ESP_LOGD(TAG, "  Disco PONG from unknown endpoint %s:%u - peer may not be in node_config_", sender_ip.c_str(), sender_port);
+  // Peer not found by disco key
+  ESP_LOGD(TAG, "  Disco PONG from unknown disco key %s:%u", sender_ip.c_str(), sender_port);
 }
 
 // Handle STUN response packets (endpoint discovery)
@@ -3700,7 +3736,7 @@ void TailscaleComponent::send_disco_ping_(const std::string& endpoint, uint16_t 
 }
 
 void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t sender_port,
-                                          const std::string& peer_disco_key) {
+                                          const std::string& peer_disco_key, const uint8_t* txid) {
   if (this->unified_socket_ == -1) {
     ESP_LOGW(TAG, "Unified socket not initialized");
     return;
@@ -3758,17 +3794,38 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
   log_hex_dump(PONG_LOG_TAG, "Peer disco public key", reinterpret_cast<const uint8_t*>(peer_pub_raw.data()), peer_pub_raw.size());
 
   // Build disco pong message per Tailscale spec
-  // Format: magic(6) + sender_disco_pubkey(32) + nonce(24) + encrypted(msg_type + version)
+  // PONG format: msg_type(1) + version(1) + TxID(12) + Src(18) = 32 bytes plaintext
 
   // Generate nonce (24 bytes for NaCl box)
   uint8_t nonce[24];
   esp_fill_random(nonce, 24);
   log_hex_dump(PONG_LOG_TAG, "Nonce", nonce, sizeof(nonce));
 
-  // Prepare plaintext payload (msg_type + version)
-  uint8_t plaintext[2];
+  // Prepare plaintext payload: msg_type(1) + version(1) + TxID(12) + Src(18) = 32 bytes
+  uint8_t plaintext[32];
   plaintext[0] = DISCO_MSG_PONG;  // Message type
   plaintext[1] = DISCO_VERSION;   // Version
+
+  // Copy TxID (12 bytes at offset 2)
+  memcpy(&plaintext[2], txid, 12);
+
+  // Build Src field (18 bytes at offset 14): IPv4-mapped IPv6 address + port
+  // IPv4-mapped IPv6: ::ffff:a.b.c.d = 10 zero bytes + 0xff 0xff + 4 IPv4 bytes
+  memset(&plaintext[14], 0, 10);  // First 10 bytes are zero
+  plaintext[24] = 0xff;           // IPv4-mapped marker
+  plaintext[25] = 0xff;
+  // Parse sender_ip (IPv4) and add to Src
+  struct in_addr ipv4_addr;
+  inet_pton(AF_INET, sender_ip.c_str(), &ipv4_addr);
+  memcpy(&plaintext[26], &ipv4_addr.s_addr, 4);
+  // Port in big-endian (network byte order)
+  plaintext[30] = (sender_port >> 8) & 0xff;
+  plaintext[31] = sender_port & 0xff;
+
+  ESP_LOGD(TAG, "  PONG TxID: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+           txid[0], txid[1], txid[2], txid[3], txid[4], txid[5],
+           txid[6], txid[7], txid[8], txid[9], txid[10], txid[11]);
+  ESP_LOGD(TAG, "  PONG Src: %s:%u", sender_ip.c_str(), sender_port);
   log_hex_dump(PONG_LOG_TAG, "Plaintext payload", plaintext, sizeof(plaintext));
 
   // Encrypt using NaCl box (crypto_box_easy)
@@ -3796,7 +3853,7 @@ void TailscaleComponent::send_disco_pong_(const std::string& sender_ip, uint16_t
                  (const uint8_t*)our_pub_raw.data() + 32);
   // Nonce (24 bytes)
   message.insert(message.end(), nonce, nonce + 24);
-  // Encrypted payload (2 bytes plaintext + 16 bytes MAC = 18 bytes)
+  // Encrypted payload (32 bytes plaintext + 16 bytes MAC = 48 bytes)
   message.insert(message.end(), ciphertext, ciphertext + sizeof(ciphertext));
 
   log_hex_dump(PONG_LOG_TAG, "Final Disco PONG packet", message.data(), message.size());
@@ -4470,12 +4527,13 @@ bool TailscaleComponent::check_server_keepalive_() {
   // ESP32-C3 has only 320KB RAM: Control plane TLS (~70KB) + DERP TLS (~70KB) = ~140KB = OOM
   // The 1-second blocking window allows mbedTLS to free buffers before DERP connects.
   //
-  // Reduced timeout to 50ms for faster packet processing (was 1000ms)
-  // This allows DERP packets to be processed more frequently
+  // Reduced timeout to 5ms for low-latency packet processing (was 1000ms → 50ms → 5ms)
+  // This allows UDP packets to be processed more frequently
+  // Note: Memory warning in comments above - 0ms causes OOM during TLS overlap
   const char *response_ptr = nullptr;
   size_t response_size = 0;
 
-  if (this->ts2021_transport_->http2_read_next_message(response_ptr, response_size, 50)) {
+  if (this->ts2021_transport_->http2_read_next_message(response_ptr, response_size, 5)) {
     // Received a message from server!
     this->last_server_message_time_ = current_time;
 
