@@ -958,36 +958,50 @@ void TailscaleComponent::handle_connected_state_() {
   // 2. Next loop iteration → retry DERP → fails again
   // 3. Keepalives never execute because code stuck in DERP retry loop
 
-  bool skip_derp_for_keepalives = false;  // DERP enabled to bootstrap endpoint learning
+  // DERP connection control: Skip when prefer_direct_udp is enabled
+  // This avoids OOM when trying to run 2 TLS connections concurrently
+  bool skip_derp = this->prefer_direct_udp_;
   static bool logged_skip_derp = false;  // Only log once
+  static uint32_t derp_backoff_until = 0;  // Backoff timestamp for failed connections
+  static int derp_consecutive_failures = 0;  // Track consecutive failures
 
   // Debug: Log DERP state check
   static uint32_t last_derp_check_log = 0;
   if (now - last_derp_check_log > 10000) {  // Every 10 seconds
-    ESP_LOGD(TAG, "🔍 DERP check: skip=%d, client=%p, ready=%d, state=%d",
-             skip_derp_for_keepalives,
+    ESP_LOGD(TAG, "🔍 DERP check: skip=%d (prefer_direct_udp=%d), client=%p, ready=%d, state=%d, backoff=%d",
+             skip_derp,
+             this->prefer_direct_udp_,
              this->derp_client_.get(),
              this->derp_client_ ? this->derp_client_->is_ready() : -1,
-             this->derp_client_ ? (int)this->derp_client_->get_state() : -1);
+             this->derp_client_ ? (int)this->derp_client_->get_state() : -1,
+             now < derp_backoff_until ? (int)(derp_backoff_until - now) / 1000 : 0);
     last_derp_check_log = now;
   }
 
-  if (!skip_derp_for_keepalives) {
-    // OLD BEHAVIOR: Try DERP connection (will fail with OOM if control plane is alive)
+  if (!skip_derp) {
+    // DERP connection with exponential backoff for failures
     if (this->derp_client_) {
-      // Step 1: Initiate connection if disconnected
+      // Step 1: Initiate connection if disconnected and not in backoff
       if (this->derp_client_->get_state() == DerpState::DISCONNECTED) {
-        ESP_LOGI(TAG, "Connecting to DERP relay...");
-        if (this->derp_client_->connect()) {
-          ESP_LOGI(TAG, "✓ DERP connection initiated (handshake in progress)");
-        } else {
-          ESP_LOGW(TAG, "Failed to initiate DERP connection");
+        if (now >= derp_backoff_until) {
+          ESP_LOGI(TAG, "Connecting to DERP relay...");
+          if (this->derp_client_->connect()) {
+            ESP_LOGI(TAG, "✓ DERP connection initiated (handshake in progress)");
+            derp_consecutive_failures = 0;  // Reset on success
+          } else {
+            derp_consecutive_failures++;
+            // Exponential backoff: 5s, 10s, 20s, 30s max
+            uint32_t backoff_ms = std::min(5000U * (1U << std::min(derp_consecutive_failures - 1, 3)), 30000U);
+            derp_backoff_until = now + backoff_ms;
+            ESP_LOGW(TAG, "Failed to initiate DERP connection (attempt %d, backoff %ds)",
+                     derp_consecutive_failures, backoff_ms / 1000);
+          }
         }
       }
     }
   } else {
     if (!logged_skip_derp) {
-      ESP_LOGI(TAG, "KEEPALIVE MODE: Skipping DERP connection to avoid OOM - using direct LAN connectivity");
+      ESP_LOGI(TAG, "DIRECT UDP MODE: Skipping DERP relay (prefer_direct_udp enabled) - using direct LAN connectivity");
       logged_skip_derp = true;
     }
   }
@@ -998,7 +1012,7 @@ void TailscaleComponent::handle_connected_state_() {
   static uint32_t last_handshake_check = 0;
   if (now - last_handshake_check >= 60000) {  // Check every 60 seconds
     bool derp_ready = (this->derp_client_ && this->derp_client_->is_ready());
-    bool direct_mode = skip_derp_for_keepalives;
+    bool direct_mode = skip_derp;
 
     if (direct_mode || derp_ready) {
       for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
