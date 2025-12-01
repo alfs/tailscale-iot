@@ -13,6 +13,7 @@
 #include "hostinfo_builder.h"
 #include "derp_client.h"
 #include "wireguard_device_manager.h"
+#include "tailscale_netif.h"
 #include "led_status.h"
 #include <string>
 #include <vector>
@@ -227,11 +228,13 @@ class TailscaleComponent : public PollingComponent {
   TailscaleState state_{TailscaleState::IDLE};
   NodeConfig node_config_;
 
-  // Echo server
-  void setup_echo_server_();
-  void handle_echo_clients_();
-  int echo_server_socket_{-1};
-  std::vector<int> echo_client_sockets_;
+  // BSD Socket Echo Server on lwIP netif (port 7777)
+  // This tests that TCP packets flow correctly through the Tailscale netif
+  int netif_echo_socket_{-1};
+  std::vector<int> netif_echo_clients_;
+  void setup_netif_echo_server_();
+  void handle_netif_echo_clients_();
+
   std::string machine_key_;
   std::string node_key_public_;
   std::string node_key_private_;
@@ -334,6 +337,11 @@ class TailscaleComponent : public PollingComponent {
   std::unique_ptr<WireGuardDeviceManager> wg_device_manager_;
   // derp_initialized_ removed - now using static variable in handle_fetching_map_state_() for true persistence
 
+  // LWIP NETWORK INTERFACE: Virtual netif for transparent socket support
+  // Allows standard BSD sockets to work over Tailscale (web server, etc.)
+  std::unique_ptr<TailscaleNetif> tailscale_netif_;
+  void process_tx_queue_();  // Process lwIP TX queue (called from loop())
+
   // Dynamic WireGuard peer switching (LRU eviction)
   bool activate_peer_wireguard_(size_t peer_idx);
   void deactivate_peer_wireguard_(size_t peer_idx);
@@ -401,8 +409,6 @@ class TailscaleComponent : public PollingComponent {
   bool send_map_keepalive_();  // Send periodic keepalive map request with endpoints
   bool check_server_keepalive_();  // Check for incoming server keepalive messages
 
-  // TCP Echo Service (port 7777)
-  static const uint16_t TCP_ECHO_PORT = 7777;
   static const size_t MAX_TCP_CONNECTIONS = 4;
   std::vector<TcpConnection> tcp_connections_;
   std::map<uint16_t, TailscaleSocket*> bound_sockets_;  // port -> socket mapping

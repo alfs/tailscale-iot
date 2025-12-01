@@ -2,7 +2,6 @@
 #include "derp_client.h"
 #include "crypto_box_simple.h"
 #include "local_server_cert.h"
-#include "echo_socket.h"
 #include "http_server.h"
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
@@ -45,6 +44,10 @@ namespace esphome {
 namespace tailscale {
 
 static const char *const TAG = "tailscale";
+
+// Track last received packet source for opportunistic endpoint updates during handshake
+static std::string g_last_rx_endpoint;
+static uint16_t g_last_rx_port = 0;
 
 // STUN protocol constants (RFC 5389)
 static const uint32_t STUN_MAGIC_COOKIE = 0x2112A442;
@@ -184,22 +187,6 @@ void TailscaleComponent::setup() {
   ESP_LOGD(TAG, "Machine key (first 16 chars): %s", this->machine_key_.substr(0, 16).c_str());
   ESP_LOGD(TAG, "Node public key (first 16 chars): %s", this->node_key_public_.substr(0, 16).c_str());
 
-  // Setup TCP echo server on port 7777
-  static EchoSocket echo_socket;
-  if (this->bind_socket(TCP_ECHO_PORT, &echo_socket)) {
-    ESP_LOGI(TAG, "Echo server bound to port %u", TCP_ECHO_PORT);
-  } else {
-    ESP_LOGW(TAG, "Failed to bind echo server to port %u", TCP_ECHO_PORT);
-  }
-
-  // Setup second echo server on port 8888 (test multiple sockets)
-  static EchoSocket echo_socket2;
-  if (this->bind_socket(8888, &echo_socket2)) {
-    ESP_LOGI(TAG, "Echo server 2 bound to port 8888");
-  } else {
-    ESP_LOGW(TAG, "Failed to bind echo server 2 to port 8888");
-  }
-
   // Setup HTTP server on port 8080
   static HTTPServerSocket http_server;
   http_server.set_tailscale_component(this);
@@ -216,6 +203,9 @@ void TailscaleComponent::setup() {
 }
 
 void TailscaleComponent::loop() {
+  // Prevent watchdog timeout during heavy processing
+  App.feed_wdt();
+
   // Update LED blink timing
   this->led_status_.update();
 
@@ -243,6 +233,11 @@ void TailscaleComponent::loop() {
   if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
     this->process_buffered_wg_packets_();
   }
+
+  // CRITICAL: Process lwIP TX queue on EVERY loop iteration
+  // Packets queued by lwIP's TCP/IP stack (via netif_output_fn) are sent via WireGuard.
+  // This enables standard BSD sockets to work transparently over Tailscale.
+  this->process_tx_queue_();
 
   // Periodic WireGuard statistics logging (every 30 seconds)
   static uint32_t last_wg_stats_log = 0;
@@ -574,6 +569,22 @@ void TailscaleComponent::handle_fetching_map_state_() {
 
         PeerSession& peer_session = this->peer_sessions_[session_idx];
 
+        // OPPORTUNISTIC ENDPOINT UPDATE (Handshake Response Optimization)
+        // If this is a Handshake Response (Type 2) and we have a recent valid incoming packet source,
+        // update the peer endpoint immediately. This fixes the "No route" race condition where
+        // we haven't processed a Disco packet yet but need to reply to the handshake.
+        if (len > 0 && packet[0] == 0x02 && !g_last_rx_endpoint.empty() && g_last_rx_port > 0) {
+           if (peer_session.endpoint != g_last_rx_endpoint || peer_session.endpoint_port != g_last_rx_port) {
+              ESP_LOGI(TAG, "🔄 Updating peer endpoint from handshake source: %s:%u -> %s:%u", 
+                       peer_session.endpoint.c_str(), peer_session.endpoint_port,
+                       g_last_rx_endpoint.c_str(), g_last_rx_port);
+              peer_session.endpoint = g_last_rx_endpoint;
+              peer_session.endpoint_port = g_last_rx_port;
+              // We implicitly trust the source of a handshake initiation we just processed
+              peer_session.direct_path_confirmed = true; 
+           }
+        }
+
         // DYNAMIC SWITCHING: Ensure peer has active WireGuard session
         if (this->wg_device_manager_->get_peer(peer_session.tailscale_ip) == nullptr) {
           ESP_LOGI(TAG, "Peer[%zu] %s not active, activating on-demand...", session_idx, peer_session.hostname.c_str());
@@ -666,116 +677,43 @@ void TailscaleComponent::handle_fetching_map_state_() {
                    session_idx, peer_session.hostname.c_str(), len);
         }
 
-        // Validate minimum IP header size
-        if (len < 20) {
-          ESP_LOGW(TAG, "Packet too small for IP header");
-          return;
-        }
+        // ═══════════════════════════════════════════════════════════════════════════
+        // INJECT DECRYPTED IP PACKET INTO LWIP
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Pass raw IP packet to lwIP for protocol handling (TCP, UDP, ICMP, etc.)
+        // lwIP's TCP/IP stack handles all protocol processing via standard sockets.
+        // ═══════════════════════════════════════════════════════════════════════════
 
-        // Extract IP header fields
-        uint8_t ip_version = (ip_packet[0] >> 4) & 0x0F;
-        uint8_t ip_ihl = (ip_packet[0] & 0x0F) * 4;  // IHL in bytes
-        uint8_t ip_protocol = ip_packet[9];
+        // DEBUG: Log decrypted packet details with ports
+        if (len >= 20) {
+          uint8_t ip_proto = ip_packet[9];
+          uint8_t ihl = (ip_packet[0] & 0x0F) * 4;  // IP header length
+          uint32_t src_ip = (ip_packet[12] << 24) | (ip_packet[13] << 16) | (ip_packet[14] << 8) | ip_packet[15];
+          uint32_t dst_ip = (ip_packet[16] << 24) | (ip_packet[17] << 16) | (ip_packet[18] << 8) | ip_packet[19];
+          const char* proto_name = (ip_proto == 1) ? "ICMP" :
+                                   (ip_proto == 6) ? "TCP" :
+                                   (ip_proto == 17) ? "UDP" : "OTHER";
 
-        // Verify IPv4
-        if (ip_version != 4) {
-          ESP_LOGD(TAG, "Not IPv4 (version=%d), ignoring", ip_version);
-          return;
-        }
-
-        // Handle ICMP (protocol 1) or TCP (protocol 6)
-        if (ip_protocol == 6) {
-          // TCP handling
-          this->handle_tcp_packet_(ip_packet, len);
-          return;
-        } else if (ip_protocol != 1) {
-          // Not ICMP or TCP - unsupported
-          ESP_LOGD(TAG, "Unsupported protocol=%d, ignoring", ip_protocol);
-          return;
-        }
-
-        // ICMP handling - validate header size
-        if (len < ip_ihl + 8) {
-          ESP_LOGW(TAG, "Packet too small for ICMP header");
-          return;
-        }
-
-        // Extract ICMP header
-        const uint8_t* icmp_header = ip_packet + ip_ihl;
-        uint8_t icmp_type = icmp_header[0];
-        uint8_t icmp_code = icmp_header[1];
-
-        // Extract ICMP identifier and sequence number (both big-endian uint16_t)
-        uint16_t icmp_id = (icmp_header[4] << 8) | icmp_header[5];
-        uint16_t icmp_seq = (icmp_header[6] << 8) | icmp_header[7];
-
-        ESP_LOGD(TAG, "   ✓ ICMP packet: type=%d code=%d id=%u seq=%u", icmp_type, icmp_code, icmp_id, icmp_seq);
-
-        // Handle ICMP Echo Request (type 8)
-        if (icmp_type == 8 && icmp_code == 0) {
-          ESP_LOGD(TAG, "   → Received ICMP Echo Request (seq=%u), sending Echo Reply...", icmp_seq);
-
-          // Build ICMP Echo Reply packet
-          uint8_t reply[1500];  // Max MTU
-          size_t reply_len = len;
-
-          if (reply_len > sizeof(reply)) {
-            ESP_LOGW(TAG, "Packet too large to reply (%zu > %zu)", reply_len, sizeof(reply));
-            return;
-          }
-
-          // Copy original packet
-          memcpy(reply, ip_packet, len);
-
-          // Swap IP addresses (source ← → destination)
-          uint32_t temp_ip;
-          memcpy(&temp_ip, &reply[12], 4);  // Save source IP
-          memcpy(&reply[12], &reply[16], 4);  // Dest → Source
-          memcpy(&reply[16], &temp_ip, 4);  // Source → Dest
-
-          // Update IP header checksum (zero it first for calculation)
-          reply[10] = 0;
-          reply[11] = 0;
-          uint16_t ip_checksum = 0;
-          for (size_t i = 0; i < ip_ihl; i += 2) {
-            uint16_t word = (reply[i] << 8) | reply[i + 1];
-            uint32_t sum = ip_checksum + word;
-            ip_checksum = (sum & 0xFFFF) + (sum >> 16);
-          }
-          ip_checksum = ~ip_checksum;
-          reply[10] = ip_checksum >> 8;
-          reply[11] = ip_checksum & 0xFF;
-
-          // Change ICMP type to Echo Reply (0)
-          reply[ip_ihl] = 0;
-
-          // Recalculate ICMP checksum
-          reply[ip_ihl + 2] = 0;  // Zero checksum field
-          reply[ip_ihl + 3] = 0;
-          size_t icmp_len = len - ip_ihl;
-          uint16_t icmp_checksum = 0;
-          for (size_t i = 0; i < icmp_len; i += 2) {
-            uint16_t word;
-            if (i + 1 < icmp_len) {
-              word = (reply[ip_ihl + i] << 8) | reply[ip_ihl + i + 1];
-            } else {
-              word = reply[ip_ihl + i] << 8;  // Last odd byte
-            }
-            uint32_t sum = icmp_checksum + word;
-            icmp_checksum = (sum & 0xFFFF) + (sum >> 16);
-          }
-          icmp_checksum = ~icmp_checksum;
-          reply[ip_ihl + 2] = icmp_checksum >> 8;
-          reply[ip_ihl + 3] = icmp_checksum & 0xFF;
-
-          // Send reply via WireGuard device manager
-          if (this->wg_device_manager_->send_ip_packet(peer_tailscale_ip, reply, reply_len)) {
-            ESP_LOGD(TAG, "   ✓ Sent ICMP Echo Reply to Peer[%zu] %s (seq=%u, %zu bytes)",
-                     session_idx, peer_session.hostname.c_str(), icmp_seq, reply_len);
+          // For TCP/UDP, extract ports
+          if ((ip_proto == 6 || ip_proto == 17) && len >= (size_t)(ihl + 4)) {
+            uint16_t src_port = (ip_packet[ihl] << 8) | ip_packet[ihl + 1];
+            uint16_t dst_port = (ip_packet[ihl + 2] << 8) | ip_packet[ihl + 3];
+            ESP_LOGW(TAG, "🔓 DECRYPT: %zu bytes, %s %d.%d.%d.%d:%u -> %d.%d.%d.%d:%u",
+                     len, proto_name,
+                     (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF, src_port,
+                     (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF, dst_port);
           } else {
-            ESP_LOGW(TAG, "   ✗ Failed to send ICMP Echo Reply to Peer[%zu] (seq=%u)",
-                     session_idx, icmp_seq);
+            ESP_LOGI(TAG, "🔓 DECRYPT CALLBACK: %zu bytes, proto=%s(%d) from %s",
+                     len, proto_name, ip_proto, peer_tailscale_ip.c_str());
           }
+        }
+
+        if (this->tailscale_netif_ && this->tailscale_netif_->is_running()) {
+          ESP_LOGI(TAG, "→ Injecting into lwIP netif...");
+          this->tailscale_netif_->receive(ip_packet, len);
+          ESP_LOGI(TAG, "✓ Packet injected into lwIP");
+        } else {
+          ESP_LOGW(TAG, "Tailscale netif not running, dropping packet (%zu bytes)", len);
         }
       });
 
@@ -890,6 +828,30 @@ void TailscaleComponent::handle_fetching_map_state_() {
     ESP_LOGW(TAG, "STUN query failed - using only local endpoints");
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // LWIP NETWORK INTERFACE INITIALIZATION
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // Initialize virtual network interface for transparent BSD socket support.
+  // This allows standard sockets (web server, etc.) to work over Tailscale.
+  // ═══════════════════════════════════════════════════════════════════════════════════
+  // Initialize netif only once (persists across control plane reconnections)
+  if (!this->tailscale_netif_ && !this->node_config_.ipv4_address.empty()) {
+    ESP_LOGI(TAG, "→ Initializing Tailscale lwIP netif on %s...", this->node_config_.ipv4_address.c_str());
+
+    this->tailscale_netif_ = std::make_unique<TailscaleNetif>();
+    if (this->tailscale_netif_->init(this->node_config_.ipv4_address)) {
+      ESP_LOGI(TAG, "✓ Tailscale netif started (MTU=%u, TX pool=%zu)",
+               TailscaleNetif::TAILSCALE_MTU, TailscaleNetif::TX_POOL_SIZE);
+    } else {
+      ESP_LOGE(TAG, "✗ Failed to initialize Tailscale netif");
+      this->tailscale_netif_.reset();
+    }
+  } else if (this->tailscale_netif_) {
+    ESP_LOGD(TAG, "Tailscale netif already initialized, preserving across reconnection");
+  } else {
+    ESP_LOGW(TAG, "✗ No IPv4 address assigned - skipping netif initialization");
+  }
+
   this->transition_to(TailscaleState::CONNECTED);
   this->retry_count_ = 0;
 }
@@ -905,10 +867,13 @@ void TailscaleComponent::handle_connected_state_() {
 
   // Disco timeout check moved to update() loop so it runs regardless of state
 
-  // Start echo server on first entry to CONNECTED state
-  if (this->echo_server_socket_ == -1) {
-    this->setup_echo_server_();
+  // Start netif echo server on first entry to CONNECTED state
+  if (this->netif_echo_socket_ == -1 && !this->node_config_.ipv4_address.empty()) {
+    this->setup_netif_echo_server_();
   }
+
+  // Handle netif echo clients (runs every loop)
+  this->handle_netif_echo_clients_();
 
   // === PERSISTENT STREAMING CONNECTION MANAGEMENT ===
   // The official Tailscale protocol uses a persistent HTTP/2 stream where:
@@ -1252,108 +1217,112 @@ void TailscaleComponent::handle_connected_state_() {
     }
   }
 
-  // Handle echo server clients
-  this->handle_echo_clients_();
-
   // Maintain connection, handle keepalives
   // This is handled by periodic update() calls
 }
 
-void TailscaleComponent::setup_echo_server_() {
-  ESP_LOGI(TAG, "→ Starting echo server on port 7777...");
+// configure_wireguard_() removed - DERP-only mode (esp_wireguard incompatible with esp_netif)
 
-  this->echo_server_socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (this->echo_server_socket_ < 0) {
-    ESP_LOGE(TAG, "Failed to create echo server socket: errno %d", errno);
+void TailscaleComponent::setup_netif_echo_server_() {
+  // Create a standard BSD socket TCP echo server bound to the Tailscale IP.
+  // This tests that TCP packets correctly flow through our lwIP netif.
+  ESP_LOGI(TAG, "→ Starting netif echo server on %s:7777...",
+           this->node_config_.ipv4_address.c_str());
+
+  this->netif_echo_socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (this->netif_echo_socket_ < 0) {
+    ESP_LOGE(TAG, "Failed to create netif echo socket: errno %d", errno);
     return;
   }
 
   // Set socket to non-blocking
-  int flags = fcntl(this->echo_server_socket_, F_GETFL, 0);
-  fcntl(this->echo_server_socket_, F_SETFL, flags | O_NONBLOCK);
+  int flags = fcntl(this->netif_echo_socket_, F_GETFL, 0);
+  fcntl(this->netif_echo_socket_, F_SETFL, flags | O_NONBLOCK);
 
   // Allow address reuse
   int opt = 1;
-  setsockopt(this->echo_server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(this->netif_echo_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(this->netif_echo_socket_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
-  // Bind to all interfaces on port 7777
+  // Bind to the specific Tailscale IP
   struct sockaddr_in server_addr{};
   server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(7777);
+  server_addr.sin_port = htons(6666); // Accept connections on any interface
 
-  if (bind(this->echo_server_socket_, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-    ESP_LOGE(TAG, "Failed to bind echo server socket: errno %d", errno);
-    close(this->echo_server_socket_);
-    this->echo_server_socket_ = -1;
+  if (bind(this->netif_echo_socket_, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    ESP_LOGE(TAG, "Failed to bind netif echo socket to %s:6666: errno %d",
+             this->node_config_.ipv4_address.c_str(), errno);
+    close(this->netif_echo_socket_);
+    this->netif_echo_socket_ = -1;
     return;
   }
 
-  if (listen(this->echo_server_socket_, 3) < 0) {
-    ESP_LOGE(TAG, "Failed to listen on echo server socket: errno %d", errno);
-    close(this->echo_server_socket_);
-    this->echo_server_socket_ = -1;
+  if (listen(this->netif_echo_socket_, 10) < 0) {
+    ESP_LOGE(TAG, "Failed to listen on netif echo socket: errno %d", errno);
+    close(this->netif_echo_socket_);
+    this->netif_echo_socket_ = -1;
     return;
   }
 
-  ESP_LOGI(TAG, "✓ Echo server ready");
-  ESP_LOGI(TAG, "  Connect with: nc %s 7777", this->node_config_.ipv4_address.c_str());
+  ESP_LOGI(TAG, "✓ Netif echo server ready on %s:6666",
+           this->node_config_.ipv4_address.c_str());
+  ESP_LOGI(TAG, "  Test with: nc %s 6666", this->node_config_.ipv4_address.c_str());
 }
 
-void TailscaleComponent::handle_echo_clients_() {
-  if (this->echo_server_socket_ < 0) {
+void TailscaleComponent::handle_netif_echo_clients_() {
+  if (this->netif_echo_socket_ < 0) {
     return;
   }
 
   // Accept new clients
   struct sockaddr_in client_addr{};
   socklen_t client_len = sizeof(client_addr);
-  int client_sock = accept(this->echo_server_socket_, (struct sockaddr *)&client_addr, &client_len);
+  int client_sock = accept(this->netif_echo_socket_,
+                           (struct sockaddr *)&client_addr, &client_len);
 
   if (client_sock >= 0) {
     // Set client socket to non-blocking
     int flags = fcntl(client_sock, F_GETFL, 0);
     fcntl(client_sock, F_SETFL, flags | O_NONBLOCK);
 
-    this->echo_client_sockets_.push_back(client_sock);
-    ESP_LOGI(TAG, "New echo client connected from %s:%d (total clients: %zu)",
+    this->netif_echo_clients_.push_back(client_sock);
+    ESP_LOGI(TAG, "Netif echo: client connected from %s:%d (total: %zu)",
              inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
-             this->echo_client_sockets_.size());
+             this->netif_echo_clients_.size());
   }
 
   // Handle existing clients
   static char buffer[256];
-  auto it = this->echo_client_sockets_.begin();
-  while (it != this->echo_client_sockets_.end()) {
-    int client_sock = *it;
-    ssize_t len = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
+  auto it = this->netif_echo_clients_.begin();
+  while (it != this->netif_echo_clients_.end()) {
+    int sock = *it;
+    ssize_t len = recv(sock, buffer, sizeof(buffer) - 1, 0);
 
     if (len > 0) {
       buffer[len] = '\0';
-      ESP_LOGD(TAG, "Echo: received %d bytes: %s", (int)len, buffer);
+      ESP_LOGI(TAG, "Netif echo RX: %d bytes: %s", (int)len, buffer);
 
       // Echo back
-      ssize_t sent = send(client_sock, buffer, len, 0);
+      ssize_t sent = send(sock, buffer, len, 0);
       if (sent < 0) {
-        ESP_LOGW(TAG, "Failed to send echo response: errno %d", errno);
-        close(client_sock);
-        it = this->echo_client_sockets_.erase(it);
+        ESP_LOGW(TAG, "Netif echo TX failed: errno %d", errno);
+        close(sock);
+        it = this->netif_echo_clients_.erase(it);
         continue;
       }
+      ESP_LOGI(TAG, "Netif echo TX: %d bytes echoed", (int)sent);
     } else if (len == 0 || (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
       // Client disconnected or error
-      ESP_LOGI(TAG, "Echo client disconnected (remaining: %zu)", this->echo_client_sockets_.size() - 1);
-      close(client_sock);
-      it = this->echo_client_sockets_.erase(it);
+      ESP_LOGI(TAG, "Netif echo: client disconnected (remaining: %zu)",
+               this->netif_echo_clients_.size() - 1);
+      close(sock);
+      it = this->netif_echo_clients_.erase(it);
       continue;
     }
 
     ++it;
   }
 }
-
-// configure_wireguard_() removed - DERP-only mode (esp_wireguard incompatible with esp_netif)
-
 
 bool TailscaleComponent::generate_node_keys_() {
   // Try to load existing keys from NVS first
@@ -2987,10 +2956,17 @@ void TailscaleComponent::discover_nat_port_for_peer_(const std::string& peer_ip,
 // PACKET ROUTING AND DEMULTIPLEXING
 // ========================================
 // This function inspects incoming packet magic bytes and routes to appropriate handler:
-// - Disco: TS💬 (0x54 0x53 0xf0 0x9f 0x92 0xac)
-// - STUN: byte[0] == 0x00 || byte[0] == 0x01
-// - WireGuard: byte[0] in range 1-4 (message types)
+// Packet classification (priority order):
+// - Disco: 6-byte magic "TS💬" (0x54 0x53 0xf0 0x9f 0x92 0xac)
+// - STUN: byte[0] == 0x00/0x01 AND Magic Cookie 0x2112A442 at offset 4-7
+// - WireGuard: byte[0] in 0x01-0x04, reserved bytes[1-3] == 0x00, valid length
 void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct sockaddr_in* src) {
+  // Track incoming endpoint for opportunistic updates
+  char src_ip_buf[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &src->sin_addr, src_ip_buf, sizeof(src_ip_buf));
+  g_last_rx_endpoint = src_ip_buf;
+  g_last_rx_port = ntohs(src->sin_port);
+
   if (len < 1) {
     ESP_LOGD(TAG, "⚠️ Received empty packet, ignoring");
     return;
@@ -3005,42 +2981,112 @@ void TailscaleComponent::route_incoming_packet_(uint8_t* buf, size_t len, struct
     return;
   }
 
-  // Check for STUN magic: first byte is 0x00 or 0x01
+  // Check for STUN: first byte 0x00 or 0x01, AND Magic Cookie 0x2112A442 at offset 4
+  // This differentiates from WireGuard Handshake Init (type 0x01) which has sender_index at offset 4
   if (len >= 20 && (buf[0] == 0x00 || buf[0] == 0x01)) {
-    ESP_LOGD(TAG, "🔍 Routing to STUN handler (magic: 0x%02x)", buf[0]);
-    this->handle_stun_packet_(buf, len, src);
-    return;
+    // Check for STUN Magic Cookie (big-endian: 0x21 0x12 0xA4 0x42)
+    if (buf[4] == 0x21 && buf[5] == 0x12 && buf[6] == 0xA4 && buf[7] == 0x42) {
+      ESP_LOGD(TAG, "🔍 Routing to STUN handler (magic cookie verified)");
+      this->handle_stun_packet_(buf, len, src);
+      return;
+    }
+    // Not STUN - fall through to WireGuard check
   }
 
   // Check for WireGuard packets: first byte is 0x01-0x04 (message types)
-  if (buf[0] >= 0x01 && buf[0] <= 0x04) {
-    char src_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
-    uint16_t src_port = ntohs(src->sin_port);
-    ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u",
-             buf[0], len, src_ip, src_port);
-    // Blue blink for WireGuard control (handshake types 1-3), orange for data (type 4)
-    if (buf[0] <= 0x03) {
-      this->led_status_.blink(BlinkType::CONTROL);
-    } else {
-      this->led_status_.blink(BlinkType::DATA);
+  // Additional validation: reserved bytes at offset 1-3 must be 0x00
+  // WireGuard packet sizes:
+  //   Type 1 (Handshake Init): 148 bytes
+  //   Type 2 (Handshake Response): 92 bytes
+  //   Type 3 (Cookie Reply): 64 bytes
+  //   Type 4 (Transport Data): >= 32 bytes
+  if (buf[0] >= 0x01 && buf[0] <= 0x04 && len >= 4) {
+    // Verify reserved bytes are zero (strong WireGuard indicator)
+    bool reserved_ok = (buf[1] == 0x00 && buf[2] == 0x00 && buf[3] == 0x00);
+
+    // Validate length for each message type
+    bool length_ok = false;
+    switch (buf[0]) {
+      case 0x01: length_ok = (len == 148); break;  // Handshake Init: exactly 148
+      case 0x02: length_ok = (len == 92);  break;  // Handshake Response: exactly 92
+      case 0x03: length_ok = (len == 64);  break;  // Cookie Reply: exactly 64
+      case 0x04: length_ok = (len >= 32);  break;  // Transport Data: at least 32
     }
 
-    // Route packet to WireGuard device manager (it handles peer routing internally via receiver_index)
-    if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
-      if (this->wg_device_manager_->receive_wg_packet(buf, len)) {
-        ESP_LOGD(TAG, "✓ WireGuard packet processed by device manager");
-      } else {
-        if (this->peer_sessions_.empty()) {
-          ESP_LOGW(TAG, "⚠️  WireGuard packet received but no peer sessions active");
-        } else {
-          ESP_LOGW(TAG, "✗ WireGuard packet could not be processed by device manager");
-        }
-      }
+    if (!reserved_ok || !length_ok) {
+      // Log mismatch but don't route - could be random packet
+      char src_ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+      ESP_LOGW(TAG, "⚠️ Packet starts with WG type 0x%02x but validation failed: "
+               "reserved=%s, len=%zu (expected=%s) from %s:%u",
+               buf[0], reserved_ok ? "ok" : "bad", len,
+               buf[0]==1 ? "148" : buf[0]==2 ? "92" : buf[0]==3 ? "64" : ">=32",
+               src_ip, ntohs(src->sin_port));
+      // Fall through to unknown handler
     } else {
-      ESP_LOGW(TAG, "✗ WireGuard device manager not initialized");
+      char src_ip[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, &src->sin_addr, src_ip, sizeof(src_ip));
+      uint16_t src_port = ntohs(src->sin_port);
+      // Use INFO level for transport data (type=4) to ensure visibility
+      if (buf[0] == 0x04) {
+        ESP_LOGI(TAG, "🔐 WG TRANSPORT DATA (type=0x04, %zu bytes) from %s:%u", len, src_ip, src_port);
+      } else {
+        ESP_LOGD(TAG, "🔐 Routing WireGuard packet (type=0x%02x, %zu bytes) from %s:%u",
+                 buf[0], len, src_ip, src_port);
+      }
+      // Blue blink for WireGuard control (handshake types 1-3), orange for data (type 4)
+      if (buf[0] <= 0x03) {
+        this->led_status_.blink(BlinkType::CONTROL);
+      } else {
+        this->led_status_.blink(BlinkType::DATA);
+      }
+
+      // Route packet to WireGuard device manager (it handles peer routing internally via receiver_index)
+      if (this->wg_device_manager_ && this->wg_device_manager_->is_initialized()) {
+        if (this->wg_device_manager_->receive_wg_packet(buf, len)) {
+          ESP_LOGD(TAG, "✓ WireGuard packet processed by device manager");
+        } else {
+          if (this->peer_sessions_.empty()) {
+            ESP_LOGW(TAG, "⚠️  WireGuard packet received but no peer sessions active");
+          } else {
+            // STALE CONNECTION RECOVERY:
+            // If this is a Transport Data packet (type 4) and processing failed (likely unknown receiver_index),
+            // it means the peer thinks it has a valid session but we don't (e.g. after ESP reboot).
+            // We should initiate a new handshake with the peer associated with this source address.
+            if (buf[0] == 0x04) { // Check if it's a WireGuard TRANSPORT_DATA packet
+              char src_ip_str[INET_ADDRSTRLEN];
+              inet_ntop(AF_INET, &src->sin_addr, src_ip_str, sizeof(src_ip_str));
+              std::string src_endpoint = std::string(src_ip_str) + ":" + std::to_string(ntohs(src->sin_port));
+
+              ESP_LOGW(TAG, "🔄 Stale connection suspected from %s - checking known peers for handshake recovery...", src_endpoint.c_str());
+
+              for (size_t i = 0; i < this->peer_sessions_.size(); i++) {
+                // Match by endpoint (IP:Port)
+                if (this->peer_sessions_[i].endpoint == src_endpoint) {
+                  ESP_LOGI(TAG, "🎯 Found matching peer %s (%s) - initiating HANDSHAKE RECOVERY",
+                           this->peer_sessions_[i].hostname.c_str(),
+                           this->peer_sessions_[i].tailscale_ip.c_str());
+
+                  // Force handshake initiation
+                  if (this->wg_device_manager_->start_peer_handshake(this->peer_sessions_[i].tailscale_ip)) {
+                    ESP_LOGI(TAG, "✓ Handshake recovery initiated for %s", this->peer_sessions_[i].hostname.c_str());
+                  } else {
+                    ESP_LOGE(TAG, "✗ Failed to initiate handshake recovery for %s", this->peer_sessions_[i].hostname.c_str());
+                  }
+                  return; // Only try to recover once for this packet
+                }
+              }
+              ESP_LOGW(TAG, "✗ No matching peer found for stale connection from %s", src_endpoint.c_str());
+            }
+            ESP_LOGW(TAG, "✗ WireGuard packet could not be processed by device manager");
+          }
+        }
+      } else {
+        ESP_LOGW(TAG, "✗ WireGuard device manager not initialized");
+      }
+      return;
     }
-    return;
+    // Validation failed - fall through to unknown packet handler
   }
 
   // NOTE: WireGuard packets are now routed through unified socket (updated 2025-11-12).
@@ -3391,14 +3437,76 @@ void TailscaleComponent::handle_stun_packet_(uint8_t* buf, size_t len, struct so
     return;
   }
 
-  // Parse STUN response header
+  // Parse STUN header
   uint16_t msg_type = (buf[0] << 8) | buf[1];
   uint16_t msg_len = (buf[2] << 8) | buf[3];
+  uint32_t magic_cookie = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
 
-  ESP_LOGD(TAG, "  Type: 0x%04x, Length: %u bytes", msg_type, msg_len);
+  ESP_LOGD(TAG, "  Type: 0x%04x, Length: %u bytes, Magic: 0x%08x", msg_type, msg_len, magic_cookie);
 
+  // Handle STUN Binding Request (Peer connectivity check)
+  if (msg_type == STUN_BINDING_REQUEST) {
+    ESP_LOGI(TAG, "  → Received STUN Binding Request from %s:%u, sending response...", src_ip, src_port);
+
+    uint8_t response[32]; // Sufficient for header (20) + XOR-MAPPED-ADDRESS (12)
+    
+    // 1. STUN Header (20 bytes)
+    // Type: Binding Response (0x0101)
+    response[0] = (STUN_BINDING_RESPONSE >> 8) & 0xFF;
+    response[1] = STUN_BINDING_RESPONSE & 0xFF;
+    
+    // Length: 12 bytes (one attribute) - XOR-MAPPED-ADDRESS attribute length
+    response[2] = 0x00;
+    response[3] = 0x0C; 
+    
+    // Magic Cookie (copy from request)
+    memcpy(&response[4], &buf[4], 4); // Original magic cookie
+    
+    // Transaction ID (copy from request)
+    memcpy(&response[8], &buf[8], 12);
+    
+    // 2. XOR-MAPPED-ADDRESS Attribute (12 bytes)
+    // Type: 0x0020
+    response[20] = (STUN_ATTR_XOR_MAPPED_ADDRESS >> 8) & 0xFF;
+    response[21] = STUN_ATTR_XOR_MAPPED_ADDRESS & 0xFF;
+    
+    // Length: 8 bytes
+    response[22] = 0x00;
+    response[23] = 0x08;
+    
+    // Reserved (1 byte), Family (1 byte, 0x01 = IPv4)
+    response[24] = 0x00;
+    response[25] = 0x01; // IPv4
+    
+    // X-Port (2 bytes): Port ^ (Magic Cookie >> 16)
+    uint16_t x_port = src_port ^ (uint16_t)(magic_cookie >> 16);
+    response[26] = (x_port >> 8) & 0xFF;
+    response[27] = x_port & 0xFF;
+    
+    // X-Address (4 bytes): Address ^ Magic Cookie
+    // src->sin_addr.s_addr is in network byte order. magic_cookie is in host byte order.
+    // Convert magic_cookie to network byte order for XORing with sin_addr.s_addr.
+    uint32_t x_addr = src->sin_addr.s_addr ^ htonl(magic_cookie);
+    
+    response[28] = (x_addr >> 24) & 0xFF;
+    response[29] = (x_addr >> 16) & 0xFF;
+    response[30] = (x_addr >> 8) & 0xFF;
+    response[31] = x_addr & 0xFF;
+    
+    // Send response
+    if (this->unified_socket_ >= 0) {
+      sendto(this->unified_socket_, response, sizeof(response), 0, (struct sockaddr*)src, sizeof(*src));
+      ESP_LOGI(TAG, "  ✓ Sent STUN Binding Response to %s:%u (X-Addr: %d.%d.%d.%d:%u)",
+               src_ip, src_port,
+               (x_addr >> 24) & 0xFF, (x_addr >> 16) & 0xFF, (x_addr >> 8) & 0xFF, x_addr & 0xFF,
+               x_port);
+    }
+    return;
+  }
+
+  // Handle STUN Binding Response (Endpoint Discovery)
   if (msg_type != STUN_BINDING_RESPONSE) {
-    ESP_LOGW(TAG, "  Unexpected STUN message type: 0x%04x (expected 0x0101)", msg_type);
+    ESP_LOGW(TAG, "  Unexpected STUN message type: 0x%04x (expected 0x0101 or 0x0001)", msg_type);
     return;
   }
 
@@ -5517,6 +5625,45 @@ TailscaleSocket* TailscaleComponent::find_socket_(uint16_t port) {
     return it->second;
   }
   return nullptr;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// LWIP TX QUEUE PROCESSING
+// ═══════════════════════════════════════════════════════════════════════════════════
+// Process outgoing packets from lwIP's TCP/IP stack.
+// Called from loop() to drain packets queued by netif_output_fn.
+// Each packet is sent via WireGuard to the appropriate peer.
+// ═══════════════════════════════════════════════════════════════════════════════════
+void TailscaleComponent::process_tx_queue_() {
+  if (!this->tailscale_netif_ || !this->wg_device_manager_) {
+    return; // Netif or WG Manager not initialized
+  }
+
+  // Use a local buffer to retrieve the packet from TailscaleNetif
+  // static buffer to avoid stack overflow for large packets on repeated calls
+  static uint8_t packet_buffer[TailscaleNetif::MAX_PACKET_SIZE];
+  size_t len;
+  uint32_t dst_ip_u32; // This is the uint32_t destination IP
+
+  // Loop to process all available packets in the netif's pending TX queue
+  while (this->tailscale_netif_->get_pending_tx(packet_buffer, &len, &dst_ip_u32)) {
+    // Convert uint32_t IP to string (e.g., "100.64.0.17") for send_ip_packet
+    char ip_str[16]; // Max length for IPv4 is "255.255.255.255" + null
+    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+             (dst_ip_u32 >> 0) & 0xFF, (dst_ip_u32 >> 8) & 0xFF, (dst_ip_u32 >> 16) & 0xFF, (dst_ip_u32 >> 24) & 0xFF);
+    std::string peer_tailscale_ip(ip_str); // String version for send_ip_packet
+
+    ESP_LOGE(TAG, "process_tx_queue_: retrieved from netif: len=%zu to %s",
+             len, peer_tailscale_ip.c_str());
+
+    // Now, send via WireGuard manager's send_ip_packet
+    bool sent_ok = this->wg_device_manager_->send_ip_packet(peer_tailscale_ip, packet_buffer, len);
+    if (sent_ok) {
+      ESP_LOGD(TAG, "📤 lwIP TX: %zu bytes to %s", len, peer_tailscale_ip.c_str());
+    } else {
+      ESP_LOGE(TAG, "process_tx_queue_: wg_device_manager_->send_ip_packet FAILED for len=%zu", len);
+    }
+  }
 }
 
 }  // namespace tailscale

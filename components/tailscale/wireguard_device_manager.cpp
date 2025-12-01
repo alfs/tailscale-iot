@@ -327,12 +327,12 @@ bool WireGuardDeviceManager::send_peer_keepalive(const std::string& peer_tailsca
 // ============================================================================
 
 bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, size_t len) {
+  ESP_LOGI(TAG, "handle_handshake_initiation_ called, len=%zu", len); // New log
   if (len != HANDSHAKE_INIT_SIZE) {
-    ESP_LOGE(TAG, "Invalid handshake initiation size: %d", len);
+    ESP_LOGE(TAG, "Invalid handshake initiation size: %d, expected %zu", len, HANDSHAKE_INIT_SIZE); // More detail
     return false;
   }
 
-  // Handshake initiation doesn't contain peer identification, so library handles routing
   auto* device = static_cast<::wireguard_device*>(this->wg_device_);
   auto* initiation = const_cast<message_handshake_initiation*>(
     reinterpret_cast<const message_handshake_initiation*>(msg)
@@ -340,20 +340,17 @@ bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, si
 
   ESP_LOGI(TAG, "← Received handshake initiation, processing as responder...");
 
-  // Feed watchdog before crypto-heavy handshake processing
   App.feed_wdt();
+  ::wireguard_peer* peer = wireguard_process_initiation_message(device, initiation);
 
-  auto* peer = wireguard_process_initiation_message(device, initiation);
-
-  // Feed watchdog after crypto processing
   App.feed_wdt();
 
   if (!peer) {
     ESP_LOGE(TAG, "✗ Failed to process handshake initiation (unknown peer or crypto failure)");
     return false;
   }
+  ESP_LOGD(TAG, "✓ wireguard_process_initiation_message returned peer %p", peer); // New log
 
-  // Find which peer this corresponds to
   std::string peer_ip;
   for (auto& kv : this->peers_) {
     if (kv.second.peer == peer) {
@@ -363,31 +360,27 @@ bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, si
   }
 
   if (peer_ip.empty()) {
-    ESP_LOGE(TAG, "✗ Peer not found in our tracking (internal error)");
+    ESP_LOGE(TAG, "✗ Peer not found in our tracking after processing initiation (internal error)"); // More detail
     return false;
   }
 
-  ESP_LOGI(TAG, "✓ Handshake initiation processed for peer %s", peer_ip.c_str());
+  ESP_LOGI(TAG, "✓ Handshake initiation processed for peer %s (matching peer: %p)", peer_ip.c_str(), peer); // More detail
 
-  // Create handshake response
   message_handshake_response response;
   memset(&response, 0, sizeof(response));
 
-  // Feed watchdog before crypto-heavy response creation
+  App.feed_wdt();
+  bool create_resp_success = wireguard_create_handshake_response(device, peer, &response);
   App.feed_wdt();
 
-  if (!wireguard_create_handshake_response(device, peer, &response)) {
-    ESP_LOGE(TAG, "✗ Failed to create handshake response");
+  if (!create_resp_success) { // Use bool result directly
+    ESP_LOGE(TAG, "✗ Failed to create handshake response for peer %s", peer_ip.c_str()); // More detail
     return false;
   }
+  ESP_LOGD(TAG, "✓ wireguard_create_handshake_response succeeded"); // New log
 
-  // Feed watchdog after crypto operations
-  App.feed_wdt();
-
-  // Extract sender_index from response (becomes our local_index for RX routing)
   uint32_t our_sender_index = U8TO32_LITTLE(reinterpret_cast<const uint8_t*>(&response) + 4);
 
-  // CRITICAL FIX: Library may generate sender_index=0, which is invalid
   if (our_sender_index == 0) {
     our_sender_index = esp_random();
     if (our_sender_index == 0) our_sender_index = 1;
@@ -395,98 +388,86 @@ bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, si
     ESP_LOGW(TAG, "✓ FIX: Generated valid sender_index: 0x%08x", our_sender_index);
   }
 
-  // Store receiver_index for routing
   this->peers_[peer_ip].receiver_index = our_sender_index;
   this->receiver_to_peer_[our_sender_index] = peer_ip;
+  ESP_LOGI(TAG, "✓ Mapped receiver_index 0x%08x to peer %s (Responder role)", our_sender_index, peer_ip.c_str()); // New log
 
-  ESP_LOGI(TAG, "✓ Mapped receiver_index 0x%08x -> %s", our_sender_index, peer_ip.c_str());
-
-  // Send response
   if (this->send_cb_) {
     this->send_cb_(peer_ip, reinterpret_cast<const uint8_t*>(&response), sizeof(response));
+  } else {
+    ESP_LOGE(TAG, "Send callback not set, cannot send handshake response"); // New log
+    return false;
   }
 
-  // Start session (we are responder)
   wireguard_start_session(peer, false);
 
-  // BUG FIX: Promote next_keypair to curr_keypair for responder mode
   if (peer && peer->next_keypair.valid) {
     keypair_update(peer, &peer->next_keypair);
-    ESP_LOGD(TAG, "✓ Promoted next_keypair to curr_keypair for responder");
+    ESP_LOGD(TAG, "✓ Promoted next_keypair to curr_keypair for responder (valid=%d)", peer->curr_keypair.valid); // More detail
+  } else {
+    ESP_LOGE(TAG, "✗ Failed to promote next_keypair for peer %s, curr_keypair valid=%d", peer_ip.c_str(), (peer ? peer->curr_keypair.valid : -1)); // New log
   }
+
 
   this->peers_[peer_ip].handshake_established = true;
   ESP_LOGI(TAG, "✓ WireGuard session established with %s as responder", peer_ip.c_str());
 
-  // Send keepalive to confirm session
-  this->send_peer_keepalive(peer_ip);
+  this->send_peer_keepalive(peer_ip); // Will log if successful
 
   return true;
 }
 
 bool WireGuardDeviceManager::handle_handshake_response_(const uint8_t* msg, size_t len) {
+  ESP_LOGI(TAG, "handle_handshake_response_ called, len=%zu", len); // New log
   if (len != HANDSHAKE_RESP_SIZE) {
-    ESP_LOGE(TAG, "Invalid handshake response size: %d", len);
+    ESP_LOGE(TAG, "Invalid handshake response size: %d, expected %zu", len, HANDSHAKE_RESP_SIZE); // More detail
     return false;
   }
 
-  // Extract receiver_index from response (bytes 8-11) to identify which peer sent this
-  uint32_t receiver_index = U8TO32_LITTLE(&msg[8]);
+  uint32_t receiver_index_from_msg = U8TO32_LITTLE(&msg[8]); // Extracted from message
+  ESP_LOGD(TAG, "← Received handshake response (msg_receiver_index=0x%08x)", receiver_index_from_msg); // New log
 
-  // Find peer by searching all peers (handshake response doesn't have clear routing)
-  // We need to match by checking if wireguard library can decrypt it
   auto* device = static_cast<::wireguard_device*>(this->wg_device_);
   auto* response = reinterpret_cast<const message_handshake_response*>(msg);
 
-  ESP_LOGI(TAG, "← Received handshake response (receiver_index=0x%08x)", receiver_index);
-
-  // Try to process with each peer that's in INITIATING state
   bool processed = false;
   std::string matched_peer_ip;
 
   for (auto& kv : this->peers_) {
-    if (!kv.second.handshake_established) {  // Only try peers that haven't completed handshake
+    if (!kv.second.handshake_established) {
       auto* peer = kv.second.peer;
+      if (!peer) continue; // Safety check
 
-      // Feed watchdog before crypto-heavy handshake response processing
+      ESP_LOGV(TAG, "  Trying handshake response with peer %s (peer_obj=%p)", kv.first.c_str(), peer); // New log
       App.feed_wdt();
-
-      if (wireguard_process_handshake_response(device, peer,
-                                               const_cast<message_handshake_response*>(response))) {
+      if (wireguard_process_handshake_response(device, peer, const_cast<message_handshake_response*>(response))) {
         matched_peer_ip = kv.first;
         processed = true;
+        ESP_LOGD(TAG, "✓ wireguard_process_handshake_response succeeded for peer %s", matched_peer_ip.c_str()); // New log
         break;
       }
+      ESP_LOGV(TAG, "  ✗ wireguard_process_handshake_response failed for peer %s", kv.first.c_str()); // New log
     }
   }
 
-  // Feed watchdog after handshake processing loop
   App.feed_wdt();
 
   if (!processed) {
-    ESP_LOGE(TAG, "✗ Failed to process handshake response (no matching peer)");
+    ESP_LOGE(TAG, "✗ Failed to process handshake response (no matching peer or crypto failure)");
     return false;
   }
 
   auto* peer = this->peers_[matched_peer_ip].peer;
-
-  // Start session (we are initiator)
   wireguard_start_session(peer, true);
 
-  // Map our local_index for incoming transport data lookup.
-  // In WG handshake response: bytes 8-11 (receiver_index) = echo of our sender_index from initiation.
-  // This is what the peer will use as receiver_index in transport data sent TO us.
-  // Note: receiver_index was already extracted at line 410.
-  this->peers_[matched_peer_ip].receiver_index = receiver_index;
-  this->receiver_to_peer_[receiver_index] = matched_peer_ip;
-
-  ESP_LOGI(TAG, "✓ Mapped receiver_index 0x%08x -> %s", receiver_index, matched_peer_ip.c_str());
+  this->peers_[matched_peer_ip].receiver_index = receiver_index_from_msg;
+  this->receiver_to_peer_[receiver_index_from_msg] = matched_peer_ip;
+  ESP_LOGI(TAG, "✓ Mapped receiver_index 0x%08x to peer %s (Initiator role)", receiver_index_from_msg, matched_peer_ip.c_str()); // New log
 
   this->peers_[matched_peer_ip].handshake_established = true;
   ESP_LOGI(TAG, "✓ WireGuard session established with %s as initiator", matched_peer_ip.c_str());
 
-  // Send keepalive to complete handshake
-  this->send_peer_keepalive(matched_peer_ip);
+  this->send_peer_keepalive(matched_peer_ip); // Will log if successful
 
   return true;
 }

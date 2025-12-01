@@ -95,7 +95,7 @@ bool DerpClient::init(const std::string& server_url,
 
 bool DerpClient::connect() {
   if (this->state_ != DerpState::DISCONNECTED) {
-    ESP_LOGW(TAG, "Already connected or connecting");
+    ESP_LOGW(TAG, "Already connected or connecting (state=%d)", (int)this->state_);
     return false;
   }
 
@@ -119,12 +119,14 @@ bool DerpClient::connect() {
       this->state_ = DerpState::ERROR;
       return false;
     }
+    ESP_LOGD(TAG, "Socket created (fd=%d)", this->sock_);
 
     // Set socket to non-blocking for timeout handling
     int flags = fcntl(this->sock_, F_GETFL, 0);
     fcntl(this->sock_, F_SETFL, flags | O_NONBLOCK);
 
     // Resolve hostname (can block for extended periods)
+    ESP_LOGD(TAG, "Resolving hostname %s...", this->server_host_.c_str());
     App.feed_wdt();  // Feed watchdog before DNS resolution
     struct hostent *server = gethostbyname(this->server_host_.c_str());
     App.feed_wdt();  // Feed watchdog after DNS resolution
@@ -135,6 +137,7 @@ bool DerpClient::connect() {
       this->state_ = DerpState::ERROR;
       return false;
     }
+    ESP_LOGD(TAG, "Hostname %s resolved to %s", this->server_host_.c_str(), inet_ntoa(*(struct in_addr *)server->h_addr));
 
     // Connect
     struct sockaddr_in serv_addr = {};
@@ -142,6 +145,7 @@ bool DerpClient::connect() {
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
     serv_addr.sin_port = htons(this->server_port_);
 
+    ESP_LOGD(TAG, "Attempting TCP connect to %s:%d...", inet_ntoa(serv_addr.sin_addr), this->server_port_);
     int ret = ::connect(this->sock_, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
     if (ret < 0 && errno != EINPROGRESS) {
       ESP_LOGE(TAG, "Failed to connect: errno %d", errno);
@@ -150,6 +154,7 @@ bool DerpClient::connect() {
       this->state_ = DerpState::ERROR;
       return false;
     }
+    ESP_LOGD(TAG, "Connect returned %d, errno %d", ret, errno);
 
     // Wait for connection with timeout
     fd_set writefds;
@@ -162,7 +167,7 @@ bool DerpClient::connect() {
     App.feed_wdt();  // Feed watchdog after select
 
     if (ret <= 0) {
-      ESP_LOGE(TAG, "Connection timeout");
+      ESP_LOGE(TAG, "Select returned %d, Connection timeout", ret);
       close(this->sock_);
       this->sock_ = -1;
       this->state_ = DerpState::ERROR;
@@ -173,6 +178,7 @@ bool DerpClient::connect() {
     int error = 0;
     socklen_t len = sizeof(error);
     getsockopt(this->sock_, SOL_SOCKET, SO_ERROR, &error, &len);
+    ESP_LOGD(TAG, "Select returned success, getsockopt error=%d", error);
 
     if (error != 0) {
       ESP_LOGE(TAG, "Connection failed: %d", error);
@@ -318,6 +324,7 @@ bool DerpClient::do_tls_handshake_() {
     ESP_LOGE(TAG, "Failed to create TLS context");
     return false;
   }
+  ESP_LOGD(TAG, "TLS context initialized");
 
   // Feed watchdog before blocking TLS handshake to prevent crashes
   // TLS handshake can take up to 30 seconds according to timeout config
@@ -326,12 +333,11 @@ bool DerpClient::do_tls_handshake_() {
 
   // Connect with TLS (includes TCP + TLS handshake)
   // esp_tls_conn_new_sync will automatically use server_host for SNI
-  ESP_LOGD(TAG, "Starting TLS connection (blocking, up to 30s)...");
+  ESP_LOGD(TAG, "Starting blocking TLS connection to %s:%d (timeout %dms)...", this->server_host_.c_str(), this->server_port_, cfg.timeout_ms);
   uint32_t start_ms = esphome::millis();
   int ret = esp_tls_conn_new_sync(this->server_host_.c_str(), this->server_host_.length(),
                                    this->server_port_, &cfg, tls);
   uint32_t elapsed_ms = esphome::millis() - start_ms;
-  ESP_LOGD(TAG, "TLS connection attempt completed in %d ms (result: %d)", elapsed_ms, ret);
 
   if (ret != 1) {
     ESP_LOGE(TAG, "❌ TLS connection failed:");
@@ -353,6 +359,8 @@ bool DerpClient::do_tls_handshake_() {
     // mbedtls_ssl_setup error -0x7F00 (MBEDTLS_ERR_SSL_ALLOC_FAILED) indicates allocation failure
     // We detect this by checking if free heap is critically low (<20KB) or if ESP-TLS state indicates memory issue
     bool is_oom = (free_heap < 20480) || (err == ESP_ERR_NO_MEM);
+    // DEBUG: Log OOM status
+    ESP_LOGD(TAG, "TLS failure: is_oom=%d, free_heap=%zu", is_oom, free_heap);
 
     if (is_oom) {
       // Increment OOM recovery attempts
@@ -427,6 +435,18 @@ bool DerpClient::do_tls_handshake_() {
     ESP_LOGE(TAG, "      3. TLS handshake timeout (server unreachable)");
     ESP_LOGE(TAG, "      4. Incompatible TLS version or cipher suite");
     ESP_LOGE(TAG, "      5. Out of memory (mbedtls allocation failed)");
+    
+    esp_tls_error_handle_t error_handle;
+    esp_tls_get_error_handle(tls, &error_handle);
+
+    int mbedtls_err = 0;
+    int flags = 0;
+    esp_tls_get_and_clear_last_error(error_handle, &mbedtls_err, &flags);
+    
+    char tls_err_buf[128];
+    mbedtls_strerror(mbedtls_err, tls_err_buf, sizeof(tls_err_buf));
+    
+    ESP_LOGE(TAG, "   → Last mbedTLS error: 0x%x (-%d) = %s", -mbedtls_err, -mbedtls_err, tls_err_buf);
 
     esp_tls_conn_destroy(tls);
     return false;

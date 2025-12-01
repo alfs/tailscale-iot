@@ -8,6 +8,26 @@ esp32:
     type: esp-idf
     version: recommended
     sdkconfig_options:
+      # LwIP Debugging (uncomment when needed)
+      # CONFIG_LWIP_DEBUG: y
+      # CONFIG_LWIP_TCP_DEBUG: y
+      # CONFIG_LWIP_TCP_INPUT_DEBUG: y
+      # CONFIG_LWIP_TCP_OUTPUT_DEBUG: y
+      # CONFIG_LWIP_IP_DEBUG: y
+
+      # Ensure LwIP calculates checksums (we have no HW offload for the tunnel)
+      CONFIG_LWIP_CHECKSUM_GEN_IP: y
+      CONFIG_LWIP_CHECKSUM_GEN_UDP: y
+      CONFIG_LWIP_CHECKSUM_GEN_TCP: y
+      CONFIG_LWIP_CHECKSUM_GEN_ICMP: y
+      
+      # Increase TCP limits to prevent PCB exhaustion
+      CONFIG_LWIP_MAX_ACTIVE_TCP: "16"
+      CONFIG_LWIP_MAX_LISTENING_TCP: "16"
+      
+      # Increase LwIP Task Stack Size to prevent overflows
+      CONFIG_LWIP_TCPIP_TASK_STACK_SIZE: "4096"
+
       # Increase task watchdog timeout from default 5s to 30s
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
       
