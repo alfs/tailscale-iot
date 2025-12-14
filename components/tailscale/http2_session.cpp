@@ -875,7 +875,7 @@ bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
   }
 
   // Final check: all braces closed, ensure we end with }
-  for (size_t i = buffer_size; i > start_offset && i > buffer_size - 100; i--) {
+  for (size_t i = buffer_size; i > start_offset && i > (buffer_size > 100 ? buffer_size - 100 : 0); i--) {
     char c = buffer[i - 1];
     if (!std::isspace(static_cast<unsigned char>(c))) {
       bool ends_with_brace = (c == '}');
