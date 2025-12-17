@@ -43,6 +43,7 @@ bool WireGuardDeviceManager::init(const uint8_t* our_private_key) {
   static bool wg_initialized = false;
   if (!wg_initialized) {
     ESP_LOGI(TAG, "Initializing WireGuard library...");
+    wireguard_platform_init();
     wireguard_init();
     wg_initialized = true;
     ESP_LOGI(TAG, "✓ WireGuard library initialized");
