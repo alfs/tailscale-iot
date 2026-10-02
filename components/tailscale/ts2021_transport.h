@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "http2_session.h"
+#include "noise_records.h"
 
 namespace esphome {
 namespace tailscale {
@@ -70,6 +71,7 @@ class Ts2021Transport {
   uint32_t persistent_stream_id_{0};  // Track persistent map stream for receiving keepalives
   uint64_t tx_count_{0};
   uint64_t rx_count_{0};
+  control_records::Records records_;
 };
 
 }  // namespace tailscale

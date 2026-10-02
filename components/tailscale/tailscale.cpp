@@ -446,20 +446,8 @@ void TailscaleComponent::handle_fetching_map_state_() {
   }
 
   // Initialize DERP client for relay connectivity (ONLY on first map fetch)
-  // CRITICAL ARCHITECTURAL FIX: Use static variable to survive ALL state resets
-  //
-  // ARCHITECTURAL PROBLEM SOLVED:
-  // The state machine does: CONNECTED → INITIALIZING → ... → FETCHING_MAP → CONNECTED (every ~15s)
-  // This was destroying derp_client_ because:
-  // 1. std::unique_ptr gets reset during state transitions
-  // 2. Member variables (derp_initialized_) ALSO get reset during state transitions
-  //
-  // SOLUTION: Use STATIC variable inside function - persists across ALL calls
-  // - Static variables are allocated once and persist for program lifetime
-  // - Not tied to object lifecycle, survives even if TailscaleComponent is recreated
-  // - First time in FETCHING_MAP: Initialize DERP and set static flag
-  // - Subsequent times: Skip initialization, preserve existing connection
-  static bool derp_initialized = false;  // STATIC - survives all state resets
+  // Keep a successful relay across control reconnects, scoped to this object.
+  bool& derp_initialized = this->derp_initialized_; // Track successful init, not just allocation.
   if (!derp_initialized) {
     ESP_LOGI(TAG, "→ Initializing DERP relay client (first time)...");
     this->derp_client_ = std::make_unique<DerpClient>();
@@ -886,8 +874,6 @@ void TailscaleComponent::handle_connected_state_() {
 
   // Send periodic endpoint updates every 60 seconds
   // These are sent on NEW HTTP/2 streams, not on the persistent receiving stream
-  static uint32_t last_keepalive_send_time = 0;
-  static bool first_keepalive_init = true;
   uint32_t current_time = millis();
   const uint32_t KEEPALIVE_SEND_INTERVAL_MS = 60000;  // 60 seconds
 
@@ -941,7 +927,6 @@ void TailscaleComponent::handle_connected_state_() {
   // This handles hairpin NAT situations where some peers on same NAT need DERP
   bool all_direct_paths_confirmed = true;
   bool any_direct_path_confirmed = false;
-  static uint32_t direct_mode_start_time = 0;
   static const uint32_t DIRECT_MODE_FALLBACK_TIMEOUT = 30000;  // 30s to confirm direct path
 
   if (this->prefer_direct_udp_) {
@@ -968,10 +953,6 @@ void TailscaleComponent::handle_connected_state_() {
   // This enables DERP for hairpin NAT scenarios where peers share same external IP
   bool skip_derp = this->prefer_direct_udp_ &&
                    (all_direct_paths_confirmed || (now - direct_mode_start_time < DIRECT_MODE_FALLBACK_TIMEOUT));
-  static bool logged_skip_derp = false;  // Only log once
-  static bool logged_derp_fallback = false;
-  static uint32_t derp_backoff_until = 0;  // Backoff timestamp for failed connections
-  static int derp_consecutive_failures = 0;  // Track consecutive failures
 
   // Debug: Log DERP state check
   static uint32_t last_derp_check_log = 0;
@@ -1031,7 +1012,6 @@ void TailscaleComponent::handle_connected_state_() {
   // Step 2: Periodic WireGuard handshake maintenance
   // Ensures active peers have a valid WireGuard session, especially for Direct UDP
   // INCREASED INTERVAL: 5s -> 60s to avoid WDT crashes caused by frequent Curve25519 re-keying
-  static uint32_t last_handshake_check = 0;
   if (now - last_handshake_check >= 60000) {  // Check every 60 seconds
     bool derp_ready = (this->derp_client_ && this->derp_client_->is_ready());
     bool direct_mode = skip_derp;
@@ -1049,9 +1029,8 @@ void TailscaleComponent::handle_connected_state_() {
         
         if (wg_peer != nullptr) {
           // Peer is active - check if we need to re-initiate handshake
-          // CRITICAL FIX: Only re-initiate if handshake NOT established
-          // Re-keying while session is active causes 30+ second crypto blocking
-          if (this->wg_device_manager_->is_handshake_established(peer.tailscale_ip)) {
+          // Renew aged active sessions while retaining current-key transport.
+          if (!this->wg_device_manager_->needs_rekey(peer.tailscale_ip)) {
             // Session established - just send keepalive
             ESP_LOGD(TAG, "🔄 Peer[%zu] %s: Session active, sending keepalive", i, peer.hostname.c_str());
             this->wg_device_manager_->send_peer_keepalive(peer.tailscale_ip);
@@ -1079,9 +1058,6 @@ void TailscaleComponent::handle_connected_state_() {
 
   // NAT-PMP: Request port mapping ONCE at startup (before TTL discovery)
   // This is simpler and faster than TTL-based discovery
-  static bool natpmp_requested = false;
-  static uint32_t natpmp_request_time = 0;
-  static bool natpmp_success = false;
 
   if (!natpmp_requested && this->unified_socket_ >= 0) {
     // Request NAT-PMP mapping (sends UDP packet to gateway)
@@ -1152,8 +1128,6 @@ void TailscaleComponent::handle_connected_state_() {
   }
 
   // Send periodic disco pings to maintain peer connectivity (every 10 seconds)
-  static uint32_t last_disco_ping_time = 0;
-  static uint32_t last_nat_discovery_time = 0;
   // Reuse 'now' from earlier in function (declared at line 614)
   if (now - last_disco_ping_time >= 10000) {  // 10 second interval
     ESP_LOGD(TAG, "→ Sending periodic disco ping to peers...");
@@ -1189,7 +1163,6 @@ void TailscaleComponent::handle_connected_state_() {
 
   // Send periodic WireGuard keepalives to maintain tunnel session (every 20 seconds)
   // This prevents NAT mappings from expiring and keeps WireGuard session active
-  static uint32_t last_wg_keepalive_time = 0;
   if (now - last_wg_keepalive_time >= 20000) {  // 20 second interval
     if (this->derp_client_ && !this->node_config_.peers.empty()) {
       // Send minimal WireGuard keepalive packet (empty payload with WG header)
@@ -1960,6 +1933,7 @@ bool TailscaleComponent::fetch_map_response_() {
   hostinfo.include_netinfo = true;                   // Enable NetInfo inside Hostinfo
 
   map_payload.hostinfo_json = build_hostinfo_json(hostinfo);
+  map_payload.keep_alive = true;   // Request server keepalives on the persistent response.
   map_payload.stream = true;        // Must be true to receive initial map response and updates
   map_payload.read_only = false;    // Must be false to get full map response (not just lite update)
   map_payload.omit_peers = false;   // Must be false with stream=true (headscale protocol requirement)
@@ -2560,6 +2534,7 @@ void TailscaleComponent::start_io_task_() {
     return;  // Already running
   }
 
+  this->io_task_exited_ = false;
   this->io_task_running_ = true;
 
   // Create the IO task with 4KB stack
@@ -2576,6 +2551,7 @@ void TailscaleComponent::start_io_task_() {
   if (result != pdPASS) {
     ESP_LOGE(TAG, "❌ Failed to create IO task");
     this->io_task_running_ = false;
+    this->io_task_exited_ = true;
     return;
   }
 
@@ -2583,27 +2559,14 @@ void TailscaleComponent::start_io_task_() {
 }
 
 // Stop the IO task (keeps queues intact for restart)
-void TailscaleComponent::stop_io_task_() {
-  if (this->io_task_handle_ == nullptr) {
-    return;
-  }
-
-  // Signal task to stop
+bool TailscaleComponent::stop_io_task_() {
   this->io_task_running_ = false;
-
-  // Wait for task to finish (up to 1 second)
-  for (int i = 0; i < 100 && eTaskGetState(this->io_task_handle_) != eDeleted; i++) {
+  if (!this->io_task_handle_) return true;
+  for (unsigned i = 0; i < 200 && !this->io_task_exited_.load(); ++i)
     vTaskDelay(pdMS_TO_TICKS(10));
-  }
-
-  // DO NOT delete queues here - they need to persist for task restart
-  // Queues are only cleaned up when component is destroyed
-  // The task will be recreated with the same queues by start_io_task_()
-
-  // Reset task handle so start_io_task_() can create a new one
+  if (!this->io_task_exited_.load()) return false;
   this->io_task_handle_ = nullptr;
-
-  ESP_LOGI(TAG, "✓ Stopped IO task (queues preserved for restart)");
+  return true;
 }
 
 // Static task function that blocks on select() for energy efficiency
@@ -2728,6 +2691,7 @@ void TailscaleComponent::io_task_func_(void* arg) {
   }
 
   ESP_LOGI(TAG, "IO Task exiting");
+  self->io_task_exited_.store(true); // Last component access before self deletion.
   vTaskDelete(nullptr);
 }
 
@@ -4068,7 +4032,7 @@ bool TailscaleComponent::perform_stun_query_() {
   bool task_was_running = this->io_task_running_;
   if (task_was_running) {
     ESP_LOGD(TAG, "Pausing IO task for STUN query");
-    this->stop_io_task_();
+    if (!this->stop_io_task_()) { this->transition_to(TailscaleState::ERROR); return false; }
     vTaskDelay(pdMS_TO_TICKS(50));  // Give task time to stop
   }
 
@@ -4627,9 +4591,9 @@ bool TailscaleComponent::send_map_keepalive_() {
 
   // CRITICAL: Set KeepAlive to true for keepalive requests
   map_payload.keep_alive = true;
-  map_payload.stream = true;  // REQUIRED for online status (Headscale sets IsOnline=true only for Stream=true)
+  map_payload.stream = false;  // Endpoint mutations use a separate finite request.
   map_payload.read_only = false;
-  map_payload.omit_peers = true;  // Minimize response size - server sends just {"KeepAlive":true} (18 bytes)
+  map_payload.omit_peers = true;  // Finite endpoint updates need no peer map.
 
   // Include all discovered endpoints (local + external)
   if (!this->discovered_endpoints_.empty()) {
@@ -4646,7 +4610,7 @@ bool TailscaleComponent::send_map_keepalive_() {
   }
 
   std::string payload_json = render_map_request(map_payload);
-  ESP_LOGI(TAG, "DEBUG: Keepalive payload (%zu bytes): %s", payload_json.length(), payload_json.c_str());
+  ESP_LOGD(TAG, "Endpoint update: %zu bytes", payload_json.size());
 
   // Send keepalive map request via HTTP/2
   const char *response_ptr = nullptr;
@@ -4662,47 +4626,13 @@ bool TailscaleComponent::send_map_keepalive_() {
     return false;
   }
 
-  // CRITICAL: Send keepalive on the persistent stream (stream 3) instead of creating new streams
-  // The persistent stream was opened with the initial MapRequest (Stream=true)
-  // We must send subsequent keepalives ON THE SAME STREAM to keep the connection alive
-  // The server will respond with {"KeepAlive":true} on the same stream
-  ESP_LOGI(TAG, "→ Sending keepalive on persistent stream...");
-
-  if (!this->ts2021_transport_->http2_send_on_persistent_stream(payload_json)) {
-    ESP_LOGE(TAG, "Failed to send keepalive on persistent stream");
+  // The original POST was half-closed with END_STREAM. For modern capability
+  // versions, streaming maps are read-only; publish changes on a new stream.
+  if (!this->ts2021_transport_->http2_post_json(scheme, this->control_authority_,
+      "/machine/map", payload_json, response_ptr, response_size, status, 5000, true, false)) {
     return false;
   }
-
-  ESP_LOGI(TAG, "✓ Keepalive sent on persistent stream (%zu bytes)", payload_json.length());
-
-  // The response will be received asynchronously via check_server_keepalive_()
-  // which calls http2_read_next_message() and will see the server's {"KeepAlive":true} response
-
-  // Note: We don't need to parse the keepalive response - the server acknowledges with HTTP 200
-  // and may send an empty or minimal response since OmitPeers=true
-
-  // KEEP control plane alive after keepalive to avoid OOM crashes
-  // Previously: closed control plane to free ~70KB for DERP connections
-  // Problem: Causes out-of-memory crashes when reconnecting due to 16KB buffer allocation
-  // Solution: Keep control plane alive permanently
-  // if (!transport_ready) {
-  //   ESP_LOGI(TAG, "→ Closing control plane to free memory...");
-  //   if (this->ts2021_transport_) {
-  //     this->ts2021_transport_->reset();
-  //   }
-  //   if (this->upgrade_channel_) {
-  //     this->upgrade_channel_->close();
-  //     this->upgrade_channel_.reset();
-  //   }
-  //   this->noise_session_.reset();
-  //   this->noise_session_ = esphome::make_unique<NoiseSession>();
-  //   if (!this->noise_session_->initialize_ik()) {
-  //     ESP_LOGE(TAG, "Failed to initialize Noise session after reset");
-  //   }
-  //   ESP_LOGI(TAG, "   ✓ Control plane closed (freed ~70KB for DERP)");
-  // }
-
-  return true;
+  return status >= 200 && status < 300;
 } // Correct closing brace for send_map_keepalive_
 
 // Check for incoming server keepalive messages on persistent streaming connection
@@ -4802,10 +4732,7 @@ bool TailscaleComponent::check_server_keepalive_() {
     }
   }
 
-  // Event-Driven Read: Only attempt to read if IO task signaled data
-  if (!this->control_plane_data_available_) {
-    return false;
-  }
+  // Decrypted frames can remain buffered after select() reports no socket bytes.
   
   // Clear flag and read
   this->control_plane_data_available_ = false;

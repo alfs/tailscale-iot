@@ -1,0 +1,4 @@
+# ESPHome compiler output and optional local secrets.
+/.esphome/
+/secrets.yaml
+/.host-build/

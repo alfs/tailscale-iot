@@ -104,3 +104,73 @@ make build        # Build the firmware
 Once the node comes online you can continue iterating on `esp32-ts.yaml` or
 switch to your own configuration files. Subsequent `esphome run` invocations
 will reuse the `.esphome/` build cache for faster rebuilds.
+
+## Protocol regression tests and port findings
+
+Run `python3 tests/run_host_tests.py` with clang++ to exercise control-plane
+framing and status decoding under ASan/UBSan without credentials or hardware.
+See [Paper S3 port findings](docs/paper-s3-port-findings.md) for the downstream
+hardware evidence, memory tradeoffs, and further improvements to review.
+
+#### Reconstructed client timers
+
+Connection-specific endpoint-refresh, relay-backoff, WireGuard maintenance,
+discovery, and NAT-PMP state is owned by each component instance. Constructing a
+new client does not inherit the previous network's NAT mapping or failed relay's
+backoff, and its first periodic endpoint update waits a full minute after entering
+connected state. This adds fixed member storage, with no extra allocation.
+
+`python3 tests/check_connection_timers.py` compiles the actual endpoint-update
+block and member declarations under ASan/UBSan, exercising reconstruction at
+high uptime, failed-update retry throttling, and timer wrap. The other host tests
+remain applicable. C3 physical behavior still requires validation on hardware;
+Paper S3 validation uses its reader adapter.
+
+### Credential-free ESP32-C3 build check
+
+```sh
+python -m pip install esphome==2025.6.1
+esphome compile tests/esp32-c3-build.yaml
+```
+
+The fixture compiles the component for `esp32-c3-devkitm-1` with ESP-IDF 5.3.2,
+an empty auth key and dummy Wi-Fi values. It requires neither `secrets.yaml` nor
+hardware. Do not flash it. The GitHub Actions build uses the same command.
+Both this fixture and the original example (with dummy build-only secrets)
+compiled successfully on 2026-10-01. This validates compilation/linking, not
+ESP32-C3 runtime behavior, memory headroom under network load or enrollment.
+
+### WireGuard session regression coverage
+
+After the ESPHome fixture has fetched the pinned `esp_wireguard` 0.4.2 dependency,
+run real cryptography on the host (clang, pkg-config and libsodium required):
+
+```sh
+python3 tests/check_wireguard_crypto.py \
+  --wireguard-source tests/.esphome/build/tailscale-c3-build/.piolibdeps/tailscale-c3-build/esp_wireguard/src
+```
+
+This compiles the actual manager and dependency under ASan/UBSan. It checks
+multiple peers, both initiation directions, traffic during pending renewal,
+three timed rollovers, delayed old-key packets, replay/corruption rejection,
+hard time/message expiration, receiver-cache bounds, peer removal and accepting
+an incoming session after reconstructing the manager. The C3 workflow runs this
+check after compilation. ESPHome clock/watchdog/platform declarations are stubbed
+for the host check; it does not validate C3 hardware, FreeRTOS races or every
+control-plane/network interoperability case.
+
+Transport readiness now remains separate from renewal demand. Active-key traffic
+continues while an authenticated renewal is pending; the hard rejection limits
+still apply. Responses match the pending handshake's receiver index rather than
+excluding established peers. Incoming data chooses the current, pending or
+previous key by receiver index, authenticates and checks replay before promoting
+the pending key, and never delivers an empty keepalive as an inner IP packet.
+Receiver routes are pruned when sessions are created to retain only indexes backed
+by those three key slots. No per-packet cache scan or new buffer allocation is
+introduced by the pruning.
+
+The original manager at `01103df` was used as a negative control: with the same
+actual-crypto fixture and dependency, an authenticated incoming renewal failed
+when its handshake response was rejected. The corrected manager passes. This
+identifies a reproduced upstream rekey defect; it does not identify the cause of
+the separate intermittent Paper S3 hardware data-authentication mismatch.

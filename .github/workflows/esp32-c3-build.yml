@@ -1,0 +1,27 @@
+name: ESP32-C3 build
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, fix/control-stream-hardening]
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install esphome==2025.6.1
+      - run: sudo apt-get update && sudo apt-get install -y clang libsodium-dev pkg-config
+      - name: Compile without credentials or hardware
+        run: esphome compile tests/esp32-c3-build.yaml
+      - name: Exercise actual WireGuard cryptography under ASan and UBSan
+        run: >-
+          python tests/check_wireguard_crypto.py
+          --wireguard-source tests/.esphome/build/tailscale-c3-build/.piolibdeps/tailscale-c3-build/esp_wireguard/src

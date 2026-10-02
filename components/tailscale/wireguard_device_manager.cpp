@@ -132,9 +132,11 @@ void WireGuardDeviceManager::remove_peer(const std::string& peer_tailscale_ip) {
     return;
   }
 
-  // Remove from receiver_index mapping
-  if (it->second.receiver_index != 0) {
-    this->receiver_to_peer_.erase(it->second.receiver_index);
+  // Both initiation directions and rekeys can leave multiple receiver indexes.
+  // Revocation must remove every route to the peer before its slot is reused.
+  for (auto index = this->receiver_to_peer_.begin(); index != this->receiver_to_peer_.end();) {
+    if (index->second == peer_tailscale_ip) index = this->receiver_to_peer_.erase(index);
+    else ++index;
   }
 
   // Free the peer slot in the device's internal array by marking it invalid
@@ -171,6 +173,9 @@ bool WireGuardDeviceManager::start_peer_handshake(const std::string& peer_tailsc
   auto* device = static_cast<::wireguard_device*>(this->wg_device_);
   auto* peer = it->second.peer;
 
+  if (peer->handshake.valid && peer->handshake.initiator &&
+      !wireguard_expired(peer->last_initiation_tx, REKEY_TIMEOUT))
+    return true;
   // Build handshake initiation message
   message_handshake_initiation msg;
   memset(&msg, 0, sizeof(msg));
@@ -190,6 +195,13 @@ bool WireGuardDeviceManager::start_peer_handshake(const std::string& peer_tailsc
   // Feed watchdog after crypto operations complete
   App.feed_wdt();
 
+  peer->last_initiation_tx = wireguard_sys_now();
+  // Continue carrying current-key traffic during an authenticated renewal.
+  it->second.handshake_established =
+      peer->curr_keypair.valid && peer->curr_keypair.sending_valid &&
+      !wireguard_expired(peer->curr_keypair.keypair_millis,
+                         REJECT_AFTER_TIME) &&
+      peer->curr_keypair.sending_counter < REJECT_AFTER_MESSAGES;
   // Send via callback (callback will route to correct peer by tailscale_ip)
   this->send_cb_(peer_tailscale_ip, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
 
@@ -198,7 +210,8 @@ bool WireGuardDeviceManager::start_peer_handshake(const std::string& peer_tailsc
 }
 
 bool WireGuardDeviceManager::receive_wg_packet(const uint8_t* wg_packet, size_t len) {
-  if (!wg_packet || len == 0) {
+  if (!wg_packet ||
+      wireguard_get_message_type(wg_packet, len) == MESSAGE_INVALID) {
     return false;
   }
 
@@ -245,7 +258,9 @@ bool WireGuardDeviceManager::send_ip_packet(const std::string& peer_tailscale_ip
   }
 
   auto* peer = it->second.peer;
-  if (!peer || !peer->curr_keypair.valid) {
+  if (!peer || !peer->curr_keypair.valid || !peer->curr_keypair.sending_valid ||
+      wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME) ||
+      peer->curr_keypair.sending_counter >= REJECT_AFTER_MESSAGES) {
     ESP_LOGE(TAG, "No valid keypair for peer %s", peer_tailscale_ip.c_str());
     return false;
   }
@@ -300,7 +315,9 @@ bool WireGuardDeviceManager::send_peer_keepalive(const std::string& peer_tailsca
   }
 
   auto* peer = it->second.peer;
-  if (!peer || !peer->curr_keypair.valid) {
+  if (!peer || !peer->curr_keypair.valid || !peer->curr_keypair.sending_valid ||
+      wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME) ||
+      peer->curr_keypair.sending_counter >= REJECT_AFTER_MESSAGES) {
     ESP_LOGE(TAG, "No valid keypair for peer %s", peer_tailscale_ip.c_str());
     return false;
   }
@@ -381,12 +398,9 @@ bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, si
 
   uint32_t our_sender_index = U8TO32_LITTLE(reinterpret_cast<const uint8_t*>(&response) + 4);
 
-  if (our_sender_index == 0) {
-    our_sender_index = esp_random();
-    if (our_sender_index == 0) our_sender_index = 1;
-    U32TO8_LITTLE(reinterpret_cast<uint8_t*>(&response) + 4, our_sender_index);
-    ESP_LOGW(TAG, "✓ FIX: Generated valid sender_index: 0x%08x", our_sender_index);
-  }
+  // Never rewrite an already authenticated handshake response.
+  if (!our_sender_index)
+    return false;
 
   this->peers_[peer_ip].receiver_index = our_sender_index;
   this->receiver_to_peer_[our_sender_index] = peer_ip;
@@ -401,15 +415,14 @@ bool WireGuardDeviceManager::handle_handshake_initiation_(const uint8_t* msg, si
 
   wireguard_start_session(peer, false);
 
-  if (peer && peer->next_keypair.valid) {
-    keypair_update(peer, &peer->next_keypair);
-    ESP_LOGD(TAG, "✓ Promoted next_keypair to curr_keypair for responder (valid=%d)", peer->curr_keypair.valid); // More detail
-  } else {
-    ESP_LOGE(TAG, "✗ Failed to promote next_keypair for peer %s, curr_keypair valid=%d", peer_ip.c_str(), (peer ? peer->curr_keypair.valid : -1)); // New log
-  }
+  if (!peer->next_keypair.valid)
+    return false;
+  prune_receiver_routes_(peer_ip);
+  // Promote only after authenticated data confirms the pending session.
 
-
-  this->peers_[peer_ip].handshake_established = true;
+  this->peers_[peer_ip].handshake_established =
+      peer->curr_keypair.valid && peer->curr_keypair.sending_valid &&
+      !wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME);
   ESP_LOGI(TAG, "✓ WireGuard session established with %s as responder", peer_ip.c_str());
 
   this->send_peer_keepalive(peer_ip); // Will log if successful
@@ -434,7 +447,9 @@ bool WireGuardDeviceManager::handle_handshake_response_(const uint8_t* msg, size
   std::string matched_peer_ip;
 
   for (auto& kv : this->peers_) {
-    if (!kv.second.handshake_established) {
+    if (kv.second.peer && kv.second.peer->handshake.valid &&
+        kv.second.peer->handshake.initiator &&
+        kv.second.peer->handshake.local_index == receiver_index_from_msg) {
       auto* peer = kv.second.peer;
       if (!peer) continue; // Safety check
 
@@ -462,6 +477,7 @@ bool WireGuardDeviceManager::handle_handshake_response_(const uint8_t* msg, size
 
   this->peers_[matched_peer_ip].receiver_index = receiver_index_from_msg;
   this->receiver_to_peer_[receiver_index_from_msg] = matched_peer_ip;
+  prune_receiver_routes_(matched_peer_ip);
   ESP_LOGI(TAG, "✓ Mapped receiver_index 0x%08x to peer %s (Initiator role)", receiver_index_from_msg, matched_peer_ip.c_str()); // New log
 
   this->peers_[matched_peer_ip].handshake_established = true;
@@ -473,8 +489,10 @@ bool WireGuardDeviceManager::handle_handshake_response_(const uint8_t* msg, size
 }
 
 bool WireGuardDeviceManager::handle_transport_data_(const uint8_t* msg, size_t len) {
-  if (len < TRANSPORT_OVERHEAD) {
-    ESP_LOGE(TAG, "Transport data too small: %d bytes", len);
+  constexpr size_t max_transport_size =
+      ((MAX_IP_PACKET_SIZE + 15) & ~size_t(15)) + TRANSPORT_OVERHEAD;
+  if (len < TRANSPORT_OVERHEAD || len > max_transport_size) {
+    ESP_LOGE(TAG, "Invalid transport data size: %u bytes", unsigned(len));
     return false;
   }
 
@@ -496,17 +514,12 @@ bool WireGuardDeviceManager::handle_transport_data_(const uint8_t* msg, size_t l
   }
 
   auto* peer = peer_it->second.peer;
-  if (!peer || !peer->curr_keypair.valid) {
-    ESP_LOGE(TAG, "No valid keypair for peer %s", peer_ip.c_str());
+  auto *keypair =
+      peer ? get_peer_keypair_for_idx(peer, receiver_index) : nullptr;
+  if (!keypair || !keypair->receiving_valid ||
+      wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) ||
+      U8TO64_LITTLE(&msg[8]) >= REJECT_AFTER_MESSAGES)
     return false;
-  }
-
-  // Verify receiver_index matches
-  if (receiver_index != peer->curr_keypair.local_index) {
-    ESP_LOGW(TAG, "Receiver index mismatch (got 0x%08x, expected 0x%08x)",
-             receiver_index, peer->curr_keypair.local_index);
-    return false;
-  }
 
   // Decrypt
   uint64_t counter = U8TO64_LITTLE(&msg[8]);
@@ -514,14 +527,23 @@ bool WireGuardDeviceManager::handle_transport_data_(const uint8_t* msg, size_t l
   size_t padded_len = encrypted_len - 16;  // Remove auth tag
   uint8_t* decrypted = new uint8_t[padded_len];
 
-  if (!wireguard_decrypt_packet(decrypted, &msg[16], encrypted_len, counter, &peer->curr_keypair)) {
+  if (!wireguard_decrypt_packet(decrypted, &msg[16], encrypted_len, counter,
+                                keypair)) {
     ESP_LOGE(TAG, "Failed to decrypt packet from %s (counter=%llu)", peer_ip.c_str(), counter);
     delete[] decrypted;
     return false;
   }
 
-  // Deliver to application via callback
-  if (this->decrypt_cb_) {
+  if (!wireguard_check_replay(keypair, counter)) {
+    delete[] decrypted;
+    return false;
+  }
+  keypair->last_rx = wireguard_sys_now();
+  peer->last_rx = keypair->last_rx;
+  keypair_update(peer, keypair);
+  peer_it->second.handshake_established = true;
+  // An authenticated keepalive has no inner IP packet to deliver.
+  if (padded_len && this->decrypt_cb_) {
     this->decrypt_cb_(peer_ip, decrypted, padded_len);
   }
 
@@ -533,3 +555,41 @@ bool WireGuardDeviceManager::handle_transport_data_(const uint8_t* msg, size_t l
 
 }  // namespace tailscale
 }  // namespace esphome
+
+namespace esphome::tailscale {
+bool WireGuardDeviceManager::is_handshake_established(
+    const std::string &ip) const {
+  const auto it = peers_.find(ip);
+  if (it == peers_.end() || !it->second.handshake_established ||
+      !it->second.peer)
+    return false;
+  const auto &key = it->second.peer->curr_keypair;
+  return key.valid && key.sending_valid &&
+         !wireguard_expired(key.keypair_millis, REJECT_AFTER_TIME) &&
+         key.sending_counter < REJECT_AFTER_MESSAGES;
+}
+bool WireGuardDeviceManager::needs_rekey(const std::string &ip) const {
+  if (!is_handshake_established(ip))
+    return true;
+  const auto &key = peers_.find(ip)->second.peer->curr_keypair;
+  return wireguard_expired(key.keypair_millis, key.initiator
+                                                   ? REKEY_AFTER_TIME
+                                                   : REJECT_AFTER_TIME) ||
+         key.sending_counter >= REKEY_AFTER_MESSAGES;
+}
+} // namespace esphome::tailscale
+
+namespace esphome::tailscale {
+void WireGuardDeviceManager::prune_receiver_routes_(const std::string &ip) {
+  const auto found = peers_.find(ip);
+  auto *peer = found == peers_.end() ? nullptr : found->second.peer;
+  for (auto route = receiver_to_peer_.begin();
+       route != receiver_to_peer_.end();) {
+    if (route->second == ip &&
+        (!peer || !get_peer_keypair_for_idx(peer, route->first)))
+      route = receiver_to_peer_.erase(route);
+    else
+      ++route;
+  }
+}
+} // namespace esphome::tailscale

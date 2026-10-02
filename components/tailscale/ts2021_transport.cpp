@@ -31,6 +31,8 @@ void Ts2021Transport::reset() {
   this->upgrade_ = nullptr;
   this->http2_session_.reset();
   this->next_stream_id_ = 1;
+  this->persistent_stream_id_ = 0;
+  this->records_.clear();
 }
 
 void Ts2021Transport::mark_failed() {
@@ -346,61 +348,33 @@ bool Ts2021Transport::send_plaintext(const uint8_t *data, size_t len) {
 }
 
 bool Ts2021Transport::receive_plaintext(std::vector<uint8_t> &out, uint32_t timeout_ms) {
-  if (this->upgrade_ == nullptr) {
-    ESP_LOGE(TAG, "upgrade channel is null");
-    return false;
-  }
-
-  // Feed watchdog before blocking WebSocket read to prevent crashes
-  App.feed_wdt();
-
-  // Read the framed message from WebSocket
-  // ESP32-C3 has limited RAM and suffers from fragmentation with large allocations
-  // Use 8KB buffer - WebSocket layer buffers partial frames automatically
-  // This is enough for most control messages while preventing OOM crashes
-  std::vector<uint8_t> framed;
-  if (!this->upgrade_->read_raw(framed, 8192, timeout_ms)) {
-    ESP_LOGD(TAG, "WebSocket read timeout or closed");
-    return false;
-  }
-  if (framed.empty()) {
-    out.clear();
-    return false;
-  }
-
-  ESP_LOGD(TAG, "Received %zu byte frame", framed.size());
-
-  // Parse controlbase record framing: [type(1)] [length(2)] [ciphertext(...)]
-  if (framed.size() < 3) {
-    ESP_LOGE(TAG, "Frame too short: %zu bytes", framed.size());
-    this->mark_failed();
-    return false;
-  }
-
-  uint8_t msg_type = framed[0];
-  uint16_t ciphertext_len = (static_cast<uint16_t>(framed[1]) << 8) | framed[2];
-  size_t expected_total = 3 + ciphertext_len;
-
-  if (msg_type != 0x04) {
-    ESP_LOGE(TAG, "Unexpected message type: 0x%02x", msg_type);
-    if (msg_type == 0x03 && framed.size() >= 3 + ciphertext_len) {
-      // Server error message
-      std::string error_msg(reinterpret_cast<const char*>(framed.data() + 3),
-                          std::min<size_t>(ciphertext_len, framed.size() - 3));
-      ESP_LOGE(TAG, "Server error: %s", error_msg.c_str());
+  out.clear();
+  if (!this->upgrade_ || this->failed()) return false;
+  const uint32_t started = millis();
+  const uint32_t limit = timeout_ms ? timeout_ms : 5;
+  while (true) {
+    const auto state = records_.state();
+    if (state == control_records::Records::State::Invalid) {
+      ESP_LOGE(TAG, "Invalid bounded control record");
+      this->mark_failed();
+      return false;
     }
-    this->mark_failed();
-    return false;
+    if (state == control_records::Records::State::Ready) {
+      const bool ok = this->decrypt_payload(records_.ciphertext(), records_.ciphertextSize(), out);
+      records_.consume();
+      return ok;
+    }
+    const uint32_t elapsed = millis() - started;
+    if (elapsed >= limit) return false;
+    App.feed_wdt();
+    std::vector<uint8_t> chunk;
+    if (!this->upgrade_->read_raw(chunk, 8192, limit - elapsed)) return false;
+    if (!records_.append(chunk.data(), chunk.size())) {
+      ESP_LOGE(TAG, "Control record buffer exceeded");
+      this->mark_failed();
+      return false;
+    }
   }
-
-  if (framed.size() < expected_total) {
-    ESP_LOGE(TAG, "Frame truncated: have %zu bytes, need %zu", framed.size(), expected_total);
-    this->mark_failed();
-    return false;
-  }
-
-  // Decrypt the ciphertext portion
-  return this->decrypt_payload(framed.data() + 3, ciphertext_len, out);
 }
 
 bool Ts2021Transport::start_http2_session() {
@@ -478,6 +452,7 @@ bool Ts2021Transport::http2_post_json(const std::string &scheme, const std::stri
   if (!this->http2_session_->post_json(stream_id, scheme, authority, path, payload, response_ptr, response_size,
                                        status_code, timeout_ms, close_stream, filter_node_only)) {
     ESP_LOGE(TAG, "HTTP/2 POST failed for %s (stream_id=%u)", path.c_str(), stream_id);
+    if (this->http2_session_->stream_failed()) this->mark_failed();
 
     // DO NOT reset HTTP/2 session for stream desync errors
     // Stream desync happens when multiple streams are active (e.g., streaming map + keepalive)
@@ -506,7 +481,9 @@ bool Ts2021Transport::http2_read_next_message(const char *&response_ptr, size_t 
 
   ESP_LOGD(TAG, "Reading next message from persistent stream %u", this->persistent_stream_id_);
 
-  return this->http2_session_->read_next_message(this->persistent_stream_id_, response_ptr, response_size, timeout_ms);
+  const bool ready = this->http2_session_->read_next_message(this->persistent_stream_id_, response_ptr, response_size, timeout_ms);
+  if (this->http2_session_->stream_failed()) this->mark_failed();
+  return ready;
 }
 
 bool Ts2021Transport::http2_send_on_persistent_stream(const std::string &data) {

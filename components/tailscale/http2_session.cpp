@@ -1,3 +1,4 @@
+#include "hpack_status.h"
 #include "http2_session.h"
 
 #include "esphome/core/log.h"
@@ -45,39 +46,18 @@ void append_uint32(std::vector<uint8_t> &out, uint32_t value) {
 
 }  // namespace
 
-// Helper function to print long strings in chunks to handle ESP32 serial line length limits
-static void print_chunked(const char *tag, const char *label, const char *data, size_t length) {
-  const size_t chunk_size = 200;  // Safe chunk size for ESP32 serial output
-
-  if (length == 0 || data == nullptr) {
-    ESP_LOGD(tag, "%s: (empty)", label);
-    return;
-  }
-
-  ESP_LOGD(tag, "%s (%zu bytes):", label, length);
-
-  size_t offset = 0;
-  size_t chunk_num = 1;
-  while (offset < length) {
-    size_t remaining = length - offset;
-    size_t current_chunk = (remaining < chunk_size) ? remaining : chunk_size;
-
-    // Create a temporary null-terminated string for this chunk
-    char chunk_buffer[chunk_size + 1];
-    memcpy(chunk_buffer, data + offset, current_chunk);
-    chunk_buffer[current_chunk] = '\0';
-
-    ESP_LOGD(tag, "  [%zu/%zu] %s", chunk_num, (length + chunk_size - 1) / chunk_size, chunk_buffer);
-
-    offset += current_chunk;
-    chunk_num++;
-  }
-}
-
 bool Http2Session::init(SendCallback send_cb, ReceiveCallback recv_cb) {
   this->send_cb_ = std::move(send_cb);
   this->recv_cb_ = std::move(recv_cb);
   this->recv_buffer_.clear();
+  this->deferred_.clear();
+  this->deferred_.reserve(8);
+  this->deferred_bytes_ = 0;
+  this->persistent_stream_ = 0;
+  this->map_messages_.reset();
+  this->map_frame_ = {};
+  this->map_offset_ = 0;
+  this->stream_failed_ = false;
   this->recv_buffer_.reserve(MAX_FRAME_SIZE + 32);  // reduce reallocations while pulling data
   this->settings_ack_sent_ = false;
   this->settings_exchanged_ = false;
@@ -97,6 +77,7 @@ bool Http2Session::send_initial_settings() {
   // 1. SETTINGS_ENABLE_PUSH (0x02) = 0 (disable server push)
   // 2. SETTINGS_MAX_FRAME_SIZE (0x05) = MAX_FRAME_SIZE (limit frame size for ESP32 RAM)
   frame.payload = {
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // HEADER_TABLE_SIZE = 0
     0x00, 0x02, 0x00, 0x00, 0x00, 0x00,  // ENABLE_PUSH = 0
     0x00, 0x05,                           // MAX_FRAME_SIZE setting ID
     static_cast<uint8_t>((MAX_FRAME_SIZE >> 24) & 0xFF),
@@ -182,11 +163,13 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
                              const std::string &path, const std::string &payload, const char *&response_ptr,
                              size_t &response_size, uint16_t &status_code, uint32_t timeout_ms, bool close_stream,
                              bool filter_node_only) {
+  if (this->stream_failed_) return false;
   ESP_LOGD(TAG, "=== HTTP/2 POST Request ===");
   ESP_LOGD(TAG, "Stream ID: %u, Path: %s", stream_id, path.c_str());
   ESP_LOGD(TAG, "Payload: %zu bytes", payload.size());
   ESP_LOGD(TAG, "JSON filtering: %s", filter_node_only ? "enabled (Node field only)" : "disabled (full response)");
 
+  if (!close_stream) this->persistent_stream_ = stream_id;
   // Store filtering mode for this request
   this->filter_node_only_ = filter_node_only;
 
@@ -196,7 +179,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
   this->json_complete_ = false;
   this->filtered_json_size_ = 0;
   this->json_bytes_processed_ = 0;
-  memset(this->filtered_json_buffer_, 0, sizeof(this->filtered_json_buffer_));
+  this->filtered_json_buffer_[0] = '\0'; // Size bookkeeping bounds all reads.
   ESP_LOGD(TAG, "JSON parser initialized (filtering: %s)", filter_node_only ? "ON" : "OFF");
 
   std::vector<uint8_t> header_block;
@@ -291,15 +274,15 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
     ESP_LOGD(TAG, "Response frame: type=%d, flags=0x%02x, stream_id=%u, length=%u",
              frame.type, frame.flags, frame.stream_id, frame.length);
 
+    // WINDOW_UPDATE applies independently of the response currently awaited.
+    if (frame.type == 0x08) continue;
+    if (frame.stream_id != stream_id && frame.stream_id != 0)
+      ESP_LOGD(TAG, "HTTP2 interleaved frame expected=%u stream=%u type=%u flags=%u",
+          stream_id, frame.stream_id, frame.type, frame.flags);
     // Handle frames for unexpected streams
     if (frame.stream_id != stream_id && frame.stream_id != 0) {
-      // Don't drain - just abort on unexpected stream
-      // This happens when there's a persistent stream active (stream 3) and we're sending
-      // a new request (stream 5+). The persistent stream data is NOT old/stale.
-      ESP_LOGE(TAG, "Received frame for unexpected stream %u (expected %u) - stream conflict",
-               frame.stream_id, stream_id);
-      ESP_LOGE(TAG, "This usually means a persistent stream is active. Aborting this request.");
-      return false;
+      if (!this->defer_frame_(std::move(frame))) return false;
+      continue;
     }
     switch (frame.type) {
       case kFrameTypeHeaders: {
@@ -309,6 +292,15 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
           ESP_LOGD(TAG, "HTTP status code: %u (flags=0x%02x)", status_code, frame.flags);
         }
         if ((frame.flags & kFlagEndStream) != 0) {
+          // Check the complete body once, including all trailing DATA.
+          if (!filter_node_only && this->json_bytes_processed_) {
+            this->json_complete_ = this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_);
+            if (!this->json_complete_) {
+              this->stream_failed_ = true;
+              return false;
+            }
+          }
+
           ESP_LOGW(TAG, "⚠️  Stream %u ended by HEADERS frame with END_STREAM flag - server sent no body!", stream_id);
           ESP_LOGW(TAG, "⚠️  This means the server accepted the request but has no data to send");
           stream_open = false;
@@ -316,8 +308,12 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         break;
       }
       case kFrameTypeData: {
+        if (frame.flags & 0x08) {  // Padding is unsupported; never feed it as JSON.
+          this->stream_failed_ = true;
+          return false;
+        }
         size_t payload_size = frame.length;
-        const char *payload_ptr = reinterpret_cast<const char *>(this->recv_buffer_.data() + 9);
+        const char *payload_ptr = reinterpret_cast<const char *>(frame.payload.data());
 
         ESP_LOGD(TAG, "📥 DATA frame: %zu bytes (flags=0x%02x, stream=%u, total_processed=%zu)",
                  payload_size, frame.flags, frame.stream_id, this->json_bytes_processed_);
@@ -381,7 +377,12 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
           if (this->parsing_json_) {
             // Append to filtered buffer (reusing it as general buffer)
             size_t space_left = kFilteredBufferSize - this->filtered_json_size_ - 1;  // -1 for null terminator
-            size_t bytes_to_copy = (json_length < space_left) ? json_length : space_left;
+            if (json_length > space_left) {
+              ESP_LOGE(TAG, "JSON response exceeds bounded capacity");
+              this->stream_failed_ = true;
+              return false;
+            }
+            size_t bytes_to_copy = json_length;
             if (bytes_to_copy > 0) {
               memcpy(this->filtered_json_buffer_ + this->filtered_json_size_, json_data, bytes_to_copy);
               this->filtered_json_size_ += bytes_to_copy;
@@ -390,24 +391,16 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
 
               // Check if we have received complete JSON without waiting for END_STREAM
               // This is critical for persistent streaming connections (Stream=true)
-              if (!this->json_complete_ &&
+              if (!close_stream && !this->json_complete_ &&
                   this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
                 this->json_complete_ = true;
                 ESP_LOGD(TAG, "✅ Complete JSON detected in full response mode (%zu bytes)",
                          this->filtered_json_size_);
               }
-            } else {
-              ESP_LOGW(TAG, "Buffer full, cannot buffer more data (have %zu bytes)", this->filtered_json_size_);
             }
             this->json_bytes_processed_ += json_length;
           }
         }
-
-        // Immediately erase the processed DATA frame from recv_buffer_ to free memory
-        size_t total = 9 + payload_size;
-        this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
-        this->recv_buffer_.shrink_to_fit();
-        ESP_LOGD(TAG, "Freed recv_buffer_, heap: %u bytes", esp_get_free_heap_size());
 
         // Send WINDOW_UPDATE to tell server we've consumed this data and it can send more
         // This is critical for HTTP/2 flow control - without it, server stops after ~65KB
@@ -451,7 +444,7 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         // Check completion based on mode
         if (this->filter_node_only_) {
           // In filtering mode, check if streaming JSON parser has extracted complete Node
-          if (this->json_complete_) {
+          if (this->json_complete_ && !close_stream) {
             ESP_LOGI(TAG, "✅ Streaming parser completed - Node extracted (%zu bytes)",
                      this->filtered_json_size_);
             stream_open = false;
@@ -464,8 +457,8 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
               // Simple request-response: close after first complete JSON
               ESP_LOGD(TAG, "✅ Full JSON response completed (%zu bytes) - closing stream",
                        this->filtered_json_size_);
-              stream_open = false;
-              break;
+              // Wait for END_STREAM, including a possible empty final DATA
+              // frame, so a completed response cannot leak into the next request.
             } else {
               // Long-polling mode: keep stream open for keepalive messages
               ESP_LOGD(TAG, "✅ Received initial MapResponse (%zu bytes) - keeping stream open for server keepalives",
@@ -482,6 +475,15 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
         // Close stream on END_STREAM flag (HTTP/2 RFC 7540 Section 6.1)
         // END_STREAM (0x1) signals that this is the last frame from the sender
         if ((frame.flags & kFlagEndStream) != 0) {
+          // Check the complete body once, including all trailing DATA.
+          if (!filter_node_only && this->json_bytes_processed_) {
+            this->json_complete_ = this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_);
+            if (!this->json_complete_) {
+              this->stream_failed_ = true;
+              return false;
+            }
+          }
+
           ESP_LOGI(TAG, "🔚 HTTP/2 END_STREAM flag received on DATA frame");
           ESP_LOGI(TAG, "   → Stream %u is now closed by server", stream_id);
           ESP_LOGI(TAG, "   → Total data received: %zu bytes", this->filtered_json_size_);
@@ -494,16 +496,16 @@ bool Http2Session::post_json(uint32_t stream_id, const std::string &scheme, cons
             ESP_LOGW(TAG, "   → Checking if JSON is actually complete despite parser state...");
 
             // Force re-check of JSON completion
-            if (this->filtered_json_size_ > 0 &&
+            if (close_stream && !filter_node_only && !this->json_bytes_processed_) {
+              this->json_complete_ = true; // Empty finite update responses are legitimate.
+            } else if (this->filtered_json_size_ > 0 &&
                 this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
               ESP_LOGI(TAG, "   ✅ JSON IS complete - parser missed it, forcing completion");
               this->json_complete_ = true;
             } else {
-              ESP_LOGW(TAG, "   ❌ JSON is genuinely incomplete after END_STREAM");
-              ESP_LOGW(TAG, "   → This indicates server sent truncated response");
-              ESP_LOGW(TAG, "   → Proceeding anyway - may cause parse errors");
-              // Force completion anyway since server won't send more data
-              this->json_complete_ = true;
+              ESP_LOGE(TAG, "Truncated JSON response");
+              this->stream_failed_ = true;
+              return false;
             }
           } else {
             ESP_LOGI(TAG, "   ✅ JSON already marked complete - clean stream closure");
@@ -607,18 +609,13 @@ bool Http2Session::send_settings_ack_() {
 }
 
 bool Http2Session::read_frame_(Frame &frame, uint32_t timeout_ms) {
-  // Safety check: if recv_buffer_ is already too large, something is wrong
-  if (this->recv_buffer_.size() > MAX_FRAME_SIZE * 2) {
-    ESP_LOGE(TAG, "recv_buffer_ too large (%zu bytes) - possible memory leak or frame processing issue",
-             this->recv_buffer_.size());
-    ESP_LOGE(TAG, "Clearing recv_buffer_ to prevent OOM crash");
-    this->recv_buffer_.clear();
-    this->recv_buffer_.shrink_to_fit();
-  }
-  
-  if (!this->pull_bytes_(timeout_ms)) {
+  if (this->stream_failed_) return false;
+  // Do not discard valid coalesced frames or silently reset stream framing.
+  if (this->recv_buffer_.size() > 40 * 1024) {
+    this->stream_failed_ = true;
     return false;
   }
+
   while (this->recv_buffer_.size() < 9) {
     App.feed_wdt();  // Reset watchdog during header wait
     if (!this->pull_bytes_(timeout_ms)) {
@@ -644,6 +641,7 @@ bool Http2Session::read_frame_(Frame &frame, uint32_t timeout_ms) {
     ESP_LOGE(TAG, "Frame too large: %u bytes (max %u) - insufficient RAM", length, MAX_FRAME_SIZE);
     ESP_LOGE(TAG, "This is likely a MapResponse that's too big for ESP32-C3");
     ESP_LOGE(TAG, "Consider reducing the number of peers in your tailnet or using pagination");
+    this->stream_failed_ = true;
     return false;
   }
   
@@ -674,27 +672,8 @@ bool Http2Session::read_frame_(Frame &frame, uint32_t timeout_ms) {
   frame.flags = flags;
   frame.stream_id = stream_id;
   
-  // For DATA frames, we DON'T copy the payload to save memory on ESP32-C3
-  // The payload will be empty, and the caller should extract from recv_buffer_
-  // For other frame types, we need the payload
-  if (type != kFrameTypeData && length > 0) {
-    frame.payload.resize(length);
-    std::copy(this->recv_buffer_.begin() + 9, this->recv_buffer_.begin() + total, 
-              frame.payload.begin());
-  }
-  
-  // For non-DATA frames, erase immediately to keep recv_buffer_ small
-  // For DATA frames, caller must handle erasure after extracting the data
-  if (type != kFrameTypeData) {
-    this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
-    
-    // Aggressively shrink the buffer to free memory
-    if (this->recv_buffer_.capacity() > MAX_FRAME_SIZE * 2) {
-      this->recv_buffer_.shrink_to_fit();
-      ESP_LOGD(TAG, "Shrunk recv_buffer after non-DATA frame, heap: %u", esp_get_free_heap_size());
-    }
-  }
-  
+  frame.payload.assign(this->recv_buffer_.begin() + 9, this->recv_buffer_.begin() + total);
+  this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
   return true;
 }
 
@@ -725,169 +704,44 @@ bool Http2Session::pull_bytes_(uint32_t timeout_ms) {
   }
   ESP_LOGD(TAG, "pull_bytes_: received %zu bytes, adding to buffer (current size: %zu)",
            chunk.size(), this->recv_buffer_.size());
+  if (chunk.size() > kMaxRecvBufferSize - this->recv_buffer_.size()) {
+    this->stream_failed_ = true;
+    return false;
+  }
   this->recv_buffer_.insert(this->recv_buffer_.end(), chunk.begin(), chunk.end());
   return !chunk.empty();
 }
 
-bool Http2Session::has_complete_json_(const char* buffer, size_t buffer_size) {
-  if (buffer_size < 2) {
-    ESP_LOGD(TAG, "Response check: buffer too small (%zu bytes)", buffer_size);
-    return false;
-  }
-  
-  // Tailscale/headscale wire format: [4-byte little-endian uint32 length][JSON body]
-  // Reference: headscale/hscontrol/poll.go:297-299
-  size_t start_offset = 0;
-  uint32_t expected_json_length = 0;
-
-  auto log_full_json = [&](const char *label, size_t closing_index) {
-    // Print JSON in chunks without copying to avoid OOM on ESP32
-    if (buffer_size <= start_offset) {
-      return;
-    }
-    size_t json_len = 0;
-    if (closing_index != SIZE_MAX && closing_index >= start_offset) {
-      json_len = (closing_index + 1) - start_offset;
-    }
-    size_t available = buffer_size - start_offset;
-    if (expected_json_length != 0 && expected_json_length <= available) {
-      json_len = expected_json_length;
-    } else if (json_len == 0 || json_len > available) {
-      json_len = available;
-    }
-    // Use pointer to existing buffer - no copy needed
-    print_chunked(TAG, label, buffer + start_offset, json_len);
-  };
-
-  if (buffer_size >= 5) {
-    uint8_t first_byte = (uint8_t)buffer[0];
-    // If first byte is not '{' but byte 4 is, we have a length prefix
-    if (first_byte != '{' && buffer_size > 4 && buffer[4] == '{') {
-      // Read the 4-byte little-endian length prefix
-      expected_json_length = ((uint32_t)(uint8_t)buffer[0]) |
-                             ((uint32_t)(uint8_t)buffer[1] << 8) |
-                             ((uint32_t)(uint8_t)buffer[2] << 16) |
-                             ((uint32_t)(uint8_t)buffer[3] << 24);
-      start_offset = 4;  // Skip 4-byte length prefix
-      ESP_LOGI(TAG, "Detected Tailscale wire format: length prefix = %u bytes, buffer = %zu bytes",
-               expected_json_length, buffer_size - 4);
-
-      // Check if we have received the complete JSON yet
-      if (buffer_size < (4 + expected_json_length)) {
-        ESP_LOGD(TAG, "Waiting for complete JSON: have %zu bytes, need %u bytes",
-                 buffer_size - 4, expected_json_length);
-        return false;  // Not complete yet, wait for more data
-      }
-
-      ESP_LOGI(TAG, "Complete JSON received (%u bytes)", expected_json_length);
-    }
-  }
-
-  uint8_t first_byte = (uint8_t)buffer[start_offset];
-  
-  // Check if this is MessagePack (0x80-0x8f = fixmap, 0xa0-0xbf = fixstr, 0xde/0xdf = map16/32)
-  bool is_msgpack = (first_byte >= 0x80 && first_byte <= 0x8f) ||  // fixmap
-                    (first_byte >= 0xa0 && first_byte <= 0xbf) ||  // fixstr (common in msgpack maps)
-                    (first_byte == 0xde || first_byte == 0xdf);    // map16/map32
-  
-  // Check if this is JSON
-  bool is_json = (first_byte == '{');
-  
-  if (is_msgpack) {
-    ESP_LOGI(TAG, "Response format: MessagePack (first byte: 0x%02x, size: %zu bytes)", first_byte, buffer_size);
-    // For MessagePack, we can't easily detect completion without full parsing
-    // But Tailscale sends the complete response in one go for non-streaming requests
-    // So we'll use a heuristic: if we haven't received more data in a while, we're done
-    // For now, just accept any MessagePack response that's > 1KB as "complete enough"
-    if (buffer_size >= 1024) {
-      ESP_LOGI(TAG, "✓ MessagePack response appears complete (%zu bytes)", buffer_size);
-      return true;
-    }
-    return false;
-  }
-  
-  if (!is_json) {
-    ESP_LOGW(TAG, "Response format: Unknown (first byte at offset %zu: 0x%02x, total size: %zu)", 
-             start_offset, first_byte, buffer_size);
-    // Show first 32 bytes for debugging
-    char hex_preview[100];
-    size_t hex_len = 0;
-    for (size_t i = 0; i < buffer_size && i < 32 && hex_len < 96; i++) {
-      hex_len += snprintf(hex_preview + hex_len, sizeof(hex_preview) - hex_len, 
-                          "%02x ", (uint8_t)buffer[i]);
-    }
-    ESP_LOGW(TAG, "First 32 bytes: %s", hex_preview);
-    return false;
-  }
-  
-  // JSON detection - count braces starting from the offset
-  ESP_LOGD(TAG, "Response format: JSON (size: %zu bytes, offset: %zu)", buffer_size, start_offset);
-  
-  int brace_depth = 0;
-  bool in_string = false;
-  bool escaped = false;
-
-  for (size_t i = start_offset; i < buffer_size; i++) {
-    char c = buffer[i];
-    if (escaped) {
-      escaped = false;
+bool Http2Session::has_complete_json_(const char* buffer, size_t size) {
+  if (!buffer || size < 2) return false;
+  size_t at = 0;
+  while (at < size && std::isspace(static_cast<unsigned char>(buffer[at]))) ++at;
+  if (at == size || buffer[at] != '{') return false;
+  // Structural completion only; the caller still parses JSON for syntax/schema.
+  // Scan the whole tail, avoiding unsigned size-100 underflow and prefix matches.
+  unsigned depth = 0;
+  bool quoted = false, escaped = false;
+  for (; at < size; ++at) {
+    const unsigned char c = buffer[at];
+    if (quoted) {
+      if (escaped) { escaped = false; continue; }
+      if (c == '\\') escaped = true;
+      else if (c == '"') quoted = false;
+      else if (c < 0x20) return false;
       continue;
     }
-    if (c == '\\') {
-      escaped = true;
-      continue;
-    }
-    if (c == '"') {
-      in_string = !in_string;
-      continue;
-    }
-    if (in_string) {
-      continue;
-    }
-    if (c == '{') {
-      brace_depth++;
-    } else if (c == '}') {
-      brace_depth--;
-      // Early exit optimization: if we've closed all braces and we're past a reasonable size,
-      // check if we're done (avoids scanning huge buffers)
-      if (brace_depth == 0 && i > 1000) {
-        // Quick check: is the rest just whitespace?
-        bool all_whitespace = true;
-        for (size_t j = i + 1; j < buffer_size && j < i + 100; j++) {
-          if (!std::isspace(static_cast<unsigned char>(buffer[j]))) {
-            all_whitespace = false;
-            break;
-          }
-        }
-        if (all_whitespace || i + 1 >= buffer_size) {
-          ESP_LOGD(TAG, "✓ JSON complete: depth=0, size=%zu, last_brace_at=%zu", buffer_size, i);
-          log_full_json("✓ JSON complete", i);
-          return true;
-        }
+    if (c == '"') quoted = true;
+    else if (c == '{' || c == '[') ++depth;
+    else if (c == '}' || c == ']') {
+      if (!depth) return false;
+      if (--depth == 0) {
+        if (c != '}') return false;
+        for (++at; at < size; ++at)
+          if (!std::isspace(static_cast<unsigned char>(buffer[at]))) return false;
+        return true;
       }
     }
   }
-
-  if (brace_depth != 0 || in_string) {
-    ESP_LOGD(TAG, "JSON incomplete: depth=%d, in_string=%d, size=%zu", 
-             brace_depth, in_string, buffer_size);
-    return false;
-  }
-
-  // Final check: all braces closed, ensure we end with }
-  for (size_t i = buffer_size; i > start_offset && i > buffer_size - 100; i--) {
-    char c = buffer[i - 1];
-    if (!std::isspace(static_cast<unsigned char>(c))) {
-      bool ends_with_brace = (c == '}');
-      if (ends_with_brace) {
-        ESP_LOGD(TAG, "✓ Complete JSON detected: %zu bytes, depth=0, ends with '}'", buffer_size);
-        log_full_json("✓ Complete JSON detected", i - 1);
-      }
-      return ends_with_brace;
-    }
-  }
-
-  ESP_LOGW(TAG, "JSON validation failed: depth=0 but doesn't end with '}'");
   return false;
 }
 
@@ -915,200 +769,64 @@ void Http2Session::encode_string_literal_(std::vector<uint8_t> &block, const std
   block.insert(block.end(), value.begin(), value.end());
 }
 
-int16_t Http2Session::decode_status_header_(const std::vector<uint8_t> &block) {
-  size_t idx = 0;
-  while (idx < block.size()) {
-    uint8_t b = block[idx];
-    if ((b & 0x80) != 0) {
-      uint32_t index = b & 0x7F;
-      if (index == 8) {
-        return 200;
-      }
-      idx += 1;
-      continue;
-    }
-    if ((b & 0xF0) == 0x00) {
-      idx += 1;
-      if (idx >= block.size()) {
-        break;
-      }
-      uint32_t name_len = block[idx++] & 0x7F;
-      if (idx + name_len > block.size()) {
-        break;
-      }
-      std::string name(reinterpret_cast<const char *>(&block[idx]), name_len);
-      idx += name_len;
-      if (idx >= block.size()) {
-        break;
-      }
-      uint32_t value_len = block[idx++] & 0x7F;
-      if (idx + value_len > block.size()) {
-        break;
-      }
-      std::string value(reinterpret_cast<const char *>(&block[idx]), value_len);
-      idx += value_len;
-      if (name == ":status") {
-        return static_cast<int16_t>(atoi(value.c_str()));
-      }
-      continue;
-    }
-    break;
-  }
-  return -1;
+int16_t Http2Session::decode_status_header_(const std::vector<uint8_t>& block) {
+  return hpack::status(block.data(), block.size());
 }
 
-bool Http2Session::read_next_message(uint32_t stream_id, const char *&response_ptr, size_t &response_size,
-                                     uint32_t timeout_ms) {
-  ESP_LOGD(TAG, "=== Reading next message from stream %u ===", stream_id);
-
-  // Reset JSON parsing state for new message
-  this->json_parser_.reset();
-  this->parsing_json_ = false;
-  this->json_complete_ = false;
-  this->filtered_json_size_ = 0;
-  this->json_bytes_processed_ = 0;
-  memset(this->filtered_json_buffer_, 0, sizeof(this->filtered_json_buffer_));
-
-  // We're reading full responses (server keepalives are small JSON messages)
-  this->filter_node_only_ = false;
-
-  uint32_t start_time = millis();
-  bool stream_open = true;
-
-  while (stream_open) {
-    // Check timeout
-    if (millis() - start_time > timeout_ms) {
-      ESP_LOGD(TAG, "Timeout waiting for message on stream %u", stream_id);
-      return false;
-    }
-
-    App.feed_wdt();  // Reset watchdog
-
-    Frame frame;
-    if (!this->read_frame_(frame, 1)) {  // 1ms timeout per frame for low-latency packet processing
-      continue;  // Keep trying until overall timeout
-    }
-
-    ESP_LOGD(TAG, "Frame: type=%d, flags=0x%02x, stream_id=%u, length=%u",
-             frame.type, frame.flags, frame.stream_id, frame.length);
-
-    // Ignore frames not for our stream
-    if (frame.stream_id != stream_id && frame.stream_id != 0) {
-      ESP_LOGD(TAG, "Frame for different stream %u, ignoring", frame.stream_id);
-      // CRITICAL: For DATA frames, we must erase the payload from recv_buffer_
-      // read_frame_() leaves DATA payloads in buffer for caller to handle
-      if (frame.type == kFrameTypeData) {
-        size_t total = 9 + frame.length;  // 9-byte header + payload
-        if (this->recv_buffer_.size() >= total) {
-          this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
-          this->recv_buffer_.shrink_to_fit();
-          ESP_LOGD(TAG, "Erased unwanted DATA frame (%zu bytes) from buffer", total);
-        }
-      }
-      continue;
-    }
-
-    switch (frame.type) {
-      case kFrameTypeHeaders: {
-        // Just acknowledge headers, don't close stream
-        ESP_LOGD(TAG, "Received HEADERS on stream %u", stream_id);
-        break;
-      }
-
-      case kFrameTypeData: {
-        size_t payload_size = frame.length;
-        const char *payload_ptr = reinterpret_cast<const char *>(this->recv_buffer_.data() + 9);
-
-        ESP_LOGV(TAG, "DATA frame: %zu bytes", payload_size);
-
-        // Handle Tailscale wire format: 4-byte length prefix + JSON
-        const char *json_data = payload_ptr;
-        size_t json_length = payload_size;
-
-        if (this->json_bytes_processed_ == 0 && payload_size >= 5) {
-          // Check for wire format
-          if (payload_ptr[0] != '{' && payload_ptr[4] == '{') {
-            ESP_LOGD(TAG, "Detected wire format, skipping 4-byte prefix");
-            json_data = payload_ptr + 4;
-            json_length = payload_size - 4;
-            this->parsing_json_ = true;
-          }
-        }
-
-        // Enable parsing even without wire format
-        if (!this->parsing_json_ && this->json_bytes_processed_ == 0) {
-          this->parsing_json_ = true;
-        }
-
-        // Buffer the JSON
-        if (this->parsing_json_) {
-          size_t space_left = kFilteredBufferSize - this->filtered_json_size_ - 1;
-          size_t bytes_to_copy = (json_length < space_left) ? json_length : space_left;
-
-          if (bytes_to_copy > 0) {
-            memcpy(this->filtered_json_buffer_ + this->filtered_json_size_, json_data, bytes_to_copy);
-            this->filtered_json_size_ += bytes_to_copy;
-            this->filtered_json_buffer_[this->filtered_json_size_] = '\0';
-
-            // Check for complete JSON
-            if (!this->json_complete_ &&
-                this->has_complete_json_(this->filtered_json_buffer_, this->filtered_json_size_)) {
-              this->json_complete_ = true;
-              ESP_LOGD(TAG, "✅ Received complete message: %zu bytes", this->filtered_json_size_);
-
-              // Return the message but keep stream open
-              response_ptr = this->filtered_json_buffer_;
-              response_size = this->filtered_json_size_;
-
-              // Clean up recv_buffer
-              size_t total = 9 + payload_size;
-              this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
-              this->recv_buffer_.shrink_to_fit();
-
-              return true;  // Success, stream remains open
-            }
-          }
-
-          this->json_bytes_processed_ += json_length;
-        }
-
-        // Clean up recv_buffer
-        size_t total = 9 + payload_size;
-        this->recv_buffer_.erase(this->recv_buffer_.begin(), this->recv_buffer_.begin() + total);
-        this->recv_buffer_.shrink_to_fit();
-
-        // Check for END_STREAM flag
-        if ((frame.flags & kFlagEndStream) != 0) {
-          ESP_LOGD(TAG, "Stream %u closed by server", stream_id);
-          return false;  // Stream closed
-        }
-
-        break;
-      }
-
-      case kFrameTypeSettings: {
-        if (!this->handle_settings_(frame)) {
-          return false;
-        }
-        if ((frame.flags & kFlagAck) == 0) {
-          if (!this->send_settings_ack_()) {
-            return false;
-          }
-        }
-        break;
-      }
-
-      case kFrameTypeGoAway: {
-        ESP_LOGW(TAG, "Received GOAWAY on stream %u", stream_id);
+bool Http2Session::read_next_message(uint32_t stream_id, const char*& response_ptr,
+    size_t& response_size, uint32_t timeout_ms) {
+  const uint32_t started = millis();
+  while (!stream_failed_ && millis() - started <= timeout_ms) {
+    if (map_offset_ < map_frame_.payload.size()) {
+      size_t consumed = 0;
+      const auto result = map_messages_.feed(map_frame_.payload.data() + map_offset_,
+          map_frame_.payload.size() - map_offset_, consumed);
+      map_offset_ += consumed;
+      if (result == MapMessages<>::Result::Invalid) {
+        ESP_LOGE(TAG, "Invalid streaming map message length");
+        stream_failed_ = true;
         return false;
       }
-
-      default:
-        ESP_LOGD(TAG, "Ignoring frame type %d", frame.type);
-        break;
+      if (result == MapMessages<>::Result::Ready) {
+        response_ptr = map_messages_.data();
+        response_size = map_messages_.size();
+        ESP_LOGD(TAG, "Control map message bytes=%u", static_cast<unsigned>(response_size));
+        return true;
+      }
+    }
+    map_frame_.payload.clear();
+    map_offset_ = 0;
+    Frame frame;
+    if (!take_frame_(stream_id, frame) && !read_frame_(frame, 1)) return false;
+    if (frame.stream_id && frame.stream_id != stream_id) {
+      if (!defer_frame_(std::move(frame))) stream_failed_ = true;
+      continue;
+    }
+    if (frame.type == kFrameTypeSettings) {
+      if (!handle_settings_(frame)) stream_failed_ = true;
+    } else if (frame.type == 6 && !(frame.flags & kFlagAck)) {
+      frame.flags |= kFlagAck;
+      if (!send_frame_(frame)) stream_failed_ = true;
+    } else if (frame.type == kFrameTypeGoAway || frame.type == 3 ||
+               (frame.stream_id == stream_id && (frame.flags & kFlagEndStream))) {
+      ESP_LOGE(TAG, "Control map stream closed");
+      stream_failed_ = true;
+    } else if (frame.type == kFrameTypeData && frame.stream_id == stream_id) {
+      if (frame.flags & 0x08) { stream_failed_ = true; return false; }
+      if (frame.length) {
+        Frame window;
+        window.type = 8;
+        window.length = 4;
+        window.payload = {uint8_t(frame.length >> 24), uint8_t(frame.length >> 16),
+                          uint8_t(frame.length >> 8), uint8_t(frame.length)};
+        window.stream_id = stream_id;
+        if (!send_frame_(window)) { stream_failed_ = true; return false; }
+        window.stream_id = 0;
+        if (!send_frame_(window)) { stream_failed_ = true; return false; }
+      }
+      map_frame_ = std::move(frame);
     }
   }
-
   return false;
 }
 
@@ -1147,3 +865,27 @@ bool Http2Session::send_data_on_stream(uint32_t stream_id, const std::string &da
 
 }  // namespace tailscale
 }  // namespace esphome
+
+namespace esphome::tailscale {
+bool Http2Session::defer_frame_(Frame&& frame) {
+  if (!persistent_stream_ || frame.stream_id != persistent_stream_ ||
+      deferred_.size() >= 8 || frame.payload.size() > 65536 - deferred_bytes_) {
+    ESP_LOGE(TAG, "HTTP2 deferred frame limit or unknown stream");
+    stream_failed_ = true;
+    return false;
+  }
+  deferred_bytes_ += frame.payload.size();
+  deferred_.push_back(std::move(frame));
+  return true;
+}
+bool Http2Session::take_frame_(uint32_t stream, Frame& frame) {
+  for (auto it = deferred_.begin(); it != deferred_.end(); ++it) {
+    if (it->stream_id != stream) continue;
+    deferred_bytes_ -= it->payload.size();
+    frame = std::move(*it);
+    deferred_.erase(it);
+    return true;
+  }
+  return false;
+}
+}

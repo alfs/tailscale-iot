@@ -132,12 +132,12 @@ class WireGuardDeviceManager {
   /**
    * @brief Check if handshake is established for a specific peer
    */
-  bool is_handshake_established(const std::string& peer_tailscale_ip) const {
-    auto it = this->peers_.find(peer_tailscale_ip);
-    return it != this->peers_.end() && it->second.handshake_established;
-  }
+  bool is_handshake_established(const std::string &peer_tailscale_ip) const;
+  // Renewal demand is distinct from current-key transport readiness.
+  bool needs_rekey(const std::string &peer_tailscale_ip) const;
 
- protected:
+protected:
+  void prune_receiver_routes_(const std::string &peer_tailscale_ip);
   // Internal peer tracking structure
   struct PeerContext {
     ::wireguard_peer* peer;         // Pointer to wireguard_peer (global namespace)

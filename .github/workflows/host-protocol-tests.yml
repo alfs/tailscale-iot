@@ -1,0 +1,11 @@
+name: Host protocol tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/run_host_tests.py
